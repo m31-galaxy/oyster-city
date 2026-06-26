@@ -29,9 +29,13 @@ export default function TubeMap() {
       (window as unknown as { editor?: Editor }).editor = editor;
     }
 
-    // Clean slate (guards React double-invoke / any stale state).
+    // Clean slate (guards React double-invoke / stale state). Plain
+    // deleteShapes skips locked shapes — the lines are locked — so force it
+    // past the lock, otherwise old lines accumulate on re-mount.
     const existing = [...editor.getCurrentPageShapeIds()];
-    if (existing.length) editor.deleteShapes(existing);
+    if (existing.length) {
+      editor.run(() => editor.deleteShapes(existing), { ignoreShapeLock: true });
+    }
 
     const net = getTubeNetwork();
 
@@ -48,6 +52,9 @@ export default function TubeMap() {
         type: "tube-line" as const,
         x: minX,
         y: minY,
+        // Locked so the lines are never hovered or selected (getShapeAtPoint
+        // skips locked shapes) — they're decoration behind the stations.
+        isLocked: true,
         props: {
           w: Math.max(...xs) - minX || 1,
           h: Math.max(...ys) - minY || 1,
