@@ -1,5 +1,6 @@
 import TubeMap from "@/components/TubeMap";
 import StationReadout from "@/components/StationReadout";
+import CollapsibleSidebar from "@/components/CollapsibleSidebar";
 import { getLineStatus } from "@/lib/tfl/client";
 import { lineColour } from "@/lib/tfl/lines";
 import type { LineStatus } from "@/lib/tfl/types";
@@ -16,7 +17,7 @@ export default async function Home() {
 
   return (
     <main className="layout">
-      <aside className="sidebar">
+      <CollapsibleSidebar>
         <h1>Oyster City</h1>
         <p className="tagline">Live London transport — a TfL Go for the web.</p>
 
@@ -51,7 +52,7 @@ export default async function Home() {
         </section>
 
         <footer className="attribution">Powered by TfL Open Data</footer>
-      </aside>
+      </CollapsibleSidebar>
 
       <div className="map">
         <TubeMap />

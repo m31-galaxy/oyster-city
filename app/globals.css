@@ -25,17 +25,64 @@ body {
 }
 
 .layout {
+  position: relative;
   display: flex;
   height: 100vh;
 }
 
 .sidebar {
-  width: 320px;
-  flex-shrink: 0;
-  padding: 20px;
+  flex: 0 0 320px;
+  min-width: 0;
+  /* Collapse by animating max-width (flex-basis/width transitions are
+     unreliable for flex items; max-width animates cleanly and caps the used
+     width to 0). */
+  max-width: 320px;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  overflow: hidden;
+  transition: max-width 0.25s ease;
+}
+
+.sidebar.sidebar--collapsed {
+  max-width: 0;
+  border-right: none;
+}
+
+.sidebar-content {
+  width: 320px;
+  height: 100%;
+  padding: 20px;
   overflow-y: auto;
+}
+
+.sidebar-toggle {
+  position: absolute;
+  top: 12px;
+  left: 332px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  transition: left 0.25s ease;
+}
+
+.sidebar-toggle:hover {
+  background: #fafafa;
+}
+
+.sidebar-toggle.sidebar-toggle--collapsed {
+  left: 12px;
 }
 
 .sidebar h1 {
