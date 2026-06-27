@@ -1,22 +1,27 @@
 import network from "./network.generated.json";
 
 // The complete network is generated from the TfL Unified API by
-// scripts/build-tube-data.mjs (geographic [lon,lat] coordinates). Here we
-// project it once into canvas coordinates for the tldraw renderer.
+// scripts/build-tube-data.mjs. Here we project the geographic [lon,lat]
+// coordinates once into canvas coordinates, and expose the topology
+// (per-branch ordered station-id sequences + a station lookup) that the
+// octilinear line renderer (lib/tube/octilinear.ts) needs.
 //
-// Layout is geographic, not Beck-schematic: full open-data schematic
-// coordinates don't exist (TfL's are geographic; the schematic artwork is
-// copyright). To refresh the data, re-run the generator. To re-style as a true
-// schematic later, this projection is the single place to change.
+// Station POSITIONS are the single source of truth — line geometry is derived
+// from them, so moving / adding / hiding stations and lines all flow through.
 
 /** Width (in canvas units) the projected map is scaled to. Tunes marker density. */
 const TARGET_WIDTH = 5000;
 
+interface RawLinePoint {
+  id: string;
+  lon: number;
+  lat: number;
+}
 interface RawLine {
   id: string;
   name: string;
   color: string;
-  points: [number, number][];
+  points: RawLinePoint[];
 }
 interface RawStation {
   id: string;
@@ -25,6 +30,7 @@ interface RawStation {
   lon: number;
   interchange: boolean;
   color: string;
+  lines: string[];
 }
 interface RawNetwork {
   lines: RawLine[];
@@ -48,11 +54,24 @@ export interface TubeStation {
   interchange: boolean;
   labelPos: string;
   color: string;
+  lines: string[];
+}
+
+/** One contiguous run of a line (a line can have several branches). */
+export interface TubeBranch {
+  lineId: string;
+  name: string;
+  color: string;
+  /** Ordered station ids; positions are looked up in `stationsById`. */
+  stationIds: string[];
 }
 
 export interface TubeNetwork {
+  /** Geographic straight-line polylines (legacy / full-map rendering). */
   lines: TubeLinePath[];
   stations: TubeStation[];
+  stationsById: Map<string, TubeStation>;
+  branches: TubeBranch[];
   bounds: { w: number; h: number };
 }
 
@@ -72,7 +91,7 @@ export function getTubeNetwork(): TubeNetwork {
     latMin = Math.min(latMin, lat);
     latMax = Math.max(latMax, lat);
   };
-  for (const l of data.lines) for (const [lon, lat] of l.points) consider(lon, lat);
+  for (const l of data.lines) for (const p of l.points) consider(p.lon, p.lat);
   for (const s of data.stations) consider(s.lon, s.lat);
 
   // Equirectangular projection with longitude compressed by cos(latitude) so
@@ -89,7 +108,7 @@ export function getTubeNetwork(): TubeNetwork {
     id: l.id,
     name: l.name,
     color: l.color,
-    points: l.points.map(([lon, lat]) => project(lon, lat)),
+    points: l.points.map((p) => project(p.lon, p.lat)),
   }));
 
   const stations: TubeStation[] = data.stations.map((s) => {
@@ -102,12 +121,26 @@ export function getTubeNetwork(): TubeNetwork {
       interchange: s.interchange,
       labelPos: "E",
       color: s.color,
+      lines: s.lines ?? [],
     };
+  });
+
+  const stationsById = new Map(stations.map((s) => [s.id, s]));
+
+  // One branch per raw line-path; collapse consecutive duplicate station ids.
+  const branches: TubeBranch[] = data.lines.map((l) => {
+    const stationIds: string[] = [];
+    for (const p of l.points) {
+      if (stationIds[stationIds.length - 1] !== p.id) stationIds.push(p.id);
+    }
+    return { lineId: l.id, name: l.name, color: l.color, stationIds };
   });
 
   cached = {
     lines,
     stations,
+    stationsById,
+    branches,
     bounds: { w: TARGET_WIDTH, h: (latMax - latMin) * scale },
   };
   return cached;

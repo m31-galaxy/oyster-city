@@ -8,7 +8,6 @@ import {
   useValue,
   type TLBaseShape,
 } from "tldraw";
-import { selectStation } from "@/lib/tube/selection";
 
 export interface StationProps {
   w: number;
@@ -74,7 +73,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   }
 
   override component(shape: StationShape) {
-    const { name, stationId, interchange, labelPos, color, w, h } = shape.props;
+    const { name, interchange, labelPos, color, w, h } = shape.props;
     const editor = useEditor();
     // Interchanges are always labelled; other stations reveal as you zoom in.
     // The computed value is a boolean, so a shape only re-renders when it
@@ -102,18 +101,13 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
         };
 
     return (
-      <HTMLContainer style={{ pointerEvents: "all", cursor: "pointer" }}>
-        <div
-          onPointerDown={(e) => {
-            // Handle the tap ourselves; don't let tldraw start a pan/marquee.
-            e.stopPropagation();
-            selectStation({ id: stationId, name });
-          }}
-          style={{ position: "relative", width: w, height: h }}
-        >
+      // pointer-events off so tldraw handles select/drag via the shape
+      // geometry — the marker/label are pure visuals. Selection is wired to the
+      // sidebar separately (see TubeMap).
+      <HTMLContainer style={{ pointerEvents: "none" }}>
+        <div style={{ position: "relative", width: w, height: h }}>
           <div style={marker} />
-          {/* Progressive labels: interchanges always, others on zoom-in. Any
-              station's name also shows in the sidebar on tap. */}
+          {/* Progressive labels: interchanges always, others on zoom-in. */}
           {showLabel && <span style={labelStyle(labelPos)}>{name}</span>}
         </div>
       </HTMLContainer>
