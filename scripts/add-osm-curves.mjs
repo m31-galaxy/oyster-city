@@ -23,41 +23,6 @@ const stationPos = new Map(net.stations.map((s) => [s.id, [s.lon, s.lat]]));
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const TOL = 0.004; // sum of the two endpoint gaps (each station ~<200m off)
 
-/** Interior turn angle at v (deg): 0 = straight, 180 = U-turn. */
-function turnDeg(a, v, b) {
-  const v1x = v[0] - a[0], v1y = v[1] - a[1];
-  const v2x = b[0] - v[0], v2y = b[1] - v[1];
-  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
-  if (!m1 || !m2) return 0;
-  const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (m1 * m2)));
-  return (Math.acos(cos) * 180) / Math.PI;
-}
-
-const lerp = (p, q, t) => [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
-
-/**
- * Round only the sharp corners of a polyline (Chaikin-style cut at vertices
- * whose turn exceeds `maxTurn`). Smooths the chord-fallback lines (sharp
- * station corners) while leaving real OSM curves (gentle turns) ~untouched.
- */
-function smoothSharpCorners(points, maxTurn = 18, iterations = 3) {
-  let pts = points;
-  for (let it = 0; it < iterations; it++) {
-    const out = [pts[0]];
-    for (let i = 1; i < pts.length - 1; i++) {
-      const v = pts[i];
-      if (turnDeg(pts[i - 1], v, pts[i + 1]) > maxTurn) {
-        out.push(lerp(v, pts[i - 1], 0.25), lerp(v, pts[i + 1], 0.25));
-      } else {
-        out.push(v);
-      }
-    }
-    out.push(pts[pts.length - 1]);
-    pts = out;
-  }
-  return pts;
-}
-
 /**
  * Centripetal Catmull-Rom samples for the P1->P2 span (P0,P3 = neighbours).
  * Passes exactly through P1 and P2, so a fallback segment stays attached to its
