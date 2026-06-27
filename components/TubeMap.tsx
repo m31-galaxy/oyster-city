@@ -26,8 +26,8 @@ const ANIM_MS = 650;
 /** Point count used while morphing a line between straight and curved. */
 const MORPH_POINTS = 120;
 
-// Two simple, branch-free lines sharing exactly one station (Oxford Circus).
-const SHOWN_LINES = ["bakerloo", "victoria"];
+// Line ids to show — null shows the whole network.
+const SHOWN_LINES: string[] | null = null;
 
 type Pt = { x: number; y: number };
 
@@ -153,7 +153,9 @@ export default function TubeMap() {
     ed.__oysterBuilt = true;
 
     const net = getTubeNetwork();
-    const lines = net.lines.filter((l) => SHOWN_LINES.includes(l.id));
+    const lines = SHOWN_LINES
+      ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
+      : net.lines;
 
     const lineCount = new Map<string, number>();
     const colourFor = new Map<string, string>();
@@ -317,6 +319,14 @@ export default function TubeMap() {
         return { id: s.id, stationIds, curveN };
       });
 
+    // Only animate stations that actually move (none, in the common no-edit
+    // case) — keeps the whole-network tween cheap.
+    const movingIds = ids.filter((id) => {
+      const s = starts.get(id)!;
+      const g = targets.get(id)!;
+      return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
+    });
+
     animating.current = true;
     let startTs: number | null = null;
 
@@ -326,7 +336,7 @@ export default function TubeMap() {
       const e = easeInOutCubic(t);
       editor.run(
         () => {
-          for (const id of ids) {
+          for (const id of movingIds) {
             const s = starts.get(id)!;
             const g = targets.get(id)!;
             editor.updateShape({
