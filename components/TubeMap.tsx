@@ -1,21 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Tldraw, createShapeId, type Editor, type TLShapeId } from "tldraw";
 import "tldraw/tldraw.css";
-import { TubeLineShapeUtil, type TubeLineShape } from "@/components/shapes/TubeLineShapeUtil";
-import { StationShapeUtil, type StationShape } from "@/components/shapes/StationShapeUtil";
+import {
+  TubeLineShapeUtil,
+  type TubeLineShape,
+} from "@/components/shapes/TubeLineShapeUtil";
+import {
+  StationShapeUtil,
+  type StationShape,
+} from "@/components/shapes/StationShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { selectStation } from "@/lib/tube/selection";
 
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
 const MARKER = 11;
+const ANIM_MS = 650;
 
-// For now we focus on two simple, branch-free lines that share exactly one
-// station (Oxford Circus) — a clean testbed for the draggable node-graph.
+// Two simple, branch-free lines sharing exactly one station (Oxford Circus).
 const SHOWN_LINES = ["bakerloo", "victoria"];
 
 type Pt = { x: number; y: number };
+
+const easeInOutCubic = (t: number) =>
+  t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
 /** Build an SVG path + bounding box from page-space points (station centres). */
 function pathFromPoints(points: Pt[]) {
@@ -41,16 +56,52 @@ function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
   return b ? { x: b.center.x, y: b.center.y } : null;
 }
 
+/** Redraw one line through its stations' current centres. */
+function recomputeLine(editor: Editor, line: TubeLineShape) {
+  const ids = line.props.stationIds as TLShapeId[];
+  const centres = ids
+    .map((id) => stationCentre(editor, id))
+    .filter((c): c is Pt => !!c);
+  if (centres.length < 2) return;
+  const path = pathFromPoints(centres);
+  editor.updateShape<TubeLineShape>({
+    id: line.id,
+    type: "tube-line",
+    x: path.x,
+    y: path.y,
+    props: { w: path.w, h: path.h, d: path.d },
+  });
+}
+
+/** Redraw every line (used while animating, where many stations move at once). */
+function recomputeAllLines(editor: Editor) {
+  editor.run(
+    () => {
+      for (const shape of editor.getCurrentPageShapes()) {
+        if (shape.type === "tube-line") recomputeLine(editor, shape);
+      }
+    },
+    { ignoreShapeLock: true },
+  );
+}
+
 /**
  * Editable schematic Tube-map canvas (the `'use client'` island).
  *
- * Stations are draggable shapes; lines are locked decoration that recompute
- * their path whenever a connected station moves (via a store side-effect).
- * Built once per editor and gated behind `mounted` so tldraw never touches
- * `window` during Next's server prerender.
+ * Stations are draggable nodes; lines are locked decoration that follow them.
+ * A geo/editable toggle animates every station between its geographically
+ * accurate position and the user's custom (dragged) layout.
  */
 export default function TubeMap() {
   const [mounted, setMounted] = useState(false);
+  const [geoMode, setGeoMode] = useState(false);
+
+  const editorRef = useRef<Editor | null>(null);
+  const geoPos = useRef<Map<TLShapeId, Pt>>(new Map());
+  const customPos = useRef<Map<TLShapeId, Pt>>(new Map());
+  const animating = useRef(false);
+  const animFrame = useRef<number | null>(null);
+
   useEffect(() => setMounted(true), []);
 
   const handleMount = useCallback((editor: Editor) => {
@@ -66,8 +117,6 @@ export default function TubeMap() {
     const net = getTubeNetwork();
     const lines = net.lines.filter((l) => SHOWN_LINES.includes(l.id));
 
-    // For each station, how many shown lines use it (>1 ⇒ interchange here) and
-    // a representative colour, plus its centre point.
     const lineCount = new Map<string, number>();
     const colourFor = new Map<string, string>();
     for (const line of lines) {
@@ -80,27 +129,32 @@ export default function TubeMap() {
     const centreFor = new Map<string, Pt>(
       stations.map((s) => [s.id, { x: s.cx, y: s.cy }]),
     );
-
-    // Stable tldraw shape id per station, so lines can reference stations.
     const shapeIdFor = new Map<string, TLShapeId>(
       stations.map((s) => [s.id, createShapeId()]),
     );
 
-    const stationShapes = stations.map((s) => ({
-      id: shapeIdFor.get(s.id)!,
-      type: "station" as const,
-      x: s.cx - MARKER / 2,
-      y: s.cy - MARKER / 2,
-      props: {
-        w: MARKER,
-        h: MARKER,
-        name: s.name,
-        stationId: s.id,
-        interchange: (lineCount.get(s.id) ?? 0) > 1,
-        labelPos: s.labelPos,
-        color: colourFor.get(s.id) ?? s.color,
-      },
-    }));
+    const stationShapes = stations.map((s) => {
+      const id = shapeIdFor.get(s.id)!;
+      const pos = { x: s.cx - MARKER / 2, y: s.cy - MARKER / 2 };
+      // Both layouts start at the geographic position.
+      geoPos.current.set(id, pos);
+      customPos.current.set(id, pos);
+      return {
+        id,
+        type: "station" as const,
+        x: pos.x,
+        y: pos.y,
+        props: {
+          w: MARKER,
+          h: MARKER,
+          name: s.name,
+          stationId: s.id,
+          interchange: (lineCount.get(s.id) ?? 0) > 1,
+          labelPos: s.labelPos,
+          color: colourFor.get(s.id) ?? s.color,
+        },
+      };
+    });
 
     const lineShapes = lines.map((line) => {
       const ids = line.stationIds
@@ -115,8 +169,6 @@ export default function TubeMap() {
         type: "tube-line" as const,
         x: path.x,
         y: path.y,
-        // Locked: lines are non-interactive decoration (getShapeAtPoint skips
-        // locked shapes, so only stations hover/select/drag).
         isLocked: true,
         props: {
           w: path.w,
@@ -128,14 +180,15 @@ export default function TubeMap() {
       };
     });
 
-    // Lines first → rendered behind the stations.
     editor.createShapes<TubeLineShape | StationShape>([
       ...lineShapes,
       ...stationShapes,
     ]);
 
-    // Reactive lines: when a station moves, redraw the lines through it.
+    // Reactive lines: when a station is dragged, redraw the lines through it.
+    // Skipped while animating — the tween redraws lines itself.
     editor.sideEffects.registerAfterChangeHandler("shape", (prev, next) => {
+      if (animating.current) return;
       if (next.type !== "station") return;
       if (prev.x === next.x && prev.y === next.y) return;
       editor.run(
@@ -143,19 +196,7 @@ export default function TubeMap() {
           for (const shape of editor.getCurrentPageShapes()) {
             if (shape.type !== "tube-line") continue;
             const ids = shape.props.stationIds as TLShapeId[];
-            if (!ids.includes(next.id)) continue;
-            const centres = ids
-              .map((id) => stationCentre(editor, id))
-              .filter((c): c is Pt => !!c);
-            if (centres.length < 2) continue;
-            const path = pathFromPoints(centres);
-            editor.updateShape<TubeLineShape>({
-              id: shape.id,
-              type: "tube-line",
-              x: path.x,
-              y: path.y,
-              props: { w: path.w, h: path.h, d: path.d },
-            });
+            if (ids.includes(next.id)) recomputeLine(editor, shape);
           }
         },
         { ignoreShapeLock: true },
@@ -172,7 +213,6 @@ export default function TubeMap() {
       );
     });
 
-    // Fit once the viewport is measured (it can be 0×0 at onMount).
     const fit = () => {
       const vp = editor.getViewportScreenBounds();
       if (!vp || vp.w < 1 || vp.h < 1) {
@@ -182,13 +222,124 @@ export default function TubeMap() {
       editor.zoomToFit();
     };
     requestAnimationFrame(fit);
+
+    editorRef.current = editor;
   }, []);
+
+  // Animate stations to the target layout (and follow with the lines).
+  const applyMode = useCallback((editor: Editor, geo: boolean) => {
+    if (animFrame.current !== null) cancelAnimationFrame(animFrame.current);
+
+    // Allow programmatic moves while animating; lock to view-only in geo mode.
+    editor.updateInstanceState({ isReadonly: false });
+
+    const ids = [...geoPos.current.keys()];
+    const starts = new Map<TLShapeId, Pt>(
+      ids.map((id) => {
+        const s = editor.getShape(id);
+        return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
+      }),
+    );
+    // Leaving editable mode: remember the user's custom layout first.
+    if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
+    const targets = geo ? geoPos.current : customPos.current;
+
+    animating.current = true;
+    let startTs: number | null = null;
+
+    const tick = (now: number) => {
+      if (startTs === null) startTs = now;
+      const t = Math.min(1, (now - startTs) / ANIM_MS);
+      const e = easeInOutCubic(t);
+      editor.run(
+        () => {
+          for (const id of ids) {
+            const s = starts.get(id)!;
+            const g = targets.get(id)!;
+            editor.updateShape({
+              id,
+              type: "station",
+              x: s.x + (g.x - s.x) * e,
+              y: s.y + (g.y - s.y) * e,
+            });
+          }
+          for (const shape of editor.getCurrentPageShapes()) {
+            if (shape.type === "tube-line") recomputeLine(editor, shape);
+          }
+        },
+        { ignoreShapeLock: true },
+      );
+      if (t < 1) {
+        animFrame.current = requestAnimationFrame(tick);
+      } else {
+        animFrame.current = null;
+        animating.current = false;
+        editor.updateInstanceState({ isReadonly: geo });
+      }
+    };
+    animFrame.current = requestAnimationFrame(tick);
+  }, []);
+
+  // Animate only on a real mode change — skip the initial mount (and React
+  // strict-mode's double-invoke), which would otherwise run a no-op animation.
+  const lastMode = useRef(false);
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || lastMode.current === geoMode) return;
+    lastMode.current = geoMode;
+    applyMode(editor, geoMode);
+  }, [geoMode, applyMode]);
 
   if (!mounted) return null;
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
+      <div style={toggleWrapStyle} role="group" aria-label="Map layout mode">
+        <button
+          type="button"
+          style={segStyle(!geoMode)}
+          aria-pressed={!geoMode}
+          onClick={() => setGeoMode(false)}
+        >
+          Editable
+        </button>
+        <button
+          type="button"
+          style={segStyle(geoMode)}
+          aria-pressed={geoMode}
+          onClick={() => setGeoMode(true)}
+        >
+          Geographic
+        </button>
+      </div>
       <Tldraw shapeUtils={shapeUtils} hideUi onMount={handleMount} />
     </div>
   );
+}
+
+const toggleWrapStyle: CSSProperties = {
+  position: "absolute",
+  top: 12,
+  right: 12,
+  zIndex: 10,
+  display: "flex",
+  gap: 2,
+  padding: 3,
+  background: "#ffffff",
+  border: "1px solid #e4e4e7",
+  borderRadius: 8,
+  boxShadow: "0 1px 3px rgba(0, 0, 0, 0.08)",
+};
+
+function segStyle(active: boolean): CSSProperties {
+  return {
+    padding: "5px 11px",
+    border: "none",
+    borderRadius: 6,
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+    color: active ? "#ffffff" : "#52525b",
+    background: active ? "#18181b" : "transparent",
+  };
 }
