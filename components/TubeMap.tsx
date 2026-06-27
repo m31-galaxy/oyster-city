@@ -23,8 +23,8 @@ import { selectStation } from "@/lib/tube/selection";
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
 const MARKER = 11;
 const ANIM_MS = 650;
-/** Point count used while morphing a line between straight and curved. */
-const MORPH_POINTS = 120;
+/** Points sampled per station-pair segment while morphing a line. */
+const SEG_SAMPLES = 12;
 
 // Line ids to show — null shows the whole network.
 const SHOWN_LINES: string[] | null = null;
@@ -138,6 +138,7 @@ export default function TubeMap() {
   const geoPos = useRef<Map<TLShapeId, Pose>>(new Map());
   const customPos = useRef<Map<TLShapeId, Pose>>(new Map());
   const lineGeo = useRef<Map<TLShapeId, Pt[]>>(new Map());
+  const lineSegGeo = useRef<Map<TLShapeId, (Pt[] | null)[]>>(new Map());
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
 
@@ -206,11 +207,19 @@ export default function TubeMap() {
         .map((sid) => centreFor.get(sid))
         .filter((c): c is Pt => !!c);
       const path = pathFromPoints(centres);
-      // Stash the projected OSM track curve for geographic mode.
+      // Stash the projected OSM track curve (settle) + per-pair segments (morph).
       if (line.geoPoints.length >= 2) {
         lineGeo.current.set(
           lineId,
           line.geoPoints.map(([x, y]) => ({ x, y })),
+        );
+      }
+      if (line.geoSegments.length) {
+        lineSegGeo.current.set(
+          lineId,
+          line.geoSegments.map((seg) =>
+            seg ? seg.map(([x, y]) => ({ x, y })) : null,
+          ),
         );
       }
       return {
@@ -296,28 +305,45 @@ export default function TubeMap() {
 
     // Precompute each line's resampled OSM curve so the tween can morph the
     // lines straight<->curve in lockstep with the station movement.
+    // For each line, decompose each station-pair segment into (along, perp)
+    // relative to its geo chord — so the tick can re-anchor it to the *current*
+    // chord between its two live stations and keep stations on the line.
     const lineMorph = editor
       .getCurrentPageShapes()
       .filter((s): s is TubeLineShape => s.type === "tube-line")
       .map((s) => {
         const stationIds = s.props.stationIds as TLShapeId[];
-        const curve = lineGeo.current.get(s.id);
-        let curveN =
-          curve && curve.length >= 2 ? resample(curve, MORPH_POINTS) : null;
-        // Orient the curve to the station order so its endpoints line up with
-        // the straight path's — otherwise the line flips end-to-end mid-morph
-        // (the OSM stitch direction can be the reverse of the route order).
-        if (curveN) {
-          const a = geoPos.current.get(stationIds[0]);
-          const b = geoPos.current.get(stationIds[stationIds.length - 1]);
-          if (a && b) {
-            const head = curveN[0];
-            const dA = Math.hypot(head.x - a.x, head.y - a.y);
-            const dB = Math.hypot(head.x - b.x, head.y - b.y);
-            if (dB < dA) curveN = curveN.slice().reverse();
+        const segs = lineSegGeo.current.get(s.id);
+        const segMorph: ({ along: number[]; perp: number[] } | null)[] = [];
+        if (segs && segs.length === stationIds.length - 1) {
+          for (const seg of segs) {
+            if (!seg || seg.length < 2) {
+              segMorph.push(null);
+              continue;
+            }
+            // Segment endpoints are snapped to the geo station centres, so
+            // they already run stationIds[i] -> stationIds[i+1] (no flip).
+            const rs = resample(seg, SEG_SAMPLES);
+            const a = rs[0];
+            const b = rs[rs.length - 1];
+            const cx = b.x - a.x;
+            const cy = b.y - a.y;
+            const L = Math.hypot(cx, cy) || 1;
+            const ux = cx / L;
+            const uy = cy / L;
+            const along: number[] = [];
+            const perp: number[] = [];
+            for (const p of rs) {
+              const dx = p.x - a.x;
+              const dy = p.y - a.y;
+              along.push((dx * ux + dy * uy) / L);
+              perp.push((dx * -uy + dy * ux) / L);
+            }
+            segMorph.push({ along, perp });
           }
         }
-        return { id: s.id, stationIds, curveN };
+        const hasCurve = segMorph.some((m) => m !== null);
+        return { id: s.id, stationIds, segMorph, hasCurve };
       });
 
     // Only animate stations that actually move (none, in the common no-edit
@@ -355,8 +381,11 @@ export default function TubeMap() {
               rotation: s.rotation + (g.rotation - s.rotation) * e,
             });
           }
-          // Morph each line between straight (through the current station
-          // centres) and its OSM curve. morphFrac: 0 = straight, 1 = curve.
+          // Draw each line as its station-pair segments, each anchored to its
+          // two CURRENT station centres with a perpendicular bow scaled by
+          // morphFrac (0 = straight chord, 1 = the OSM curve). Because every
+          // segment endpoint sits exactly on a station centre, the stations
+          // never detach from the line during the tween.
           const morphFrac = geo ? e : 1 - e;
           for (const lm of lineMorph) {
             const centres = lm.stationIds
@@ -364,15 +393,37 @@ export default function TubeMap() {
               .filter((c): c is Pt => !!c);
             if (centres.length < 2) continue;
             let pts: Pt[];
-            if (lm.curveN && morphFrac > 0) {
-              const straightN = resample(centres, MORPH_POINTS);
-              pts = straightN.map((sp, i) => {
-                const c = lm.curveN![i];
-                return {
-                  x: sp.x + (c.x - sp.x) * morphFrac,
-                  y: sp.y + (c.y - sp.y) * morphFrac,
-                };
-              });
+            if (
+              lm.hasCurve &&
+              morphFrac > 0 &&
+              centres.length === lm.stationIds.length
+            ) {
+              pts = [];
+              for (let i = 0; i < lm.segMorph.length; i++) {
+                const cA = centres[i];
+                const cB = centres[i + 1];
+                const m = lm.segMorph[i];
+                if (!m) {
+                  // No curve for this pair → straight chord.
+                  if (pts.length === 0) pts.push(cA);
+                  pts.push(cB);
+                  continue;
+                }
+                const cx = cB.x - cA.x;
+                const cy = cB.y - cA.y;
+                const L = Math.hypot(cx, cy) || 1;
+                const pux = -cy / L; // unit perpendicular of the current chord
+                const puy = cx / L;
+                for (let j = 0; j < m.along.length; j++) {
+                  if (i > 0 && j === 0) continue; // drop the shared joint vertex
+                  const a = m.along[j];
+                  const pf = m.perp[j];
+                  pts.push({
+                    x: cA.x + a * cx + morphFrac * pf * L * pux,
+                    y: cA.y + a * cy + morphFrac * pf * L * puy,
+                  });
+                }
+              }
             } else {
               pts = centres;
             }

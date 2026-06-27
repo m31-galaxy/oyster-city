@@ -20,6 +20,8 @@ interface RawLine {
   stationIds: string[];
   /** OSM-derived track curve as [lon,lat] (added by add-osm-curves.mjs). */
   geoPath?: [number, number][];
+  /** Per-station-pair OSM curves as [lon,lat]; segment i joins stationIds[i]..[i+1]. */
+  geoSegments?: ([number, number][] | null)[];
 }
 interface RawStation {
   id: string;
@@ -45,6 +47,8 @@ export interface TubeLinePath {
   stationIds: string[];
   /** Projected OSM track curve (canvas coords); empty if unavailable. */
   geoPoints: [number, number][];
+  /** Projected per-station-pair OSM curves (canvas); segment i joins stationIds[i]..[i+1]. */
+  geoSegments: ([number, number][] | null)[];
 }
 
 export interface TubeStation {
@@ -101,6 +105,9 @@ export function getTubeNetwork(): TubeNetwork {
     points: l.points.map(([lon, lat]) => project(lon, lat)),
     stationIds: l.stationIds,
     geoPoints: (l.geoPath ?? []).map(([lon, lat]) => project(lon, lat)),
+    geoSegments: (l.geoSegments ?? []).map((seg) =>
+      seg ? seg.map(([lon, lat]) => project(lon, lat)) : null,
+    ),
   }));
 
   const stations: TubeStation[] = data.stations.map((s) => {
