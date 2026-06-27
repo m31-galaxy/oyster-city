@@ -61,15 +61,19 @@ for (const line of lines) {
     );
     if (stops.length < 2) continue;
     branches++;
+    const hubKey = (sp) => sp.topMostParentId || sp.stationId || sp.id;
     linePaths.push({
       id: line.id,
       name: line.name,
       color: colour,
       points: stops.map((sp) => [sp.lon, sp.lat]),
+      // Ordered station hub ids, aligned with `points` — lets the renderer
+      // link line segments to station shapes for a reactive node-graph.
+      stationIds: stops.map(hubKey),
     });
     for (const sp of stops) {
       // Group platforms/modes under the hub so multi-mode interchanges merge.
-      const key = sp.topMostParentId || sp.stationId || sp.id;
+      const key = hubKey(sp);
       let st = stations.get(key);
       if (!st) {
         st = {

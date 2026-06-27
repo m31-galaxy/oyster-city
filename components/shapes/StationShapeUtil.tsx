@@ -8,7 +8,6 @@ import {
   useValue,
   type TLBaseShape,
 } from "tldraw";
-import { selectStation } from "@/lib/tube/selection";
 
 export interface StationProps {
   w: number;
@@ -74,7 +73,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   }
 
   override component(shape: StationShape) {
-    const { name, stationId, interchange, labelPos, color, w, h } = shape.props;
+    const { name, interchange, labelPos, color, w, h } = shape.props;
     const editor = useEditor();
     // Interchanges are always labelled; other stations reveal as you zoom in.
     // The computed value is a boolean, so a shape only re-renders when it
@@ -83,6 +82,14 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       "show-label",
       () => interchange || editor.getZoomLevel() >= LABEL_ZOOM,
       [editor, interchange],
+    );
+    // Read rotation reactively: tldraw updates the shape container's transform
+    // for rotation without re-rendering component(), so `shape.rotation` here
+    // is stale. Subscribing forces a re-render when rotation actually changes.
+    const rotation = useValue(
+      "rotation",
+      () => editor.getShape(shape.id)?.rotation ?? 0,
+      [editor, shape.id],
     );
     const marker: CSSProperties = interchange
       ? {
@@ -102,19 +109,20 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
         };
 
     return (
-      <HTMLContainer style={{ pointerEvents: "all", cursor: "pointer" }}>
-        <div
-          onPointerDown={(e) => {
-            // Handle the tap ourselves; don't let tldraw start a pan/marquee.
-            e.stopPropagation();
-            selectStation({ id: stationId, name });
-          }}
-          style={{ position: "relative", width: w, height: h }}
-        >
+      // pointer-events: none — tldraw handles selection/drag via the shape's
+      // geometry, so the marker is purely visual and never blocks a drag.
+      <HTMLContainer style={{ pointerEvents: "none" }}>
+        <div style={{ position: "relative", width: w, height: h }}>
           <div style={marker} />
-          {/* Progressive labels: interchanges always, others on zoom-in. Any
-              station's name also shows in the sidebar on tap. */}
-          {showLabel && <span style={labelStyle(labelPos)}>{name}</span>}
+          {/* Progressive labels: interchanges always, others on zoom-in. The
+              selected station's name also shows in the sidebar. The anchor
+              counter-rotates so the label stays horizontal even when the
+              station's transform is rotated. */}
+          {showLabel && (
+            <div style={labelAnchorStyle(rotation)}>
+              <span style={labelStyle(labelPos)}>{name}</span>
+            </div>
+          )}
         </div>
       </HTMLContainer>
     );
@@ -128,8 +136,25 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   }
 }
 
-/** Place the label N/S/E/W of the marker per the dataset's labelPos hint. */
+/**
+ * A zero-size anchor at the marker centre that counter-rotates the label by
+ * the shape's rotation, keeping the name horizontal (and attached) however the
+ * station is rotated.
+ */
+function labelAnchorStyle(rotation: number): CSSProperties {
+  return {
+    position: "absolute",
+    left: "50%",
+    top: "50%",
+    width: 0,
+    height: 0,
+    transform: `rotate(${-rotation}rad)`,
+  };
+}
+
+/** Place the label N/S/E/W of the marker centre per the labelPos hint. */
 function labelStyle(pos: string): CSSProperties {
+  const offset = MARKER / 2 + 3; // marker radius + gap, measured from the centre
   const style: CSSProperties = {
     position: "absolute",
     fontSize: 9,
@@ -142,19 +167,19 @@ function labelStyle(pos: string): CSSProperties {
   };
   const transforms: string[] = [];
 
-  if (pos.includes("N")) style.bottom = "calc(100% + 1px)";
-  else if (pos.includes("S")) style.top = "calc(100% + 1px)";
+  if (pos.includes("N")) style.bottom = offset;
+  else if (pos.includes("S")) style.top = offset;
   else {
-    style.top = "50%";
+    style.top = 0;
     transforms.push("translateY(-50%)");
   }
 
-  if (pos.includes("E")) style.left = "calc(100% + 3px)";
+  if (pos.includes("E")) style.left = offset;
   else if (pos.includes("W")) {
-    style.right = "calc(100% + 3px)";
+    style.right = offset;
     style.textAlign = "right";
   } else {
-    style.left = "50%";
+    style.left = 0;
     transforms.push("translateX(-50%)");
     style.textAlign = "center";
   }

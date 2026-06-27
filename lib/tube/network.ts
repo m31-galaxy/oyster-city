@@ -17,6 +17,7 @@ interface RawLine {
   name: string;
   color: string;
   points: [number, number][];
+  stationIds: string[];
 }
 interface RawStation {
   id: string;
@@ -38,6 +39,8 @@ export interface TubeLinePath {
   name: string;
   color: string;
   points: [number, number][];
+  /** Ordered station ids (aligned with `points`) this line passes through. */
+  stationIds: string[];
 }
 
 export interface TubeStation {
@@ -90,6 +93,7 @@ export function getTubeNetwork(): TubeNetwork {
     name: l.name,
     color: l.color,
     points: l.points.map(([lon, lat]) => project(lon, lat)),
+    stationIds: l.stationIds,
   }));
 
   const stations: TubeStation[] = data.stations.map((s) => {

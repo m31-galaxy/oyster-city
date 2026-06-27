@@ -11,6 +11,8 @@ export interface TubeLineProps {
   h: number;
   color: string;
   d: string;
+  /** tldraw shape ids of the stations this line connects, in order. */
+  stationIds: string[];
 }
 
 // Register the custom shape in tldraw's type system (tldraw 5 indexed-shapes
@@ -31,10 +33,11 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     h: T.number,
     color: T.string,
     d: T.string,
+    stationIds: T.arrayOf(T.string),
   };
 
   override getDefaultProps(): TubeLineShape["props"] {
-    return { w: 1, h: 1, color: "#666666", d: "" };
+    return { w: 1, h: 1, color: "#666666", d: "", stationIds: [] };
   }
 
   // Read-only decoration: never editable, resizable, or bindable.
