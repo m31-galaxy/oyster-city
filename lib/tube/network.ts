@@ -18,6 +18,8 @@ interface RawLine {
   color: string;
   points: [number, number][];
   stationIds: string[];
+  /** OSM-derived track curve as [lon,lat] (added by add-osm-curves.mjs). */
+  geoPath?: [number, number][];
 }
 interface RawStation {
   id: string;
@@ -41,6 +43,8 @@ export interface TubeLinePath {
   points: [number, number][];
   /** Ordered station ids (aligned with `points`) this line passes through. */
   stationIds: string[];
+  /** Projected OSM track curve (canvas coords); empty if unavailable. */
+  geoPoints: [number, number][];
 }
 
 export interface TubeStation {
@@ -76,6 +80,8 @@ export function getTubeNetwork(): TubeNetwork {
     latMax = Math.max(latMax, lat);
   };
   for (const l of data.lines) for (const [lon, lat] of l.points) consider(lon, lat);
+  for (const l of data.lines)
+    if (l.geoPath) for (const [lon, lat] of l.geoPath) consider(lon, lat);
   for (const s of data.stations) consider(s.lon, s.lat);
 
   // Equirectangular projection with longitude compressed by cos(latitude) so
@@ -94,6 +100,7 @@ export function getTubeNetwork(): TubeNetwork {
     color: l.color,
     points: l.points.map(([lon, lat]) => project(lon, lat)),
     stationIds: l.stationIds,
+    geoPoints: (l.geoPath ?? []).map(([lon, lat]) => project(lon, lat)),
   }));
 
   const stations: TubeStation[] = data.stations.map((s) => {

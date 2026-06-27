@@ -51,7 +51,9 @@ export default async function Home() {
           </ul>
         </section>
 
-        <footer className="attribution">Powered by TfL Open Data</footer>
+        <footer className="attribution">
+          Powered by TfL Open Data. Line geometry © OpenStreetMap contributors.
+        </footer>
       </CollapsibleSidebar>
 
       <div className="map">

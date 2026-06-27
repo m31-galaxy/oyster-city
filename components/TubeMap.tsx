@@ -56,14 +56,20 @@ function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
   return b ? { x: b.center.x, y: b.center.y } : null;
 }
 
-/** Redraw one line through its stations' current centres. */
-function recomputeLine(editor: Editor, line: TubeLineShape) {
-  const ids = line.props.stationIds as TLShapeId[];
-  const centres = ids
-    .map((id) => stationCentre(editor, id))
-    .filter((c): c is Pt => !!c);
-  if (centres.length < 2) return;
-  const path = pathFromPoints(centres);
+/**
+ * Redraw one line. With `curve` (the projected OSM track), it follows the real
+ * geography; otherwise it draws straight segments through its stations' current
+ * centres (the editable layout).
+ */
+function recomputeLine(editor: Editor, line: TubeLineShape, curve: Pt[] | null) {
+  const pts =
+    curve && curve.length >= 2
+      ? curve
+      : (line.props.stationIds as TLShapeId[])
+          .map((id) => stationCentre(editor, id))
+          .filter((c): c is Pt => !!c);
+  if (pts.length < 2) return;
+  const path = pathFromPoints(pts);
   editor.updateShape<TubeLineShape>({
     id: line.id,
     type: "tube-line",
@@ -73,12 +79,17 @@ function recomputeLine(editor: Editor, line: TubeLineShape) {
   });
 }
 
-/** Redraw every line (used while animating, where many stations move at once). */
-function recomputeAllLines(editor: Editor) {
+/** Redraw every line. Pass `lineGeo` to draw OSM curves, or null for straight. */
+function recomputeAllLines(
+  editor: Editor,
+  lineGeo: Map<TLShapeId, Pt[]> | null,
+) {
   editor.run(
     () => {
       for (const shape of editor.getCurrentPageShapes()) {
-        if (shape.type === "tube-line") recomputeLine(editor, shape);
+        if (shape.type === "tube-line") {
+          recomputeLine(editor, shape, lineGeo?.get(shape.id) ?? null);
+        }
       }
     },
     { ignoreShapeLock: true },
@@ -99,6 +110,7 @@ export default function TubeMap() {
   const editorRef = useRef<Editor | null>(null);
   const geoPos = useRef<Map<TLShapeId, Pt>>(new Map());
   const customPos = useRef<Map<TLShapeId, Pt>>(new Map());
+  const lineGeo = useRef<Map<TLShapeId, Pt[]>>(new Map());
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
 
@@ -157,6 +169,7 @@ export default function TubeMap() {
     });
 
     const lineShapes = lines.map((line) => {
+      const lineId = createShapeId();
       const ids = line.stationIds
         .map((sid) => shapeIdFor.get(sid))
         .filter((id): id is TLShapeId => !!id);
@@ -164,8 +177,15 @@ export default function TubeMap() {
         .map((sid) => centreFor.get(sid))
         .filter((c): c is Pt => !!c);
       const path = pathFromPoints(centres);
+      // Stash the projected OSM track curve for geographic mode.
+      if (line.geoPoints.length >= 2) {
+        lineGeo.current.set(
+          lineId,
+          line.geoPoints.map(([x, y]) => ({ x, y })),
+        );
+      }
       return {
-        id: createShapeId(),
+        id: lineId,
         type: "tube-line" as const,
         x: path.x,
         y: path.y,
@@ -196,7 +216,8 @@ export default function TubeMap() {
           for (const shape of editor.getCurrentPageShapes()) {
             if (shape.type !== "tube-line") continue;
             const ids = shape.props.stationIds as TLShapeId[];
-            if (ids.includes(next.id)) recomputeLine(editor, shape);
+            // Dragging only happens in editable mode → straight segments.
+            if (ids.includes(next.id)) recomputeLine(editor, shape, null);
           }
         },
         { ignoreShapeLock: true },
@@ -263,8 +284,10 @@ export default function TubeMap() {
               y: s.y + (g.y - s.y) * e,
             });
           }
+          // Straight segments while moving (the OSM curve only fits the
+          // geographic layout, applied once settled below).
           for (const shape of editor.getCurrentPageShapes()) {
-            if (shape.type === "tube-line") recomputeLine(editor, shape);
+            if (shape.type === "tube-line") recomputeLine(editor, shape, null);
           }
         },
         { ignoreShapeLock: true },
@@ -274,6 +297,8 @@ export default function TubeMap() {
       } else {
         animFrame.current = null;
         animating.current = false;
+        // Settle: geographic mode snaps lines onto the real OSM track curves.
+        recomputeAllLines(editor, geo ? lineGeo.current : null);
         editor.updateInstanceState({ isReadonly: geo });
       }
     };
