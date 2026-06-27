@@ -23,6 +23,8 @@ import { selectStation } from "@/lib/tube/selection";
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
 const MARKER = 11;
 const ANIM_MS = 650;
+/** Point count used while morphing a line between straight and curved. */
+const MORPH_POINTS = 120;
 
 // Two simple, branch-free lines sharing exactly one station (Oxford Circus).
 const SHOWN_LINES = ["bakerloo", "victoria"];
@@ -54,6 +56,30 @@ function pathFromPoints(points: Pt[]) {
 function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
   const b = editor.getShapePageBounds(id);
   return b ? { x: b.center.x, y: b.center.y } : null;
+}
+
+/** Resample a polyline to `n` points spaced evenly by arc length. */
+function resample(points: Pt[], n: number): Pt[] {
+  if (points.length <= 1) return points.slice();
+  const cum = [0];
+  for (let i = 1; i < points.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y));
+  }
+  const total = cum[cum.length - 1];
+  if (total === 0) return Array.from({ length: n }, () => ({ ...points[0] }));
+  const out: Pt[] = [];
+  let seg = 0;
+  for (let i = 0; i < n; i++) {
+    const target = (i / (n - 1)) * total;
+    while (seg < points.length - 2 && cum[seg + 1] < target) seg++;
+    const segLen = cum[seg + 1] - cum[seg] || 1;
+    const f = (target - cum[seg]) / segLen;
+    out.push({
+      x: points[seg].x + (points[seg + 1].x - points[seg].x) * f,
+      y: points[seg].y + (points[seg + 1].y - points[seg].y) * f,
+    });
+  }
+  return out;
 }
 
 /**
@@ -265,6 +291,32 @@ export default function TubeMap() {
     if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
     const targets = geo ? geoPos.current : customPos.current;
 
+    // Precompute each line's resampled OSM curve so the tween can morph the
+    // lines straight<->curve in lockstep with the station movement.
+    const lineMorph = editor
+      .getCurrentPageShapes()
+      .filter((s): s is TubeLineShape => s.type === "tube-line")
+      .map((s) => {
+        const stationIds = s.props.stationIds as TLShapeId[];
+        const curve = lineGeo.current.get(s.id);
+        let curveN =
+          curve && curve.length >= 2 ? resample(curve, MORPH_POINTS) : null;
+        // Orient the curve to the station order so its endpoints line up with
+        // the straight path's — otherwise the line flips end-to-end mid-morph
+        // (the OSM stitch direction can be the reverse of the route order).
+        if (curveN) {
+          const a = geoPos.current.get(stationIds[0]);
+          const b = geoPos.current.get(stationIds[stationIds.length - 1]);
+          if (a && b) {
+            const head = curveN[0];
+            const dA = Math.hypot(head.x - a.x, head.y - a.y);
+            const dB = Math.hypot(head.x - b.x, head.y - b.y);
+            if (dB < dA) curveN = curveN.slice().reverse();
+          }
+        }
+        return { id: s.id, stationIds, curveN };
+      });
+
     animating.current = true;
     let startTs: number | null = null;
 
@@ -284,10 +336,35 @@ export default function TubeMap() {
               y: s.y + (g.y - s.y) * e,
             });
           }
-          // Straight segments while moving (the OSM curve only fits the
-          // geographic layout, applied once settled below).
-          for (const shape of editor.getCurrentPageShapes()) {
-            if (shape.type === "tube-line") recomputeLine(editor, shape, null);
+          // Morph each line between straight (through the current station
+          // centres) and its OSM curve. morphFrac: 0 = straight, 1 = curve.
+          const morphFrac = geo ? e : 1 - e;
+          for (const lm of lineMorph) {
+            const centres = lm.stationIds
+              .map((id) => stationCentre(editor, id))
+              .filter((c): c is Pt => !!c);
+            if (centres.length < 2) continue;
+            let pts: Pt[];
+            if (lm.curveN && morphFrac > 0) {
+              const straightN = resample(centres, MORPH_POINTS);
+              pts = straightN.map((sp, i) => {
+                const c = lm.curveN![i];
+                return {
+                  x: sp.x + (c.x - sp.x) * morphFrac,
+                  y: sp.y + (c.y - sp.y) * morphFrac,
+                };
+              });
+            } else {
+              pts = centres;
+            }
+            const path = pathFromPoints(pts);
+            editor.updateShape<TubeLineShape>({
+              id: lm.id,
+              type: "tube-line",
+              x: path.x,
+              y: path.y,
+              props: { w: path.w, h: path.h, d: path.d },
+            });
           }
         },
         { ignoreShapeLock: true },
