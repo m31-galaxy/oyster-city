@@ -65,14 +65,7 @@ for (const line of lines) {
       id: line.id,
       name: line.name,
       color: colour,
-      // Keep the hub id per stop so the renderer has an ordered station-id
-      // sequence per branch — needed to build the octilinear line geometry
-      // from (fixed) station positions, and to merge shared/interchange stops.
-      points: stops.map((sp) => ({
-        id: sp.topMostParentId || sp.stationId || sp.id,
-        lon: sp.lon,
-        lat: sp.lat,
-      })),
+      points: stops.map((sp) => [sp.lon, sp.lat]),
     });
     for (const sp of stops) {
       // Group platforms/modes under the hub so multi-mode interchanges merge.
@@ -102,7 +95,6 @@ const stationList = [...stations.values()].map((s) => ({
   lon: s.lon,
   interchange: s.lineSet.size > 1,
   color: s.color,
-  lines: [...s.lineSet],
 }));
 
 mkdirSync(join(root, "lib/tube"), { recursive: true });

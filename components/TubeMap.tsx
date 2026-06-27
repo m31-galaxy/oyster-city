@@ -1,108 +1,110 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import {
-  Tldraw,
-  createShapeId,
-  react,
-  type Editor,
-  type TLComponents,
-} from "tldraw";
+import { Tldraw, createShapeId, type Editor } from "tldraw";
 import "tldraw/tldraw.css";
-import {
-  StationShapeUtil,
-  type StationShape,
-} from "@/components/shapes/StationShapeUtil";
-import { OctiLines } from "@/components/OctiLines";
+import { TubeLineShapeUtil, type TubeLineShape } from "@/components/shapes/TubeLineShapeUtil";
+import { StationShapeUtil, type StationShape } from "@/components/shapes/StationShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
-import { selectStation } from "@/lib/tube/selection";
 
-const shapeUtils = [StationShapeUtil];
-const components: TLComponents = { OnTheCanvas: OctiLines };
+const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
 const MARKER = 11;
 
-/** Octilinear prototype scope: two simple, branch-free lines sharing Oxford Circus. */
-const SCOPED = new Set(["bakerloo", "victoria"]);
-
 /**
- * Octilinear-prototype canvas (the `'use client'` island).
+ * Read-only schematic Tube-map canvas (the `'use client'` island).
  *
- * Shows only the Bakerloo + Victoria lines. Stations are DRAGGABLE tldraw
- * shapes; the connecting lines are drawn octilinearly (Beck-style) by
- * `OctiLines` (OnTheCanvas), which re-routes reactively as stations move.
+ * On mount it builds the whole network from `getTubeNetwork()` — one
+ * `tube-line` shape per line (coloured polyline) layered behind one `station`
+ * shape per stop (interactive) — fits it to the viewport, then locks the
+ * editor so users can only pan/zoom/tap. Gated behind `mounted` so tldraw
+ * never touches `window` during Next's server prerender.
  */
 export default function TubeMap() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
   const handleMount = useCallback((editor: Editor) => {
+    // Dev affordance: reach the editor from the console (e.g. window.editor).
     if (process.env.NODE_ENV !== "production") {
       (window as unknown as { editor?: Editor }).editor = editor;
     }
 
-    // Clean slate (guards React double-invoke / stale state).
+    // Clean slate (guards React double-invoke / stale state). Plain
+    // deleteShapes skips locked shapes — the lines are locked — so force it
+    // past the lock, otherwise old lines accumulate on re-mount.
     const existing = [...editor.getCurrentPageShapeIds()];
     if (existing.length) {
       editor.run(() => editor.deleteShapes(existing), { ignoreShapeLock: true });
     }
 
     const net = getTubeNetwork();
-    const ids = new Set<string>();
-    for (const b of net.branches) {
-      if (SCOPED.has(b.lineId)) for (const id of b.stationIds) ids.add(id);
-    }
 
-    const stationShapes = [...ids]
-      .map((id) => net.stationsById.get(id))
-      .filter((s): s is NonNullable<typeof s> => s != null)
-      .map((s) => ({
+    const lineShapes = net.lines.map((line) => {
+      const xs = line.points.map((p) => p[0]);
+      const ys = line.points.map((p) => p[1]);
+      const minX = Math.min(...xs);
+      const minY = Math.min(...ys);
+      const d = line.points
+        .map((p, i) => `${i === 0 ? "M" : "L"} ${p[0] - minX} ${p[1] - minY}`)
+        .join(" ");
+      return {
         id: createShapeId(),
-        type: "station" as const,
-        x: s.cx - MARKER / 2,
-        y: s.cy - MARKER / 2,
+        type: "tube-line" as const,
+        x: minX,
+        y: minY,
+        // Locked so the lines are never hovered or selected (getShapeAtPoint
+        // skips locked shapes) — they're decoration behind the stations.
+        isLocked: true,
         props: {
-          w: MARKER,
-          h: MARKER,
-          name: s.name,
-          stationId: s.id,
-          interchange: s.interchange,
-          labelPos: s.labelPos,
-          color: s.color,
+          w: Math.max(...xs) - minX || 1,
+          h: Math.max(...ys) - minY || 1,
+          color: line.color,
+          d,
         },
-      }));
-    editor.createShapes<StationShape>(stationShapes);
-
-    // Mirror the selected station into the sidebar readout (dragging still works).
-    react("selected-station", () => {
-      const sel = editor.getOnlySelectedShape();
-      if (sel?.type === "station") {
-        const st = sel as StationShape;
-        selectStation({ id: st.props.stationId, name: st.props.name });
-      }
+      };
     });
 
-    // Fit once the viewport is measured. NOT readonly — stations stay draggable.
-    const fit = () => {
+    const stationShapes = net.stations.map((s) => ({
+      id: createShapeId(),
+      type: "station" as const,
+      x: s.cx - MARKER / 2,
+      y: s.cy - MARKER / 2,
+      props: {
+        w: MARKER,
+        h: MARKER,
+        name: s.name,
+        stationId: s.id,
+        interchange: s.interchange,
+        labelPos: s.labelPos,
+        color: s.color,
+      },
+    }));
+
+    editor.createShapes<TubeLineShape | StationShape>([
+      ...lineShapes,
+      ...stationShapes,
+    ]);
+
+    // Fit once the viewport is actually measured — at onMount it can still be
+    // 0×0, which makes zoomToFit a silent no-op (camera stuck at the origin).
+    // Then lock the canvas to pan/zoom/tap only.
+    const fitAndLock = () => {
       const vp = editor.getViewportScreenBounds();
       if (!vp || vp.w < 1 || vp.h < 1) {
-        requestAnimationFrame(fit);
+        requestAnimationFrame(fitAndLock);
         return;
       }
       editor.zoomToFit();
+      editor.updateInstanceState({ isReadonly: true });
     };
-    requestAnimationFrame(fit);
+    requestAnimationFrame(fitAndLock);
   }, []);
 
   if (!mounted) return null;
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
-      <Tldraw
-        shapeUtils={shapeUtils}
-        components={components}
-        hideUi
-        onMount={handleMount}
-      />
+      <Tldraw shapeUtils={shapeUtils} hideUi onMount={handleMount} />
     </div>
   );
 }
