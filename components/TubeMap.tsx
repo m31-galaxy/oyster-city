@@ -30,6 +30,7 @@ const MORPH_POINTS = 120;
 const SHOWN_LINES: string[] | null = null;
 
 type Pt = { x: number; y: number };
+type Pose = { x: number; y: number; rotation: number };
 
 const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -134,8 +135,8 @@ export default function TubeMap() {
   const [geoMode, setGeoMode] = useState(false);
 
   const editorRef = useRef<Editor | null>(null);
-  const geoPos = useRef<Map<TLShapeId, Pt>>(new Map());
-  const customPos = useRef<Map<TLShapeId, Pt>>(new Map());
+  const geoPos = useRef<Map<TLShapeId, Pose>>(new Map());
+  const customPos = useRef<Map<TLShapeId, Pose>>(new Map());
   const lineGeo = useRef<Map<TLShapeId, Pt[]>>(new Map());
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
@@ -176,9 +177,9 @@ export default function TubeMap() {
     const stationShapes = stations.map((s) => {
       const id = shapeIdFor.get(s.id)!;
       const pos = { x: s.cx - MARKER / 2, y: s.cy - MARKER / 2 };
-      // Both layouts start at the geographic position.
-      geoPos.current.set(id, pos);
-      customPos.current.set(id, pos);
+      // Both layouts start at the geographic position, unrotated.
+      geoPos.current.set(id, { ...pos, rotation: 0 });
+      customPos.current.set(id, { ...pos, rotation: 0 });
       return {
         id,
         type: "station" as const,
@@ -283,10 +284,10 @@ export default function TubeMap() {
     editor.updateInstanceState({ isReadonly: false });
 
     const ids = [...geoPos.current.keys()];
-    const starts = new Map<TLShapeId, Pt>(
+    const starts = new Map<TLShapeId, Pose>(
       ids.map((id) => {
         const s = editor.getShape(id);
-        return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
+        return [id, { x: s?.x ?? 0, y: s?.y ?? 0, rotation: s?.rotation ?? 0 }];
       }),
     );
     // Leaving editable mode: remember the user's custom layout first.
@@ -324,7 +325,11 @@ export default function TubeMap() {
     const movingIds = ids.filter((id) => {
       const s = starts.get(id)!;
       const g = targets.get(id)!;
-      return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
+      return (
+        Math.abs(s.x - g.x) > 0.5 ||
+        Math.abs(s.y - g.y) > 0.5 ||
+        Math.abs(s.rotation - g.rotation) > 1e-4
+      );
     });
 
     animating.current = true;
@@ -344,6 +349,10 @@ export default function TubeMap() {
               type: "station",
               x: s.x + (g.x - s.x) * e,
               y: s.y + (g.y - s.y) * e,
+              // Geographic mode is canonical (rotation 0); editable restores the
+              // captured rotation. Leftover rotation would offset a station's
+              // centre off the fixed curve.
+              rotation: s.rotation + (g.rotation - s.rotation) * e,
             });
           }
           // Morph each line between straight (through the current station
