@@ -23,8 +23,6 @@ import { selectStation } from "@/lib/tube/selection";
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
 const MARKER = 11;
 const ANIM_MS = 650;
-/** Points sampled per station-pair segment while morphing a line. */
-const SEG_SAMPLES = 12;
 
 // Line ids to show — null shows the whole network.
 const SHOWN_LINES: string[] | null = null;
@@ -57,30 +55,6 @@ function pathFromPoints(points: Pt[]) {
 function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
   const b = editor.getShapePageBounds(id);
   return b ? { x: b.center.x, y: b.center.y } : null;
-}
-
-/** Resample a polyline to `n` points spaced evenly by arc length. */
-function resample(points: Pt[], n: number): Pt[] {
-  if (points.length <= 1) return points.slice();
-  const cum = [0];
-  for (let i = 1; i < points.length; i++) {
-    cum.push(cum[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y));
-  }
-  const total = cum[cum.length - 1];
-  if (total === 0) return Array.from({ length: n }, () => ({ ...points[0] }));
-  const out: Pt[] = [];
-  let seg = 0;
-  for (let i = 0; i < n; i++) {
-    const target = (i / (n - 1)) * total;
-    while (seg < points.length - 2 && cum[seg + 1] < target) seg++;
-    const segLen = cum[seg + 1] - cum[seg] || 1;
-    const f = (target - cum[seg]) / segLen;
-    out.push({
-      x: points[seg].x + (points[seg + 1].x - points[seg].x) * f,
-      y: points[seg].y + (points[seg + 1].y - points[seg].y) * f,
-    });
-  }
-  return out;
 }
 
 /**
@@ -303,7 +277,7 @@ export default function TubeMap() {
     if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
     const targets = geo ? geoPos.current : customPos.current;
 
-    // Precompute each line's resampled OSM curve so the tween can morph the
+    // Precompute each line's per-pair OSM geometry so the tween can morph the
     // lines straight<->curve in lockstep with the station movement.
     // For each line, decompose each station-pair segment into (along, perp)
     // relative to its geo chord — so the tick can re-anchor it to the *current*
@@ -323,9 +297,12 @@ export default function TubeMap() {
             }
             // Segment endpoints are snapped to the geo station centres, so
             // they already run stationIds[i] -> stationIds[i+1] (no flip).
-            const rs = resample(seg, SEG_SAMPLES);
-            const a = rs[0];
-            const b = rs[rs.length - 1];
+            // Decompose the segment's *full* point set (not a resample): at
+            // morphFrac=1 the reconstruction then reproduces geoPath exactly, so
+            // the hand-off to the static geo curve on settle is seamless — no
+            // snap between the smooth geo line and the tween.
+            const a = seg[0];
+            const b = seg[seg.length - 1];
             const cx = b.x - a.x;
             const cy = b.y - a.y;
             const L = Math.hypot(cx, cy) || 1;
@@ -333,7 +310,7 @@ export default function TubeMap() {
             const uy = cy / L;
             const along: number[] = [];
             const perp: number[] = [];
-            for (const p of rs) {
+            for (const p of seg) {
               const dx = p.x - a.x;
               const dy = p.y - a.y;
               along.push((dx * ux + dy * uy) / L);
