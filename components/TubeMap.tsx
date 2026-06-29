@@ -29,6 +29,12 @@ const SHOWN_LINES: string[] | null = null;
 
 type Pt = { x: number; y: number };
 type Pose = { x: number; y: number; rotation: number };
+/**
+ * A segment's OSM curve decomposed along/perpendicular to its geo chord, plus
+ * each point's normalised arc-length (0..1) — the monotonic parameter that maps
+ * curve points onto the octilinear connector during the morph.
+ */
+type SegProfile = { along: number[]; perp: number[]; arc: number[] };
 
 const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -57,18 +63,131 @@ function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
   return b ? { x: b.center.x, y: b.center.y } : null;
 }
 
+/** Pixel tolerance below which a pair counts as already axis-aligned or 45°. */
+const OCTI_EPS = 0.5;
+
 /**
- * Redraw one line. With `curve` (the projected OSM track), it follows the real
- * geography; otherwise it draws straight segments through its stations' current
- * centres (the editable layout).
+ * The single bend of a two-segment octilinear connector from `a` to `b`: a 45°
+ * diagonal out of `a` that covers the shorter axis, then a straight run along
+ * the longer axis into `b` (a 135° corner). Returns null when the pair is
+ * already axis-aligned or a perfect 45° diagonal, where no bend is needed.
  */
-function recomputeLine(editor: Editor, line: TubeLineShape, curve: Pt[] | null) {
-  const pts =
-    curve && curve.length >= 2
-      ? curve
-      : (line.props.stationIds as TLShapeId[])
-          .map((id) => stationCentre(editor, id))
-          .filter((c): c is Pt => !!c);
+function octiBend(a: Pt, b: Pt): Pt | null {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const adx = Math.abs(dx);
+  const ady = Math.abs(dy);
+  if (adx < OCTI_EPS || ady < OCTI_EPS || Math.abs(adx - ady) < OCTI_EPS) {
+    return null;
+  }
+  const sx = Math.sign(dx);
+  const sy = Math.sign(dy);
+  return adx >= ady
+    ? { x: a.x + sx * ady, y: b.y } // diagonal, then horizontal
+    : { x: b.x, y: a.y + sy * adx }; // diagonal, then vertical
+}
+
+/** Octilinear polyline through `centres` — a 135° bend inserted per pair. */
+function octilinearPoints(centres: Pt[]): Pt[] {
+  if (centres.length < 2) return centres.slice();
+  const out: Pt[] = [centres[0]];
+  for (let i = 1; i < centres.length; i++) {
+    const bend = octiBend(centres[i - 1], centres[i]);
+    if (bend) out.push(bend);
+    out.push(centres[i]);
+  }
+  return out;
+}
+
+/**
+ * One station-pair segment of a morphing line, blended between its octilinear
+ * editable shape (`morphFrac` 0) and its geographic curve (`morphFrac` 1).
+ *
+ * Each output point is the lerp of a point on the octilinear connector and the
+ * matching point on the curve (`profile`, the precomputed along/perp of the OSM
+ * track) — or the straight chord when the pair has no geometry — both taken at
+ * the same fraction along the live chord cA->cB. The shared endpoints stay
+ * pinned to cA/cB (so the stations never detach) and the bend vertex is sampled
+ * exactly, so morphFrac 0/1 reproduce the two rest states with no snap.
+ */
+function morphSegmentPoints(
+  cA: Pt,
+  cB: Pt,
+  profile: SegProfile | null,
+  morphFrac: number,
+): Pt[] {
+  const cx = cB.x - cA.x;
+  const cy = cB.y - cA.y;
+  const lenSq = cx * cx + cy * cy;
+  const L = Math.sqrt(lenSq) || 1;
+  const pux = -cy / L; // unit perpendicular of the chord
+  const puy = cx / L;
+  const bend = octiBend(cA, cB);
+  // The bend's own arc-length fraction along the two-leg octilinear connector.
+  const leg1 = bend ? Math.hypot(bend.x - cA.x, bend.y - cA.y) : 0;
+  const leg2 = bend ? Math.hypot(cB.x - bend.x, cB.y - bend.y) : 0;
+  const aBend = bend && leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
+  // The octilinear connector evaluated at arc-length fraction a (0..1).
+  const octiAt = (a: number): Pt => {
+    if (!bend) return { x: cA.x + a * cx, y: cA.y + a * cy };
+    if (a <= aBend) {
+      const f = aBend > 1e-6 ? a / aBend : 0;
+      return { x: cA.x + (bend.x - cA.x) * f, y: cA.y + (bend.y - cA.y) * f };
+    }
+    const f = aBend < 1 - 1e-6 ? (a - aBend) / (1 - aBend) : 0;
+    return { x: bend.x + (cB.x - bend.x) * f, y: bend.y + (cB.y - bend.y) * f };
+  };
+  // The curve (or straight chord) point at chord-fraction s, perp offset pf.
+  const curveAt = (s: number, pf: number): Pt => ({
+    x: cA.x + s * cx + pf * L * pux,
+    y: cA.y + s * cy + pf * L * puy,
+  });
+  const mix = (o: Pt, c: Pt): Pt => ({
+    x: o.x + (c.x - o.x) * morphFrac,
+    y: o.y + (c.y - o.y) * morphFrac,
+  });
+  const along = profile ? profile.along : [0, 1];
+  const perp = profile ? profile.perp : [0, 0];
+  const arc = profile ? profile.arc : [0, 1];
+  const out: Pt[] = [];
+  let injected = !bend; // with a bend, inject its sharp vertex exactly once
+  for (let j = 0; j < along.length; j++) {
+    if (!injected && arc[j] > aBend) {
+      // Inject the bend at its arc-length fraction: the 135° corner is sharp at
+      // morphFrac 0 and sits on the curve (collinear, invisible) at morphFrac 1.
+      const prev = arc[j - 1];
+      const f = (aBend - prev) / (arc[j] - prev || 1);
+      const alongBend = along[j - 1] + (along[j] - along[j - 1]) * f;
+      const perpBend = perp[j - 1] + (perp[j] - perp[j - 1]) * f;
+      out.push(mix(bend!, curveAt(alongBend, perpBend)));
+      injected = true;
+    }
+    // Octilinear point by monotonic arc-length; curve point by chord (along,perp).
+    out.push(mix(octiAt(arc[j]), curveAt(along[j], perp[j])));
+  }
+  return out;
+}
+
+/**
+ * Redraw one line. With `curve` (the projected OSM track) it follows the real
+ * geography; otherwise it draws through its stations' current centres — bent
+ * octilinearly when `octi` (the editable layout), or straight.
+ */
+function recomputeLine(
+  editor: Editor,
+  line: TubeLineShape,
+  curve: Pt[] | null,
+  octi: boolean,
+) {
+  let pts: Pt[];
+  if (curve && curve.length >= 2) {
+    pts = curve;
+  } else {
+    const centres = (line.props.stationIds as TLShapeId[])
+      .map((id) => stationCentre(editor, id))
+      .filter((c): c is Pt => !!c);
+    pts = octi ? octilinearPoints(centres) : centres;
+  }
   if (pts.length < 2) return;
   const path = pathFromPoints(pts);
   editor.updateShape<TubeLineShape>({
@@ -80,16 +199,20 @@ function recomputeLine(editor: Editor, line: TubeLineShape, curve: Pt[] | null) 
   });
 }
 
-/** Redraw every line. Pass `lineGeo` to draw OSM curves, or null for straight. */
+/**
+ * Redraw every line. Pass `lineGeo` to draw OSM curves where available; lines
+ * without a curve fall back to `octi` octilinear (editable) or straight chords.
+ */
 function recomputeAllLines(
   editor: Editor,
   lineGeo: Map<TLShapeId, Pt[]> | null,
+  octi: boolean,
 ) {
   editor.run(
     () => {
       for (const shape of editor.getCurrentPageShapes()) {
         if (shape.type === "tube-line") {
-          recomputeLine(editor, shape, lineGeo?.get(shape.id) ?? null);
+          recomputeLine(editor, shape, lineGeo?.get(shape.id) ?? null, octi);
         }
       }
     },
@@ -180,7 +303,8 @@ export default function TubeMap() {
       const centres = line.stationIds
         .map((sid) => centreFor.get(sid))
         .filter((c): c is Pt => !!c);
-      const path = pathFromPoints(centres);
+      // Mount starts in editable mode → octilinear connectors.
+      const path = pathFromPoints(octilinearPoints(centres));
       // Stash the projected OSM track curve (settle) + per-pair segments (morph).
       if (line.geoPoints.length >= 2) {
         lineGeo.current.set(
@@ -228,8 +352,8 @@ export default function TubeMap() {
           for (const shape of editor.getCurrentPageShapes()) {
             if (shape.type !== "tube-line") continue;
             const ids = shape.props.stationIds as TLShapeId[];
-            // Dragging only happens in editable mode → straight segments.
-            if (ids.includes(next.id)) recomputeLine(editor, shape, null);
+            // Dragging only happens in editable mode → octilinear connectors.
+            if (ids.includes(next.id)) recomputeLine(editor, shape, null, true);
           }
         },
         { ignoreShapeLock: true },
@@ -278,7 +402,7 @@ export default function TubeMap() {
     const targets = geo ? geoPos.current : customPos.current;
 
     // Precompute each line's per-pair OSM geometry so the tween can morph the
-    // lines straight<->curve in lockstep with the station movement.
+    // lines octilinear<->curve in lockstep with the station movement.
     // For each line, decompose each station-pair segment into (along, perp)
     // relative to its geo chord — so the tick can re-anchor it to the *current*
     // chord between its two live stations and keep stations on the line.
@@ -288,7 +412,7 @@ export default function TubeMap() {
       .map((s) => {
         const stationIds = s.props.stationIds as TLShapeId[];
         const segs = lineSegGeo.current.get(s.id);
-        const segMorph: ({ along: number[]; perp: number[] } | null)[] = [];
+        const segMorph: (SegProfile | null)[] = [];
         if (segs && segs.length === stationIds.length - 1) {
           for (const seg of segs) {
             if (!seg || seg.length < 2) {
@@ -310,17 +434,25 @@ export default function TubeMap() {
             const uy = cy / L;
             const along: number[] = [];
             const perp: number[] = [];
-            for (const p of seg) {
+            const arc: number[] = [];
+            let cum = 0;
+            for (let k = 0; k < seg.length; k++) {
+              const p = seg[k];
               const dx = p.x - a.x;
               const dy = p.y - a.y;
               along.push((dx * ux + dy * uy) / L);
               perp.push((dx * -uy + dy * ux) / L);
+              if (k > 0) {
+                cum += Math.hypot(p.x - seg[k - 1].x, p.y - seg[k - 1].y);
+              }
+              arc.push(cum);
             }
-            segMorph.push({ along, perp });
+            const totalArc = cum || 1;
+            for (let k = 0; k < arc.length; k++) arc[k] /= totalArc;
+            segMorph.push({ along, perp, arc });
           }
         }
-        const hasCurve = segMorph.some((m) => m !== null);
-        return { id: s.id, stationIds, segMorph, hasCurve };
+        return { id: s.id, stationIds, segMorph };
       });
 
     // Only animate stations that actually move (none, in the common no-edit
@@ -358,11 +490,11 @@ export default function TubeMap() {
               rotation: s.rotation + (g.rotation - s.rotation) * e,
             });
           }
-          // Draw each line as its station-pair segments, each anchored to its
-          // two CURRENT station centres with a perpendicular bow scaled by
-          // morphFrac (0 = straight chord, 1 = the OSM curve). Because every
-          // segment endpoint sits exactly on a station centre, the stations
-          // never detach from the line during the tween.
+          // Draw each line by blending every station-pair segment between its
+          // octilinear editable shape (morphFrac 0) and its OSM curve
+          // (morphFrac 1), anchored to the two CURRENT station centres. Because
+          // every segment's endpoints sit exactly on a station centre, the
+          // stations never detach from the line during the tween.
           const morphFrac = geo ? e : 1 - e;
           for (const lm of lineMorph) {
             const centres = lm.stationIds
@@ -370,39 +502,25 @@ export default function TubeMap() {
               .filter((c): c is Pt => !!c);
             if (centres.length < 2) continue;
             let pts: Pt[];
-            if (
-              lm.hasCurve &&
-              morphFrac > 0 &&
-              centres.length === lm.stationIds.length
-            ) {
+            if (centres.length === lm.stationIds.length) {
               pts = [];
-              for (let i = 0; i < lm.segMorph.length; i++) {
-                const cA = centres[i];
-                const cB = centres[i + 1];
-                const m = lm.segMorph[i];
-                if (!m) {
-                  // No curve for this pair → straight chord.
-                  if (pts.length === 0) pts.push(cA);
-                  pts.push(cB);
-                  continue;
-                }
-                const cx = cB.x - cA.x;
-                const cy = cB.y - cA.y;
-                const L = Math.hypot(cx, cy) || 1;
-                const pux = -cy / L; // unit perpendicular of the current chord
-                const puy = cx / L;
-                for (let j = 0; j < m.along.length; j++) {
-                  if (i > 0 && j === 0) continue; // drop the shared joint vertex
-                  const a = m.along[j];
-                  const pf = m.perp[j];
-                  pts.push({
-                    x: cA.x + a * cx + morphFrac * pf * L * pux,
-                    y: cA.y + a * cy + morphFrac * pf * L * puy,
-                  });
+              for (let i = 0; i < centres.length - 1; i++) {
+                const segPts = morphSegmentPoints(
+                  centres[i],
+                  centres[i + 1],
+                  lm.segMorph[i] ?? null,
+                  morphFrac,
+                );
+                for (let k = 0; k < segPts.length; k++) {
+                  // Drop each segment's first point — it is the previous
+                  // segment's shared station endpoint.
+                  if (i > 0 && k === 0) continue;
+                  pts.push(segPts[k]);
                 }
               }
             } else {
-              pts = centres;
+              // Some stations missing → octilinear through what we have.
+              pts = octilinearPoints(centres);
             }
             const path = pathFromPoints(pts);
             editor.updateShape<TubeLineShape>({
@@ -421,8 +539,9 @@ export default function TubeMap() {
       } else {
         animFrame.current = null;
         animating.current = false;
-        // Settle: geographic mode snaps lines onto the real OSM track curves.
-        recomputeAllLines(editor, geo ? lineGeo.current : null);
+        // Settle: geographic snaps lines onto the real OSM track curves;
+        // editable settles onto octilinear connectors.
+        recomputeAllLines(editor, geo ? lineGeo.current : null, !geo);
         editor.updateInstanceState({ isReadonly: geo });
       }
     };
