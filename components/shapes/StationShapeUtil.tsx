@@ -64,6 +64,14 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   override canEdit = () => false;
   override canBind = () => false;
 
+  // The name label is HTML that overflows the marker's 11×11 geometry, so the
+  // default culling (which keys off geometry bounds) would unmount the whole
+  // shape — label included — the moment the marker crossed a screen edge, even
+  // while the label is still on-screen. Opt station shapes out of culling so
+  // edge labels stay put. It's cheap: culling only toggles `display`, and the
+  // component renders either way, so this just forgoes hiding off-screen markers.
+  override canCull = () => false;
+
   override getGeometry(shape: StationShape) {
     return new Rectangle2d({
       width: shape.props.w,
