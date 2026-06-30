@@ -23,6 +23,94 @@ const stationPos = new Map(net.stations.map((s) => [s.id, [s.lon, s.lat]]));
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const TOL = 0.004; // sum of the two endpoint gaps (each station ~<200m off)
 
+// Metric helpers for track routing (longitude compressed by cos(lat)).
+const KX = Math.cos((51.5 * Math.PI) / 180);
+const metres = (a, b) => Math.hypot((a[0] - b[0]) * KX, a[1] - b[1]) * 111320;
+const SNAP_TOL_M = 450; // max station-to-track gap to trust a routed segment
+const MAX_DETOUR = 2.2; // reject routes far longer than the straight line
+
+/**
+ * Build an undirected routing graph from a line's OSM ways: vertices quantised
+ * to ~1m become shared nodes, consecutive way vertices become weighted edges.
+ * Lets us recover a station-pair curve even when the source stores the section
+ * as one long way through several stations (e.g. the Elizabeth line tunnels).
+ */
+function buildTrackGraph(segs) {
+  const coord = new Map();
+  const adj = new Map();
+  const node = (p) => {
+    const k = `${p[0].toFixed(5)},${p[1].toFixed(5)}`;
+    if (!coord.has(k)) {
+      coord.set(k, p);
+      adj.set(k, []);
+    }
+    return k;
+  };
+  for (const seg of segs) {
+    for (let i = 0; i < seg.length - 1; i++) {
+      const a = node(seg[i]);
+      const b = node(seg[i + 1]);
+      if (a === b) continue;
+      const w = metres(seg[i], seg[i + 1]);
+      adj.get(a).push([b, w]);
+      adj.get(b).push([a, w]);
+    }
+  }
+  const nodes = [...coord.keys()];
+  return nodes.length ? { coord, adj, nodes } : null;
+}
+
+/**
+ * Shortest path along the track between the nodes nearest A and B. Returns the
+ * polyline (endpoints snapped exactly to A,B for station attachment), or null
+ * if either station is too far from the track or the route is an implausible
+ * detour (a wrong branch).
+ */
+function routeAlongTrack(graph, A, B) {
+  const { coord, adj, nodes } = graph;
+  const snap = (pt) => {
+    let best = null;
+    let bd = Infinity;
+    for (const k of nodes) {
+      const d = metres(coord.get(k), pt);
+      if (d < bd) {
+        bd = d;
+        best = k;
+      }
+    }
+    return [best, bd];
+  };
+  const [sa, da] = snap(A);
+  const [sb, db] = snap(B);
+  if (sa === sb || da > SNAP_TOL_M || db > SNAP_TOL_M) return null;
+  const distTo = new Map(nodes.map((n) => [n, Infinity]));
+  const prev = new Map();
+  distTo.set(sa, 0);
+  const pq = [[0, sa]];
+  while (pq.length) {
+    let mi = 0;
+    for (let i = 1; i < pq.length; i++) if (pq[i][0] < pq[mi][0]) mi = i;
+    const [d, u] = pq.splice(mi, 1)[0];
+    if (u === sb) break;
+    if (d > distTo.get(u)) continue;
+    for (const [v, w] of adj.get(u)) {
+      const nd = d + w;
+      if (nd < distTo.get(v)) {
+        distTo.set(v, nd);
+        prev.set(v, u);
+        pq.push([nd, v]);
+      }
+    }
+  }
+  if (distTo.get(sb) === Infinity) return null;
+  if (distTo.get(sb) > metres(A, B) * MAX_DETOUR) return null;
+  const path = [];
+  for (let u = sb; u; u = prev.get(u)) path.unshift(coord.get(u));
+  path[0] = [A[0], A[1]];
+  path[path.length - 1] = [B[0], B[1]];
+  return path;
+}
+
 /**
  * Centripetal Catmull-Rom samples for the P1->P2 span (P0,P3 = neighbours).
  * Passes exactly through P1 and P2, so a fallback segment stays attached to its
@@ -83,6 +171,7 @@ function buildBranchCurve(stationIds, segs) {
   const geoSegments = [];
   let matched = 0;
   let pairs = 0;
+  let graph; // line track graph, built lazily on the first routing fallback
   const push = (c) => {
     const last = curve[curve.length - 1];
     if (!last || last[0] !== c[0] || last[1] !== c[1]) curve.push(c);
@@ -119,16 +208,26 @@ function buildBranchCurve(stationIds, segs) {
       segPts[segPts.length - 1] = [B[0], B[1]];
       matched++;
     } else {
-      // No matching track — a smooth Catmull-Rom through the neighbouring
-      // stations (passes through A,B), so the fallback stays attached to its
-      // stations instead of cutting a sharp corner.
-      const prev = stationPos.get(stationIds[i - 1]);
-      const next = stationPos.get(stationIds[i + 2]);
-      const P0 = prev || [2 * A[0] - B[0], 2 * A[1] - B[1]];
-      const P3 = next || [2 * B[0] - A[0], 2 * B[1] - A[1]];
-      segPts = catmullRom(P0, A, B, P3, 10);
-      segPts[0] = [A[0], A[1]];
-      segPts[segPts.length - 1] = [B[0], B[1]];
+      // No station-to-station segment lines up. Try routing along the line's
+      // stitched OSM track graph — recovers the curve where the source stores a
+      // whole section as one long way (e.g. the post-2022 Elizabeth tunnels).
+      if (graph === undefined) graph = buildTrackGraph(segs);
+      const routed = graph && routeAlongTrack(graph, A, B);
+      if (routed) {
+        segPts = routed;
+        matched++;
+      } else {
+        // Still nothing — a smooth Catmull-Rom through the neighbouring stations
+        // (passes through A,B), so the fallback stays attached to its stations
+        // instead of cutting a sharp corner.
+        const prev = stationPos.get(stationIds[i - 1]);
+        const next = stationPos.get(stationIds[i + 2]);
+        const P0 = prev || [2 * A[0] - B[0], 2 * A[1] - B[1]];
+        const P3 = next || [2 * B[0] - A[0], 2 * B[1] - A[1]];
+        segPts = catmullRom(P0, A, B, P3, 10);
+        segPts[0] = [A[0], A[1]];
+        segPts[segPts.length - 1] = [B[0], B[1]];
+      }
     }
     geoSegments.push(segPts);
     segPts.forEach(push);
