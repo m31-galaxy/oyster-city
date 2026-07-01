@@ -17,12 +17,30 @@ import {
   StationShapeUtil,
   type StationShape,
 } from "@/components/shapes/StationShapeUtil";
+import {
+  TrainShapeUtil,
+  type TrainShape,
+} from "@/components/shapes/TrainShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { selectStation } from "@/lib/tube/selection";
+import {
+  deriveTrains,
+  makeBranch,
+  trainProgress,
+  type BranchInfo,
+  type TrainRecord,
+} from "@/lib/tube/trains";
+import type { Prediction } from "@/lib/tfl/types";
 
-const shapeUtils = [TubeLineShapeUtil, StationShapeUtil];
+const shapeUtils = [TubeLineShapeUtil, StationShapeUtil, TrainShapeUtil];
 const MARKER = 11;
 const ANIM_MS = 650;
+/** How often to refresh live train predictions (matches TfL's arrivals TTL). */
+const TRAIN_POLL_MS = 30_000;
+/** How often to reposition trains — trains crawl, so this stays smooth. */
+const TRAIN_TICK_MS = 100;
+const TRAIN_W = 10;
+const TRAIN_H = 6;
 
 // Line ids to show — null shows the whole network.
 const SHOWN_LINES: string[] | null = null;
@@ -168,6 +186,96 @@ function morphSegmentPoints(
   return out;
 }
 
+/** Decompose each per-pair segment into a SegProfile (along/perp/arc). */
+function buildSegProfiles(segs: (Pt[] | null)[]): (SegProfile | null)[] {
+  return segs.map((seg) => {
+    if (!seg || seg.length < 2) return null;
+    const a = seg[0];
+    const b = seg[seg.length - 1];
+    const cx = b.x - a.x;
+    const cy = b.y - a.y;
+    const L = Math.hypot(cx, cy) || 1;
+    const ux = cx / L;
+    const uy = cy / L;
+    const along: number[] = [];
+    const perp: number[] = [];
+    const arc: number[] = [];
+    let cum = 0;
+    for (let k = 0; k < seg.length; k++) {
+      const p = seg[k];
+      const dx = p.x - a.x;
+      const dy = p.y - a.y;
+      along.push((dx * ux + dy * uy) / L);
+      perp.push((dx * -uy + dy * ux) / L);
+      if (k > 0) cum += Math.hypot(p.x - seg[k - 1].x, p.y - seg[k - 1].y);
+      arc.push(cum);
+    }
+    const total = cum || 1;
+    for (let k = 0; k < arc.length; k++) arc[k] /= total;
+    return { along, perp, arc };
+  });
+}
+
+/** Point + forward tangent at arc-length fraction `f` along a page-space polyline. */
+function pointAlong(pts: Pt[], f: number): { point: Pt; tangent: Pt } {
+  const n = pts.length;
+  if (n === 0) return { point: { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
+  if (n === 1) return { point: pts[0], tangent: { x: 1, y: 0 } };
+  const seg: number[] = [];
+  let total = 0;
+  for (let i = 1; i < n; i++) {
+    const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    seg.push(d);
+    total += d;
+  }
+  const target = (f < 0 ? 0 : f > 1 ? 1 : f) * total;
+  let acc = 0;
+  let k = 0;
+  while (k < n - 2 && acc + seg[k] < target) acc += seg[k++];
+  const local = seg[k] > 0 ? (target - acc) / seg[k] : 0;
+  return {
+    point: {
+      x: pts[k].x + (pts[k + 1].x - pts[k].x) * local,
+      y: pts[k].y + (pts[k + 1].y - pts[k].y) * local,
+    },
+    tangent: { x: pts[k + 1].x - pts[k].x, y: pts[k + 1].y - pts[k].y },
+  };
+}
+
+/** Point + tangent at fraction `f` along the octilinear connector cA->cB. */
+function octiPointAt(cA: Pt, cB: Pt, f: number): { point: Pt; tangent: Pt } {
+  const bend = octiBend(cA, cB);
+  if (!bend) {
+    return {
+      point: { x: cA.x + f * (cB.x - cA.x), y: cA.y + f * (cB.y - cA.y) },
+      tangent: { x: cB.x - cA.x, y: cB.y - cA.y },
+    };
+  }
+  const leg1 = Math.hypot(bend.x - cA.x, bend.y - cA.y);
+  const leg2 = Math.hypot(cB.x - bend.x, cB.y - bend.y);
+  const aBend = leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
+  if (f <= aBend) {
+    const t = aBend > 1e-6 ? f / aBend : 0;
+    return {
+      point: { x: cA.x + (bend.x - cA.x) * t, y: cA.y + (bend.y - cA.y) * t },
+      tangent: { x: bend.x - cA.x, y: bend.y - cA.y },
+    };
+  }
+  const t = aBend < 1 - 1e-6 ? (f - aBend) / (1 - aBend) : 0;
+  return {
+    point: { x: bend.x + (cB.x - bend.x) * t, y: bend.y + (cB.y - bend.y) * t },
+    tangent: { x: cB.x - bend.x, y: cB.y - bend.y },
+  };
+}
+
+/** Point + tangent at fraction `f` along the straight chord cA->cB. */
+function straightAt(cA: Pt, cB: Pt, f: number): { point: Pt; tangent: Pt } {
+  return {
+    point: { x: cA.x + f * (cB.x - cA.x), y: cA.y + f * (cB.y - cA.y) },
+    tangent: { x: cB.x - cA.x, y: cB.y - cA.y },
+  };
+}
+
 /**
  * Redraw one line. With `curve` (the projected OSM track) it follows the real
  * geography; otherwise it draws through its stations' current centres — bent
@@ -239,6 +347,18 @@ export default function TubeMap() {
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
 
+  // Live-train state (populated in handleMount, driven by the poll + rAF loops).
+  const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
+  const branchesForLineRef = useRef<Map<string, BranchInfo[]>>(new Map());
+  const branchStationIdsRef = useRef<Map<string, string[]>>(new Map());
+  const segProfilesRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(new Map());
+  const naptanToHubRef = useRef<Record<string, string>>({});
+  const lineColorRef = useRef<Map<string, string>>(new Map());
+  const trainStore = useRef<Map<string, TrainRecord>>(new Map());
+  const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
+  /** 0 = editable, 1 = geographic, in between while the morph tween runs. */
+  const morphFracRef = useRef(0);
+
   useEffect(() => setMounted(true), []);
 
   const handleMount = useCallback((editor: Editor) => {
@@ -252,6 +372,7 @@ export default function TubeMap() {
     ed.__oysterBuilt = true;
 
     const net = getTubeNetwork();
+    naptanToHubRef.current = net.naptanToHub;
     const lines = SHOWN_LINES
       ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
       : net.lines;
@@ -271,6 +392,7 @@ export default function TubeMap() {
     const shapeIdFor = new Map<string, TLShapeId>(
       stations.map((s) => [s.id, createShapeId()]),
     );
+    shapeIdForRef.current = shapeIdFor;
 
     const stationShapes = stations.map((s) => {
       const id = shapeIdFor.get(s.id)!;
@@ -313,13 +435,21 @@ export default function TubeMap() {
         );
       }
       if (line.geoSegments.length) {
-        lineSegGeo.current.set(
-          lineId,
-          line.geoSegments.map((seg) =>
-            seg ? seg.map(([x, y]) => ({ x, y })) : null,
-          ),
+        const segs = line.geoSegments.map((seg) =>
+          seg ? seg.map(([x, y]) => ({ x, y })) : null,
         );
+        lineSegGeo.current.set(lineId, segs);
+        if (segs.length === line.stationIds.length - 1) {
+          segProfilesRef.current.set(lineId, buildSegProfiles(segs));
+        }
       }
+      // Register this branch so live trains can resolve onto its segments.
+      branchStationIdsRef.current.set(lineId, line.stationIds);
+      const branches = branchesForLineRef.current.get(line.id);
+      const branch = makeBranch(lineId, line.stationIds);
+      if (branches) branches.push(branch);
+      else branchesForLineRef.current.set(line.id, [branch]);
+      lineColorRef.current.set(line.id, line.color);
       return {
         id: lineId,
         type: "tube-line" as const,
@@ -401,59 +531,17 @@ export default function TubeMap() {
     if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
     const targets = geo ? geoPos.current : customPos.current;
 
-    // Precompute each line's per-pair OSM geometry so the tween can morph the
-    // lines octilinear<->curve in lockstep with the station movement.
-    // For each line, decompose each station-pair segment into (along, perp)
-    // relative to its geo chord — so the tick can re-anchor it to the *current*
-    // chord between its two live stations and keep stations on the line.
+    // Each line's per-pair SegProfiles (along/perp/arc) are precomputed once at
+    // mount (segProfilesRef); the tween re-anchors them to the current chord
+    // between the two live stations, keeping stations on the line.
     const lineMorph = editor
       .getCurrentPageShapes()
       .filter((s): s is TubeLineShape => s.type === "tube-line")
-      .map((s) => {
-        const stationIds = s.props.stationIds as TLShapeId[];
-        const segs = lineSegGeo.current.get(s.id);
-        const segMorph: (SegProfile | null)[] = [];
-        if (segs && segs.length === stationIds.length - 1) {
-          for (const seg of segs) {
-            if (!seg || seg.length < 2) {
-              segMorph.push(null);
-              continue;
-            }
-            // Segment endpoints are snapped to the geo station centres, so
-            // they already run stationIds[i] -> stationIds[i+1] (no flip).
-            // Decompose the segment's *full* point set (not a resample): at
-            // morphFrac=1 the reconstruction then reproduces geoPath exactly, so
-            // the hand-off to the static geo curve on settle is seamless — no
-            // snap between the smooth geo line and the tween.
-            const a = seg[0];
-            const b = seg[seg.length - 1];
-            const cx = b.x - a.x;
-            const cy = b.y - a.y;
-            const L = Math.hypot(cx, cy) || 1;
-            const ux = cx / L;
-            const uy = cy / L;
-            const along: number[] = [];
-            const perp: number[] = [];
-            const arc: number[] = [];
-            let cum = 0;
-            for (let k = 0; k < seg.length; k++) {
-              const p = seg[k];
-              const dx = p.x - a.x;
-              const dy = p.y - a.y;
-              along.push((dx * ux + dy * uy) / L);
-              perp.push((dx * -uy + dy * ux) / L);
-              if (k > 0) {
-                cum += Math.hypot(p.x - seg[k - 1].x, p.y - seg[k - 1].y);
-              }
-              arc.push(cum);
-            }
-            const totalArc = cum || 1;
-            for (let k = 0; k < arc.length; k++) arc[k] /= totalArc;
-            segMorph.push({ along, perp, arc });
-          }
-        }
-        return { id: s.id, stationIds, segMorph };
-      });
+      .map((s) => ({
+        id: s.id,
+        stationIds: s.props.stationIds as TLShapeId[],
+        segMorph: segProfilesRef.current.get(s.id) ?? [],
+      }));
 
     // Only animate stations that actually move (none, in the common no-edit
     // case) — keeps the whole-network tween cheap.
@@ -496,6 +584,7 @@ export default function TubeMap() {
           // every segment's endpoints sit exactly on a station centre, the
           // stations never detach from the line during the tween.
           const morphFrac = geo ? e : 1 - e;
+          morphFracRef.current = morphFrac; // trains follow the same blend
           for (const lm of lineMorph) {
             const centres = lm.stationIds
               .map((id) => stationCentre(editor, id))
@@ -539,6 +628,7 @@ export default function TubeMap() {
       } else {
         animFrame.current = null;
         animating.current = false;
+        morphFracRef.current = geo ? 1 : 0;
         // Settle: geographic snaps lines onto the real OSM track curves;
         // editable settles onto octilinear connectors.
         recomputeAllLines(editor, geo ? lineGeo.current : null, !geo);
@@ -557,6 +647,192 @@ export default function TubeMap() {
     lastMode.current = geoMode;
     applyMode(editor, geoMode);
   }, [geoMode, applyMode]);
+
+  // Reposition every live train onto its current segment, matching how the line
+  // is drawn: the geo curve, the octilinear connector, or the live morph blend.
+  const positionTrains = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const store = trainStore.current;
+    const shapes = trainShapes.current;
+    if (store.size === 0 && shapes.size === 0) return;
+    const now = performance.now();
+    const morphFrac = morphFracRef.current;
+    const geo = morphFrac >= 1 - 1e-6;
+    const octi = morphFrac <= 1e-6;
+
+    // Trains are programmatic; geo mode's readonly instance state blocks all
+    // create/update, so lift it just for this synchronous batch, then restore.
+    const readonly = editor.getInstanceState().isReadonly;
+    if (readonly) editor.updateInstanceState({ isReadonly: false });
+    try {
+      editor.run(
+      () => {
+        const seen = new Set<string>();
+        const toCreate: {
+          id: TLShapeId;
+          type: "train";
+          x: number;
+          y: number;
+          isLocked: boolean;
+          props: { w: number; h: number; color: string; rot: number };
+        }[] = [];
+        for (const [key, rec] of store) {
+          const netIds = branchStationIdsRef.current.get(rec.branchShapeId);
+          if (!netIds) continue;
+          const i = rec.segIndex;
+          const idA = shapeIdForRef.current.get(netIds[i]);
+          const idB = shapeIdForRef.current.get(netIds[i + 1]);
+          if (!idA || !idB) continue;
+          const cA = stationCentre(editor, idA);
+          const cB = stationCentre(editor, idB);
+          if (!cA || !cB) continue;
+          const f = trainProgress(rec, now);
+          const fFwd = rec.reversed ? 1 - f : f;
+          const branchId = rec.branchShapeId as TLShapeId;
+          let placed: { point: Pt; tangent: Pt };
+          if (geo) {
+            const seg = lineSegGeo.current.get(branchId)?.[i];
+            placed =
+              seg && seg.length >= 2
+                ? pointAlong(seg, fFwd)
+                : straightAt(cA, cB, fFwd);
+          } else if (octi) {
+            placed = octiPointAt(cA, cB, fFwd);
+          } else {
+            const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
+            placed = pointAlong(
+              morphSegmentPoints(cA, cB, profile, morphFrac),
+              fFwd,
+            );
+          }
+          const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
+          const x = placed.point.x - TRAIN_W / 2;
+          const y = placed.point.y - TRAIN_H / 2;
+          seen.add(key);
+          const shapeId = shapes.get(key);
+          if (!shapeId) {
+            const newId = createShapeId();
+            shapes.set(key, newId);
+            toCreate.push({
+              id: newId,
+              type: "train",
+              x,
+              y,
+              isLocked: true,
+              props: { w: TRAIN_W, h: TRAIN_H, color: rec.color, rot },
+            });
+          } else {
+            const cur = editor.getShape(shapeId) as TrainShape | undefined;
+            if (!cur) continue;
+            // Skip sub-pixel jitter — trains crawl, so most ticks are no-ops.
+            if (
+              Math.abs(cur.x - x) > 0.2 ||
+              Math.abs(cur.y - y) > 0.2 ||
+              Math.abs(cur.props.rot - rot) > 0.02
+            ) {
+              editor.updateShape({ id: shapeId, type: "train", x, y, props: { rot } });
+            }
+          }
+        }
+        if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
+        const toDelete: TLShapeId[] = [];
+        for (const [key, shapeId] of shapes) {
+          if (!seen.has(key)) {
+            toDelete.push(shapeId);
+            shapes.delete(key);
+          }
+        }
+        if (toDelete.length) editor.deleteShapes(toDelete);
+      },
+      { ignoreShapeLock: true },
+      );
+    } finally {
+      if (readonly) editor.updateInstanceState({ isReadonly: true });
+    }
+  }, []);
+
+  // Poll live arrivals (~30s) and rebuild the train store, keyed by branch.
+  useEffect(() => {
+    if (!mounted) return;
+    let cancelled = false;
+    let ac: AbortController | null = null;
+    let iv: ReturnType<typeof setInterval> | null = null;
+
+    const poll = async () => {
+      if (!editorRef.current) return;
+      const lineIds = [...branchesForLineRef.current.keys()];
+      if (lineIds.length === 0) return;
+      ac?.abort();
+      ac = new AbortController();
+      const signal = ac.signal;
+      const results = await Promise.all(
+        lineIds.map(async (lineId) => {
+          try {
+            const res = await fetch(`/api/tfl/Line/${lineId}/Arrivals`, { signal });
+            if (!res.ok) return null;
+            const preds = (await res.json()) as Prediction[];
+            return deriveTrains(
+              preds,
+              branchesForLineRef.current.get(lineId) ?? [],
+              naptanToHubRef.current,
+              lineId,
+              lineColorRef.current.get(lineId) ?? "#666666",
+              performance.now(),
+            );
+          } catch {
+            return null; // aborted or network error — skip this line this round
+          }
+        }),
+      );
+      if (cancelled || signal.aborted) return;
+      const next = new Map<string, TrainRecord>();
+      for (const recs of results) if (recs) for (const r of recs) next.set(r.key, r);
+      trainStore.current = next;
+    };
+
+    // Wait for the editor + branch registry before the first poll.
+    const start = () => {
+      if (cancelled) return;
+      if (!editorRef.current || branchesForLineRef.current.size === 0) {
+        setTimeout(start, 200);
+        return;
+      }
+      poll();
+      iv = setInterval(poll, TRAIN_POLL_MS);
+    };
+    start();
+
+    return () => {
+      cancelled = true;
+      ac?.abort();
+      if (iv) clearInterval(iv);
+    };
+  }, [mounted]);
+
+  // Glide trains between polls with a single throttled rAF loop.
+  useEffect(() => {
+    if (!mounted) return;
+    if (process.env.NODE_ENV !== "production") {
+      // The preview pauses requestAnimationFrame; expose a manual tick so train
+      // rendering can be driven/verified there (mirrors the window.editor hook).
+      (window as unknown as { __trainTick?: () => void }).__trainTick =
+        positionTrains;
+    }
+    let raf: number | null = null;
+    let last = 0;
+    const loop = () => {
+      raf = requestAnimationFrame(loop);
+      const now = performance.now();
+      if (now - last < TRAIN_TICK_MS) return;
+      last = now;
+      positionTrains();
+    };
+    raf = requestAnimationFrame(loop);
+    return () => {
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, [mounted, positionTrains]);
 
   if (!mounted) return null;
 

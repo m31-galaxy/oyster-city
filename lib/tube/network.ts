@@ -34,9 +34,11 @@ interface RawStation {
 interface RawNetwork {
   lines: RawLine[];
   stations: RawStation[];
+  /** Platform NaPTAN id -> our station id, for resolving live arrivals. */
+  naptanToHub?: Record<string, string>;
 }
 
-const data = network as RawNetwork;
+const data = network as unknown as RawNetwork;
 
 export interface TubeLinePath {
   id: string;
@@ -65,6 +67,8 @@ export interface TubeNetwork {
   lines: TubeLinePath[];
   stations: TubeStation[];
   bounds: { w: number; h: number };
+  /** Platform NaPTAN id -> our station id, for resolving live arrivals. */
+  naptanToHub: Record<string, string>;
 }
 
 let cached: TubeNetwork | null = null;
@@ -127,6 +131,7 @@ export function getTubeNetwork(): TubeNetwork {
     lines,
     stations,
     bounds: { w: TARGET_WIDTH, h: (latMax - latMin) * scale },
+    naptanToHub: data.naptanToHub ?? {},
   };
   return cached;
 }

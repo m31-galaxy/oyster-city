@@ -6,10 +6,19 @@ export interface Prediction {
   id: string;
   lineId: string;
   lineName: string;
+  /** Train set number — NOT unique across lines; key by (lineId, vehicleId). */
+  vehicleId: string;
+  /** Platform NaPTAN id of the stop this prediction is for (940GZZLU*). */
+  naptanId: string;
   stationName: string;
   platformName: string;
+  /** "inbound" | "outbound"; empty at the terminus stop. */
+  direction: string;
+  destinationNaptanId: string;
   destinationName: string;
   towards: string;
+  /** Free-text, e.g. "Between X and Y" — unreliable; cosmetic only. */
+  currentLocation: string;
   /** Seconds until the vehicle reaches this stop. */
   timeToStation: number;
   /** ISO 8601 timestamp. */
