@@ -125,8 +125,31 @@ export function deriveTrains(
     }
     if (!branch || step === 0) continue;
 
-    const prevIdx = j0 - step;
-    if (prevIdx < 0 || prevIdx >= branch.stationIds.length) continue;
+    let prevIdx = j0 - step;
+    if (prevIdx < 0 || prevIdx >= branch.stationIds.length) {
+      // `next` is this fragment's endpoint, but it's an interior junction on an
+      // adjacent fragment (lines are split into overlapping branch fragments).
+      // Relocate the train onto the branch that holds its real predecessor — the
+      // neighbour of `next` on the side away from `second` — instead of dropping
+      // it (otherwise trains vanish for a whole segment approaching junctions).
+      let relocated = false;
+      for (const b of branches) {
+        const a = b.indexOf.get(next.stationId);
+        if (a === undefined) continue;
+        for (const p of [a - 1, a + 1]) {
+          if (p < 0 || p >= b.stationIds.length) continue;
+          if (second && b.stationIds[p] === second.stationId) continue;
+          branch = b;
+          j0 = a;
+          prevIdx = p;
+          adjacent = false; // the ladder delta no longer describes this segment
+          relocated = true;
+          break;
+        }
+        if (relocated) break;
+      }
+      if (!relocated) continue; // a true terminus — nothing precedes it
+    }
 
     // Only trust a ladder delta as the run time when the two stops are adjacent.
     let segRunTime = FALLBACK_SEG_SECONDS;

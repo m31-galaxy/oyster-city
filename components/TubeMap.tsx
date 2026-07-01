@@ -242,6 +242,38 @@ function pointAlong(pts: Pt[], f: number): { point: Pt; tangent: Pt } {
   };
 }
 
+/**
+ * Like {@link pointAlong} but with a precomputed normalised cumulative arc
+ * (0..1, one per point) — an O(log n) lookup with no per-call arc-length sweep,
+ * for the hot geo-mode path where the curve (and its arc table) is immutable.
+ */
+function pointAlongArc(
+  pts: Pt[],
+  arc: number[],
+  f: number,
+): { point: Pt; tangent: Pt } {
+  const n = pts.length;
+  if (n < 2) return { point: pts[0] ?? { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
+  const t = f < 0 ? 0 : f > 1 ? 1 : f;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arc[mid + 1] < t) lo = mid + 1;
+    else hi = mid;
+  }
+  const k = Math.min(lo, n - 2);
+  const span = arc[k + 1] - arc[k];
+  const local = span > 0 ? (t - arc[k]) / span : 0;
+  return {
+    point: {
+      x: pts[k].x + (pts[k + 1].x - pts[k].x) * local,
+      y: pts[k].y + (pts[k + 1].y - pts[k].y) * local,
+    },
+    tangent: { x: pts[k + 1].x - pts[k].x, y: pts[k + 1].y - pts[k].y },
+  };
+}
+
 /** Point + tangent at fraction `f` along the octilinear connector cA->cB. */
 function octiPointAt(cA: Pt, cB: Pt, f: number): { point: Pt; tangent: Pt } {
   const bend = octiBend(cA, cB);
@@ -434,14 +466,23 @@ export default function TubeMap() {
           line.geoPoints.map(([x, y]) => ({ x, y })),
         );
       }
-      if (line.geoSegments.length) {
+      // Gate both maps on the same alignment check: the geo train path reads
+      // lineSegGeo by pair index and the morph path reads segProfilesRef, so a
+      // count mismatch must disable both together (else they'd draw different
+      // geometry). All current lines satisfy this; warn if a rebuild breaks it.
+      if (line.geoSegments.length === line.stationIds.length - 1) {
         const segs = line.geoSegments.map((seg) =>
           seg ? seg.map(([x, y]) => ({ x, y })) : null,
         );
         lineSegGeo.current.set(lineId, segs);
-        if (segs.length === line.stationIds.length - 1) {
-          segProfilesRef.current.set(lineId, buildSegProfiles(segs));
-        }
+        segProfilesRef.current.set(lineId, buildSegProfiles(segs));
+      } else if (
+        line.geoSegments.length &&
+        process.env.NODE_ENV !== "production"
+      ) {
+        console.warn(
+          `[tube] ${line.id}: geoSegments ${line.geoSegments.length} != stationIds-1 ${line.stationIds.length - 1}; ignoring geometry`,
+        );
       }
       // Register this branch so live trains can resolve onto its segments.
       branchStationIdsRef.current.set(lineId, line.stationIds);
@@ -693,9 +734,12 @@ export default function TubeMap() {
           let placed: { point: Pt; tangent: Pt };
           if (geo) {
             const seg = lineSegGeo.current.get(branchId)?.[i];
+            const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
             placed =
               seg && seg.length >= 2
-                ? pointAlong(seg, fFwd)
+                ? arc
+                  ? pointAlongArc(seg, arc, fFwd)
+                  : pointAlong(seg, fFwd)
                 : straightAt(cA, cB, fFwd);
           } else if (octi) {
             placed = octiPointAt(cA, cB, fFwd);
@@ -758,6 +802,7 @@ export default function TubeMap() {
     let cancelled = false;
     let ac: AbortController | null = null;
     let iv: ReturnType<typeof setInterval> | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
 
     const poll = async () => {
       if (!editorRef.current) return;
@@ -795,7 +840,7 @@ export default function TubeMap() {
     const start = () => {
       if (cancelled) return;
       if (!editorRef.current || branchesForLineRef.current.size === 0) {
-        setTimeout(start, 200);
+        retry = setTimeout(start, 200);
         return;
       }
       poll();
@@ -807,6 +852,7 @@ export default function TubeMap() {
       cancelled = true;
       ac?.abort();
       if (iv) clearInterval(iv);
+      if (retry) clearTimeout(retry);
     };
   }, [mounted]);
 
@@ -831,6 +877,9 @@ export default function TubeMap() {
     raf = requestAnimationFrame(loop);
     return () => {
       if (raf !== null) cancelAnimationFrame(raf);
+      // Also stop the morph tween's rAF so it can't run against a disposed editor.
+      if (animFrame.current !== null) cancelAnimationFrame(animFrame.current);
+      animating.current = false;
     };
   }, [mounted, positionTrains]);
 
