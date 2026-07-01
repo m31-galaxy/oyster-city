@@ -58,6 +58,9 @@ export interface TubeStation {
   name: string;
   cx: number;
   cy: number;
+  /** Geographic position (used for distance-based train run-time estimates). */
+  lon: number;
+  lat: number;
   interchange: boolean;
   labelPos: string;
   color: string;
@@ -121,6 +124,8 @@ export function getTubeNetwork(): TubeNetwork {
       name: s.name,
       cx,
       cy,
+      lon: s.lon,
+      lat: s.lat,
       interchange: s.interchange,
       labelPos: "E",
       color: s.color,

@@ -39,6 +39,8 @@ const ANIM_MS = 650;
 const TRAIN_POLL_MS = 30_000;
 /** How often to reposition trains — trains crawl, so this stays smooth. */
 const TRAIN_TICK_MS = 100;
+/** Ease each poll's position correction over this window instead of jumping. */
+const TRAIN_BLEND_MS = 1500;
 const TRAIN_W = 10;
 const TRAIN_H = 6;
 
@@ -385,9 +387,17 @@ export default function TubeMap() {
   const branchStationIdsRef = useRef<Map<string, string[]>>(new Map());
   const segProfilesRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(new Map());
   const naptanToHubRef = useRef<Record<string, string>>({});
+  const stationPosRef = useRef<Map<string, [number, number]>>(new Map());
   const lineColorRef = useRef<Map<string, string>>(new Map());
   const trainStore = useRef<Map<string, TrainRecord>>(new Map());
   const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
+  // Per-train render state for easing away the position correction each poll.
+  const trainRender = useRef<
+    Map<
+      string,
+      { x: number; y: number; fetchTime: number; offX: number; offY: number; offStart: number }
+    >
+  >(new Map());
   /** 0 = editable, 1 = geographic, in between while the morph tween runs. */
   const morphFracRef = useRef(0);
 
@@ -405,6 +415,7 @@ export default function TubeMap() {
 
     const net = getTubeNetwork();
     naptanToHubRef.current = net.naptanToHub;
+    stationPosRef.current = new Map(net.stations.map((s) => [s.id, [s.lon, s.lat]]));
     const lines = SHOWN_LINES
       ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
       : net.lines;
@@ -696,6 +707,7 @@ export default function TubeMap() {
     if (!editor) return;
     const store = trainStore.current;
     const shapes = trainShapes.current;
+    const render = trainRender.current;
     if (store.size === 0 && shapes.size === 0) return;
     const now = performance.now();
     const morphFrac = morphFracRef.current;
@@ -750,9 +762,37 @@ export default function TubeMap() {
               fFwd,
             );
           }
+          // Ease the per-poll correction: when a fresh record arrives, keep
+          // showing the current point and glide onto the new trajectory over
+          // TRAIN_BLEND_MS, so trains don't teleport each 30s refresh. Skipped
+          // during the morph, where the whole line is already moving.
+          const tx = placed.point.x;
+          const ty = placed.point.y;
+          const settled = geo || octi;
+          let rs = render.get(key);
+          if (!rs) {
+            rs = { x: tx, y: ty, fetchTime: rec.fetchTime, offX: 0, offY: 0, offStart: now };
+            render.set(key, rs);
+          }
+          if (settled && rs.fetchTime !== rec.fetchTime) {
+            rs.offX = rs.x - tx;
+            rs.offY = rs.y - ty;
+            rs.offStart = now;
+          }
+          rs.fetchTime = rec.fetchTime;
+          let dispX = tx;
+          let dispY = ty;
+          if (settled) {
+            const dt = (now - rs.offStart) / TRAIN_BLEND_MS;
+            const decay = dt >= 1 ? 0 : 1 - easeInOutCubic(dt);
+            dispX = tx + rs.offX * decay;
+            dispY = ty + rs.offY * decay;
+          }
+          rs.x = dispX;
+          rs.y = dispY;
           const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
-          const x = placed.point.x - TRAIN_W / 2;
-          const y = placed.point.y - TRAIN_H / 2;
+          const x = dispX - TRAIN_W / 2;
+          const y = dispY - TRAIN_H / 2;
           seen.add(key);
           const shapeId = shapes.get(key);
           if (!shapeId) {
@@ -785,6 +825,7 @@ export default function TubeMap() {
           if (!seen.has(key)) {
             toDelete.push(shapeId);
             shapes.delete(key);
+            render.delete(key);
           }
         }
         if (toDelete.length) editor.deleteShapes(toDelete);
@@ -821,6 +862,7 @@ export default function TubeMap() {
               preds,
               branchesForLineRef.current.get(lineId) ?? [],
               naptanToHubRef.current,
+              stationPosRef.current,
               lineId,
               lineColorRef.current.get(lineId) ?? "#666666",
               performance.now(),

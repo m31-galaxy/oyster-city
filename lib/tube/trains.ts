@@ -37,10 +37,37 @@ export interface TrainRecord {
   color: string;
 }
 
-/** Network-median inter-station run time, used when we can't estimate one. */
+/** Fallback run time when a station position is missing. */
 const FALLBACK_SEG_SECONDS = 120;
-/** Reject ladder deltas beyond this — they span a gap, not one segment. */
-const MAX_SEG_SECONDS = 600;
+/** Assumed inter-station running speed (~36 km/h) — see tfl-api research. */
+const SEG_SPEED_MPS = 10;
+/** Clamp the distance-based estimate to plausible inter-station run times. */
+const MIN_SEG_SECONDS = 25;
+const MAX_SEG_SECONDS = 240;
+const KX = Math.cos((51.5 * Math.PI) / 180); // London longitude compression
+
+/**
+ * Estimate a segment's run time (s) from the geographic distance between its two
+ * stations at an assumed running speed. Unlike the arrivals ladder delta this is
+ * per-segment and STABLE across polls, so the tts->position mapping doesn't shift
+ * between refreshes (a major cause of trains jumping on each poll).
+ */
+function segRunTimeFor(
+  aId: string,
+  bId: string,
+  pos: Map<string, [number, number]>,
+): number {
+  const a = pos.get(aId);
+  const b = pos.get(bId);
+  if (!a || !b) return FALLBACK_SEG_SECONDS;
+  const metres = Math.hypot((a[0] - b[0]) * KX, a[1] - b[1]) * 111320;
+  const secs = metres / SEG_SPEED_MPS;
+  return secs < MIN_SEG_SECONDS
+    ? MIN_SEG_SECONDS
+    : secs > MAX_SEG_SECONDS
+      ? MAX_SEG_SECONDS
+      : secs;
+}
 
 /** Build a BranchInfo (with its index lookup) from an ordered station-id list. */
 export function makeBranch(shapeId: string, stationIds: string[]): BranchInfo {
@@ -61,6 +88,7 @@ export function deriveTrains(
   predictions: Prediction[],
   branches: BranchInfo[],
   naptanToHub: Record<string, string>,
+  stationPos: Map<string, [number, number]>,
   lineId: string,
   color: string,
   fetchTime: number,
@@ -98,7 +126,6 @@ export function deriveTrains(
     let branch: BranchInfo | undefined;
     let j0 = -1;
     let step = 0;
-    let adjacent = false;
     if (second) {
       for (const b of branches) {
         const a = b.indexOf.get(next.stationId);
@@ -107,7 +134,6 @@ export function deriveTrains(
         branch = b;
         j0 = a;
         step = Math.sign(c - a);
-        adjacent = Math.abs(c - a) === 1;
         break;
       }
     }
@@ -142,7 +168,6 @@ export function deriveTrains(
           branch = b;
           j0 = a;
           prevIdx = p;
-          adjacent = false; // the ladder delta no longer describes this segment
           relocated = true;
           break;
         }
@@ -151,12 +176,12 @@ export function deriveTrains(
       if (!relocated) continue; // a true terminus — nothing precedes it
     }
 
-    // Only trust a ladder delta as the run time when the two stops are adjacent.
-    let segRunTime = FALLBACK_SEG_SECONDS;
-    if (adjacent && second) {
-      const delta = second.tts - next.tts;
-      if (delta > 0 && delta < MAX_SEG_SECONDS) segRunTime = delta;
-    }
+    // Stable per-segment run time from geography (see segRunTimeFor).
+    const segRunTime = segRunTimeFor(
+      branch.stationIds[prevIdx],
+      branch.stationIds[j0],
+      stationPos,
+    );
 
     out.push({
       key: `${lineId}:${vehicleId}`,
