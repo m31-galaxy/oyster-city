@@ -106,6 +106,10 @@ console.log(`Fetched ${lines.length} lines`);
 
 const stations = new Map(); // hubKey -> { id, name, lat, lon, lineSet, color }
 const linePaths = []; // { id, name, color, points: [[lon,lat], ...] }
+// Platform/stop NaPTAN id -> our station id (the hub key), for stops grouped
+// under a hub. Live Arrivals give platform-level 940GZZLU* ids; our stationIds
+// use HUB* ids for interchanges, so trains need this to resolve onto a line.
+const naptanToHub = {};
 
 for (const line of lines) {
   const colour = colourFor(line.id);
@@ -141,6 +145,11 @@ for (const line of lines) {
     for (const sp of stops) {
       // Group platforms/modes under the hub so multi-mode interchanges merge.
       const key = hubKey(sp);
+      // Record the stop's raw NaPTAN ids so an Arrivals naptanId resolves to
+      // our station id even when that id is a hub (HUB*).
+      for (const raw of [sp.id, sp.stationId]) {
+        if (raw && raw !== key) naptanToHub[raw] = key;
+      }
       let st = stations.get(key);
       if (!st) {
         st = {
@@ -176,7 +185,10 @@ const stationList = [...stations.values()].map((s) => ({
 
 mkdirSync(join(root, "lib/tube"), { recursive: true });
 const outPath = join(root, "lib/tube/network.generated.json");
-writeFileSync(outPath, JSON.stringify({ lines: prunedPaths, stations: stationList }));
+writeFileSync(
+  outPath,
+  JSON.stringify({ lines: prunedPaths, stations: stationList, naptanToHub }),
+);
 
 console.log(`\nWrote ${outPath}`);
 console.log(
