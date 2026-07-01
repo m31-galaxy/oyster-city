@@ -44,6 +44,8 @@ const SEG_SPEED_MPS = 10;
 /** Clamp the distance-based estimate to plausible inter-station run times. */
 const MIN_SEG_SECONDS = 25;
 const MAX_SEG_SECONDS = 240;
+/** Reject a ladder gap larger than one segment when learning run times. */
+const LADDER_MAX_SECONDS = 360;
 const KX = Math.cos((51.5 * Math.PI) / 180); // London longitude compression
 
 /**
@@ -103,7 +105,9 @@ export function deriveTrains(
     else byVehicle.set(p.vehicleId, [p]);
   }
 
-  const out: TrainRecord[] = [];
+  // First pass: each vehicle's ladder — its remaining stops in visit order.
+  type Stop = { stationId: string; tts: number };
+  const ladders: { vehicleId: string; ladder: Stop[] }[] = [];
   for (const [vehicleId, preds] of byVehicle) {
     // Resolve to stations and dedup, keeping the smallest time-to-station
     // (kills the terminus Platform 1/2 double).
@@ -113,12 +117,37 @@ export function deriveTrains(
       const cur = minTts.get(sid);
       if (cur === undefined || p.timeToStation < cur) minTts.set(sid, p.timeToStation);
     }
-    // Ladder = remaining stops in visit order.
     const ladder = [...minTts.entries()]
       .map(([stationId, tts]) => ({ stationId, tts }))
       .sort((a, b) => a.tts - b.tts);
-    if (ladder.length === 0) continue;
+    if (ladder.length) ladders.push({ vehicleId, ladder });
+  }
 
+  // Learn per-segment run times from TfL's own predictions: the gap between two
+  // consecutive stops in a vehicle's ladder is TfL's predicted run time for that
+  // directed segment. Aggregating across all vehicles gives a stable, real
+  // per-segment estimate — far better than a fixed speed, which is alternately
+  // over/under on adjacent segments and yanks trains back and forth each poll.
+  const segSamples = new Map<string, number[]>();
+  for (const { ladder } of ladders) {
+    for (let i = 0; i < ladder.length - 1; i++) {
+      const d = ladder[i + 1].tts - ladder[i].tts;
+      if (d <= 0 || d > LADDER_MAX_SECONDS) continue; // skip gaps / dwell noise
+      const key = `${ladder[i].stationId}>${ladder[i + 1].stationId}`;
+      const arr = segSamples.get(key);
+      if (arr) arr.push(d);
+      else segSamples.set(key, [d]);
+    }
+  }
+  const observedRunTime = (a: string, b: string): number | null => {
+    const arr = segSamples.get(`${a}>${b}`);
+    if (!arr || !arr.length) return null;
+    const s = [...arr].sort((x, y) => x - y);
+    return s[s.length >> 1]; // median
+  };
+
+  const out: TrainRecord[] = [];
+  for (const { vehicleId, ladder } of ladders) {
     const next = ladder[0];
     const second = ladder[1];
 
@@ -176,12 +205,14 @@ export function deriveTrains(
       if (!relocated) continue; // a true terminus — nothing precedes it
     }
 
-    // Stable per-segment run time from geography (see segRunTimeFor).
-    const segRunTime = segRunTimeFor(
-      branch.stationIds[prevIdx],
-      branch.stationIds[j0],
-      stationPos,
-    );
+    // Prefer the run time TfL's own predictions imply for this exact segment;
+    // fall back to the geographic estimate when no vehicle is predicting it.
+    const prevId = branch.stationIds[prevIdx];
+    const nextId = branch.stationIds[j0];
+    const segRunTime =
+      observedRunTime(prevId, nextId) ??
+      observedRunTime(nextId, prevId) ??
+      segRunTimeFor(prevId, nextId, stationPos);
 
     out.push({
       key: `${lineId}:${vehicleId}`,
