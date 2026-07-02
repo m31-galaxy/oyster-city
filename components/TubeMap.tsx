@@ -653,6 +653,48 @@ export default function TubeMap() {
       ...stationShapes,
     ]);
 
+    // Selection-gesture modifiers: rotation snaps to 45° increments by
+    // default and resizing keeps the aspect ratio by default; holding Shift
+    // inverts either (freeform rotate / free-stretch resize). tldraw
+    // hard-codes the opposite convention (shift = snap to 15° / lock aspect)
+    // with no public hook, so two narrow patches:
+    //  - the select tool's Rotating state gets its angle computation replaced
+    //    (same contract as the original — see Rotating.ts — minus its 15°
+    //    shift-snap, plus a 45° default snap);
+    //  - inputs.getShiftKey() reports inverted while the resize session is
+    //    active, feeding its `shiftKey || !canShapesDeform` aspect-lock. The
+    //    only other getShiftKey consumer during a resize is the shift-release
+    //    grace-timeout in Editor.dispatch, where a stale read is harmless.
+    const rotating = editor.getStateDescendant("select.rotating") as unknown as
+      | {
+          snapshot: {
+            initialCursorAngle: number;
+            initialShapesRotation: number;
+            initialPageCenter: { angle(p: unknown): number };
+          };
+          _getRotationFromPointerPosition(opts: {
+            snapToNearestDegree: boolean;
+          }): number;
+        }
+      | undefined;
+    if (rotating) {
+      const SEG = Math.PI / 4;
+      rotating._getRotationFromPointerPosition = function () {
+        const { initialCursorAngle, initialShapesRotation, initialPageCenter } =
+          this.snapshot;
+        const delta =
+          initialPageCenter.angle(editor.inputs.getCurrentPagePoint()) -
+          initialCursorAngle;
+        let rot = initialShapesRotation + delta;
+        if (!editor.inputs.getShiftKey()) rot = Math.round(rot / SEG) * SEG;
+        return rot - initialShapesRotation;
+      };
+    }
+    const inputs = editor.inputs as unknown as { getShiftKey(): boolean };
+    const realGetShiftKey = inputs.getShiftKey.bind(editor.inputs);
+    inputs.getShiftKey = () =>
+      editor.isIn("select.resizing") ? !realGetShiftKey() : realGetShiftKey();
+
     // Reactive lines: when a station is dragged, redraw the lines through it —
     // and re-pose the trains on those lines in the SAME batch, so they stay
     // glued to the moving geometry instead of catching up at the ambient tick.
