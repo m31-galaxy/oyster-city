@@ -10,8 +10,6 @@ export interface TrainProps {
   w: number;
   h: number;
   color: string;
-  /** Heading in radians — applied as a CSS rotation about the marker centre. */
-  rot: number;
 }
 
 // Register the custom shape in tldraw's type system (see TubeLineShapeUtil).
@@ -33,11 +31,10 @@ export class TrainShapeUtil extends ShapeUtil<TrainShape> {
     w: T.number,
     h: T.number,
     color: T.string,
-    rot: T.number,
   };
 
   override getDefaultProps(): TrainShape["props"] {
-    return { w: TRAIN_W, h: TRAIN_H, color: "#111111", rot: 0 };
+    return { w: TRAIN_W, h: TRAIN_H, color: "#111111" };
   }
 
   // Inert decoration: never resized, edited, bound, or selected by the user.
@@ -60,8 +57,14 @@ export class TrainShapeUtil extends ShapeUtil<TrainShape> {
     });
   }
 
+  // Heading lives in the shape's top-level `rotation` (tldraw applies it to
+  // the container), NOT in props: moving/turning a train then never changes
+  // props, so this memoized component renders exactly once per train — with
+  // 600+ trains updating every frame during the mode-morph, per-frame React
+  // re-renders were the morph's dominant cost. The renderer counter-offsets
+  // x/y so the centre stays on the track (tldraw rotates about the top-left).
   override component(shape: TrainShape) {
-    const { w, h, color, rot } = shape.props;
+    const { w, h, color } = shape.props;
     return (
       // pointer-events off so taps fall through to the stations/lines beneath.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -73,10 +76,6 @@ export class TrainShapeUtil extends ShapeUtil<TrainShape> {
             borderRadius: 2,
             border: "1px solid rgba(255,255,255,0.9)",
             boxSizing: "border-box",
-            // Rotate about the marker centre (default transform-origin) so the
-            // shape's geometry centre stays exactly on the track point — tldraw's
-            // own rotation would pivot about the top-left corner instead.
-            transform: `rotate(${rot}rad)`,
           }}
         />
       </HTMLContainer>

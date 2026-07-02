@@ -72,20 +72,29 @@ const easeInOutCubic = (t: number) =>
  */
 const smoothstepEase = (t: number) => t * t * (3 - 2 * t);
 
-/** Build an SVG path + bounding box from page-space points (station centres). */
+/** Build an SVG path + bounding box from page-space points (station centres).
+ * Single-pass (no spreads/intermediate arrays) — this runs for every line on
+ * every morph frame. */
 function pathFromPoints(points: Pt[]) {
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
-  const minX = Math.min(...xs);
-  const minY = Math.min(...ys);
-  const d = points
-    .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x - minX} ${p.y - minY}`)
-    .join(" ");
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  let d = "";
+  for (let i = 0; i < points.length; i++) {
+    d += `${i === 0 ? "M" : " L"} ${points[i].x - minX} ${points[i].y - minY}`;
+  }
   return {
     x: minX,
     y: minY,
-    w: Math.max(...xs) - minX || 1,
-    h: Math.max(...ys) - minY || 1,
+    w: maxX - minX || 1,
+    h: maxY - minY || 1,
     d,
   };
 }
@@ -199,6 +208,86 @@ function morphSegmentPoints(
     out.push(mix(octiAt(arc[j]), curveAt(along[j], perp[j])));
   }
   return out;
+}
+
+/**
+ * Point + tangent at parameter `a` (0..1, the profile's arc parameter) along
+ * the morphing pair cA->cB — the single-point equivalent of
+ * `pointAlong(morphSegmentPoints(...), a)` without building the polyline.
+ *
+ * Evaluates the same octilinear/curve blend at one parameter, so the result
+ * always lies exactly ON the drawn blended polyline and coincides with the
+ * settle-state evaluators at morphFrac 0 (octiPointAt) and 1 (pointAlongArc);
+ * mid-tween the parameterization differs from true polyline arc length by a
+ * sub-pixel amount along the line. O(log n), no allocation — this keeps the
+ * per-frame train pass cheap during the morph (600+ trains at 60fps).
+ */
+function morphPointAt(
+  cA: Pt,
+  cB: Pt,
+  profile: SegProfile | null,
+  morphFrac: number,
+  a: number,
+): { point: Pt; tangent: Pt } {
+  const cx = cB.x - cA.x;
+  const cy = cB.y - cA.y;
+  const L = Math.hypot(cx, cy) || 1;
+  const pux = -cy / L;
+  const puy = cx / L;
+  const bend = octiBend(cA, cB);
+  const leg1 = bend ? Math.hypot(bend.x - cA.x, bend.y - cA.y) : 0;
+  const leg2 = bend ? Math.hypot(cB.x - bend.x, cB.y - bend.y) : 0;
+  const aBend = bend && leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
+  const along = profile ? profile.along : null;
+  const perp = profile ? profile.perp : null;
+  const arc = profile ? profile.arc : null;
+  const n = along ? along.length : 2;
+  const xy = (t: number): Pt => {
+    // Octilinear component (arc-length parameterized, exact at the bend).
+    let ox: number;
+    let oy: number;
+    if (!bend) {
+      ox = cA.x + t * cx;
+      oy = cA.y + t * cy;
+    } else if (t <= aBend) {
+      const f = aBend > 1e-6 ? t / aBend : 0;
+      ox = cA.x + (bend.x - cA.x) * f;
+      oy = cA.y + (bend.y - cA.y) * f;
+    } else {
+      const f = aBend < 1 - 1e-6 ? (t - aBend) / (1 - aBend) : 0;
+      ox = bend.x + (cB.x - bend.x) * f;
+      oy = bend.y + (cB.y - bend.y) * f;
+    }
+    // Curve component: lerp the profile's (along, perp) at arc parameter t.
+    let s: number;
+    let pf: number;
+    if (!along || !perp || !arc) {
+      s = t;
+      pf = 0;
+    } else {
+      let lo = 0;
+      let hi = n - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arc[mid + 1] < t) lo = mid + 1;
+        else hi = mid;
+      }
+      const k = Math.min(lo, n - 2);
+      const span = arc[k + 1] - arc[k];
+      const u = span > 0 ? (t - arc[k]) / span : 0;
+      s = along[k] + (along[k + 1] - along[k]) * u;
+      pf = perp[k] + (perp[k + 1] - perp[k]) * u;
+    }
+    const gx = cA.x + s * cx + pf * L * pux;
+    const gy = cA.y + s * cy + pf * L * puy;
+    return { x: ox + (gx - ox) * morphFrac, y: oy + (gy - oy) * morphFrac };
+  };
+  const t = a < 0 ? 0 : a > 1 ? 1 : a;
+  const point = xy(t);
+  const EPS = 1e-3;
+  const back = xy(t < EPS ? 0 : t - EPS);
+  const fwd = xy(t > 1 - EPS ? 1 : t + EPS);
+  return { point, tangent: { x: fwd.x - back.x, y: fwd.y - back.y } };
 }
 
 /** Decompose each per-pair segment into a SegProfile (along/perp/arc). */
@@ -759,6 +848,19 @@ export default function TubeMap() {
     const geo = morphFrac >= 1 - 1e-6;
     const octi = morphFrac <= 1e-6;
     const settled = geo || octi;
+    // Perceptual gating: skip shape updates smaller than half a SCREEN pixel
+    // (zoomed out, every train moves sub-pixel per frame), and skip trains
+    // that are off-screen before AND after the move — positions are absolute,
+    // so they're exact whenever they re-enter view. Both cut the per-frame
+    // update count during the morph without any visible difference.
+    const minDelta = Math.max(0.2, 0.5 / editor.getZoomLevel());
+    const vp = editor.getViewportPageBounds();
+    const vpX0 = vp.x - 50;
+    const vpY0 = vp.y - 50;
+    const vpX1 = vp.x + vp.w + 50;
+    const vpY1 = vp.y + vp.h + 50;
+    const onScreen = (px: number, py: number) =>
+      px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
 
     // Trains are programmatic; geo mode's readonly instance state blocks all
     // create/update, so lift it just for this synchronous batch, then restore.
@@ -773,8 +875,21 @@ export default function TubeMap() {
           type: "train";
           x: number;
           y: number;
+          rotation: number;
           isLocked: boolean;
-          props: { w: number; h: number; color: string; rot: number };
+          props: { w: number; h: number; color: string };
+        }[] = [];
+        // One batched updateShapes call; heading goes in the shape's TOP-LEVEL
+        // rotation (props stay constant), so tldraw's memoized component never
+        // re-renders — per-frame React re-renders of 600+ trains were the
+        // mode-morph's dominant cost. Rotation pivots the top-left corner, so
+        // x/y are counter-offset to keep the marker CENTRE on the track point.
+        const toUpdate: {
+          id: TLShapeId;
+          type: "train";
+          x: number;
+          y: number;
+          rotation: number;
         }[] = [];
         for (const [key, rec] of store) {
           // On a fresh poll, convert the correction into a TIME offset that
@@ -840,10 +955,7 @@ export default function TubeMap() {
             placed = octiPointAt(cA, cB, fFwd);
           } else {
             const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
-            placed = pointAlong(
-              morphSegmentPoints(cA, cB, profile, morphFrac),
-              fFwd,
-            );
+            placed = morphPointAt(cA, cB, profile, morphFrac, fFwd);
           }
           const tx = placed.point.x;
           const ty = placed.point.y;
@@ -875,8 +987,12 @@ export default function TubeMap() {
           rs.y = dispY;
           rs.pose = pose;
           const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
-          const x = dispX - TRAIN_W / 2;
-          const y = dispY - TRAIN_H / 2;
+          // Rotation pivots the origin (top-left): offset it so the rotated
+          // centre R(rot)·(w/2, h/2) lands exactly on the track point.
+          const cos = Math.cos(rot);
+          const sin = Math.sin(rot);
+          const x = dispX - ((TRAIN_W / 2) * cos - (TRAIN_H / 2) * sin);
+          const y = dispY - ((TRAIN_W / 2) * sin + (TRAIN_H / 2) * cos);
           seen.add(key);
           const shapeId = shapes.get(key);
           if (!shapeId) {
@@ -888,23 +1004,30 @@ export default function TubeMap() {
               type: "train",
               x,
               y,
+              rotation: rot,
               isLocked: true,
-              props: { w: TRAIN_W, h: TRAIN_H, color: rec.color, rot },
+              props: { w: TRAIN_W, h: TRAIN_H, color: rec.color },
             });
           } else {
             const cur = editor.getShape(shapeId) as TrainShape | undefined;
             if (!cur) continue;
-            // Skip sub-pixel jitter — trains crawl, so most ticks are no-ops.
+            if (!onScreen(cur.x, cur.y) && !onScreen(x, y)) continue;
+            // Skip sub-perceptual jitter (< ~0.5 screen px / 0.02 rad). The
+            // rotation delta is wrapped so a heading crossing the ±π seam
+            // doesn't read as a ~2π change.
+            const dRot =
+              Math.abs(((cur.rotation - rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
             if (
-              Math.abs(cur.x - x) > 0.2 ||
-              Math.abs(cur.y - y) > 0.2 ||
-              Math.abs(cur.props.rot - rot) > 0.02
+              Math.abs(cur.x - x) > minDelta ||
+              Math.abs(cur.y - y) > minDelta ||
+              dRot > 0.02
             ) {
-              editor.updateShape({ id: shapeId, type: "train", x, y, props: { rot } });
+              toUpdate.push({ id: shapeId, type: "train", x, y, rotation: rot });
             }
           }
         }
         if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
+        if (toUpdate.length) editor.updateShapes(toUpdate);
         if (!onlyBranches) {
           const toDelete: TLShapeId[] = [];
           for (const [key, shapeId] of shapes) {

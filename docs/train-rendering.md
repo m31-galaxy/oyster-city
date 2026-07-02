@@ -111,8 +111,27 @@ stay glued to the line instead of catching up in visible ~100ms hops:
   batch** that redraws the dragged lines, filtered via
   `positionTrains(affectedBranchIds)` (a filtered pass updates existing shapes
   only — create/delete must see every key, so they stay with the full pass);
-- the mode-morph tween calls `positionTrains()` after drawing each frame
-  (~1.4ms per full-network pass, 600+ trains) and once after settling.
+- the mode-morph tween calls `positionTrains()` after drawing each frame and
+  once after settling.
+
+Keeping 600+ per-frame train updates within the frame budget (measured: the
+naive version cost ~30ms/frame vs ~11ms for the line tween alone; now ~2-4ms
+on top of it):
+
+- **`morphPointAt`** — a direct single-point evaluator of the octi/curve
+  blend (O(log n), zero allocation) instead of building each train's blended
+  polyline via `morphSegmentPoints` + `pointAlong` per frame. Exact at both
+  settle states and always on the drawn line; only the mid-tween
+  parameterization differs sub-pixel.
+- **Heading lives in the shape's top-level `rotation`, not props** (x/y
+  counter-offset by `R(rot)·(w/2,h/2)` since tldraw rotates about the
+  top-left). Props never change during motion, so the memoized shape
+  component renders once per train — per-frame React re-renders were the
+  dominant cost. Updates go through one batched `updateShapes` call.
+- **Perceptual gating** — skip updates under ~0.5 *screen* px
+  (zoom-adaptive; invisible by construction) and skip trains off-screen both
+  before and after the move (positions are absolute, so they're exact when
+  they re-enter view).
 
 For each record:
 
@@ -236,9 +255,9 @@ timers hard. Techniques that work:
 
 See `train-position-accuracy.md` §5 for the ranked list (app_key, persistent
 run-time table, TrackerNet, timetable prior, currentLocation dwell anchoring,
-stacked-train fan-out). Deferred perf items unchanged: `rot` in props breaks
-the InnerShape memo; `canCull=false` paints off-screen trains; morph-tick
-allocations.
+stacked-train fan-out). Of the previously deferred perf items, rot-in-props
+and the per-train morph-tick allocations are fixed (§4); `canCull=false`
+still paints off-screen trains (though off-screen *updates* are now skipped).
 
 ## 11. Related commits
 
