@@ -11,7 +11,14 @@
 Small coloured rectangles (`train` shapes) glide along each Tube/DLR/Overground/
 Elizabeth line at the live position of every train, in **both** view modes:
 
-- **Editable mode** — trains sit on the octilinear (45°/90°, Beck-style) connectors.
+- **Editable mode** — trains sit on the octilinear (45°/90°, Beck-style)
+  connectors. Every bend is a 45° turn rounded by a circular fillet
+  (`octiConnector`, radius `OCTI_FILLET_R`, clamped to 40% of the shorter
+  leg); trains sweep smoothly through the arc, tangent included. The same
+  connector evaluator feeds line drawing (`octilinearPoints`), the train pose
+  (`octiPointAt`), and both morph paths (`morphSegmentPoints` injects the
+  fillet samples; `morphPointAt` evaluates it directly), so trains and lines
+  agree by construction (offline check: ≤0.04px divergence at any morphFrac).
 - **Geographic mode** — trains sit on the real OSM track curves, rotated to face
   along the track.
 

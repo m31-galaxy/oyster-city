@@ -139,13 +139,126 @@ function octiBend(a: Pt, b: Pt): Pt | null {
     : { x: b.x, y: a.y + sy * adx }; // diagonal, then vertical
 }
 
-/** Octilinear polyline through `centres` — a 135° bend inserted per pair. */
+/** Corner-fillet radius for octilinear bends (page px). Every bend is a 45°
+ * turn by construction; rounding it with a circular arc lets lines — and the
+ * trains riding them — sweep through corners instead of snapping direction. */
+const OCTI_FILLET_R = 18;
+/** Polyline samples across the fillet arc (endpoints inclusive). */
+const OCTI_ARC_POINTS = 7;
+
+/**
+ * An octilinear connector a->b with its 45° bend rounded by a circular
+ * fillet, arc-length parameterized over [leg1, arc, leg2]. Null when the pair
+ * is axis-aligned or a perfect diagonal (no bend — a straight line).
+ */
+interface OctiConn {
+  a: Pt;
+  /** Unit vectors of the two legs. */
+  u1: Pt;
+  u2: Pt;
+  /** Fillet endpoints on leg 1 / leg 2. */
+  t1: Pt;
+  t2: Pt;
+  /** Arc centre. */
+  cx: number;
+  cy: number;
+  /** Signed sweep angle (rad) — sign is the turn direction. */
+  sweep: number;
+  /** Lengths: leg 1 up to the fillet, the arc, and the grand total. */
+  L1: number;
+  LA: number;
+  total: number;
+}
+
+function octiConnector(a: Pt, b: Pt): OctiConn | null {
+  const bend = octiBend(a, b);
+  if (!bend) return null;
+  const l1 = Math.hypot(bend.x - a.x, bend.y - a.y);
+  const l2 = Math.hypot(b.x - bend.x, b.y - bend.y);
+  const u1 = { x: (bend.x - a.x) / l1, y: (bend.y - a.y) / l1 };
+  const u2 = { x: (b.x - bend.x) / l2, y: (b.y - bend.y) / l2 };
+  const cross = u1.x * u2.y - u1.y * u2.x;
+  const dot = u1.x * u2.x + u1.y * u2.y;
+  const phi = Math.abs(Math.atan2(cross, dot)); // 45° by construction
+  const side = cross >= 0 ? 1 : -1;
+  const tanHalf = Math.tan(phi / 2);
+  // Tangent offset from the corner; the fillet never eats more than 40% of
+  // either leg (short segments degrade gracefully toward a sharp corner).
+  const d = Math.min(OCTI_FILLET_R * tanHalf, 0.4 * Math.min(l1, l2));
+  const r = d / tanHalf;
+  const t1 = { x: bend.x - u1.x * d, y: bend.y - u1.y * d };
+  const t2 = { x: bend.x + u2.x * d, y: bend.y + u2.y * d };
+  // Arc centre: from t1 along leg-1's normal, toward the turn side.
+  const cx = t1.x - u1.y * side * r;
+  const cy = t1.y + u1.x * side * r;
+  const L1 = l1 - d;
+  const LA = r * phi;
+  return {
+    a,
+    u1,
+    u2,
+    t1,
+    t2,
+    cx,
+    cy,
+    sweep: side * phi,
+    L1,
+    LA,
+    total: L1 + LA + (l2 - d),
+  };
+}
+
+/** Point + tangent at arc-length fraction `f` along a rounded connector. */
+function octiConnPointAt(c: OctiConn, f: number): { point: Pt; tangent: Pt } {
+  const t = (f < 0 ? 0 : f > 1 ? 1 : f) * c.total;
+  if (t <= c.L1) {
+    return {
+      point: { x: c.a.x + c.u1.x * t, y: c.a.y + c.u1.y * t },
+      tangent: { x: c.u1.x, y: c.u1.y },
+    };
+  }
+  if (t >= c.L1 + c.LA) {
+    const d2 = t - c.L1 - c.LA;
+    return {
+      point: { x: c.t2.x + c.u2.x * d2, y: c.t2.y + c.u2.y * d2 },
+      tangent: { x: c.u2.x, y: c.u2.y },
+    };
+  }
+  const ang = c.LA > 1e-9 ? ((t - c.L1) / c.LA) * c.sweep : 0;
+  const cos = Math.cos(ang);
+  const sin = Math.sin(ang);
+  const vx = c.t1.x - c.cx;
+  const vy = c.t1.y - c.cy;
+  return {
+    point: { x: c.cx + vx * cos - vy * sin, y: c.cy + vx * sin + vy * cos },
+    tangent: {
+      x: c.u1.x * cos - c.u1.y * sin,
+      y: c.u1.x * sin + c.u1.y * cos,
+    },
+  };
+}
+
+/** The fillet arc sampled as polyline points (t1..t2 inclusive). */
+function octiConnArcPoints(c: OctiConn): Pt[] {
+  const out: Pt[] = [];
+  const vx = c.t1.x - c.cx;
+  const vy = c.t1.y - c.cy;
+  for (let i = 0; i < OCTI_ARC_POINTS; i++) {
+    const ang = (i / (OCTI_ARC_POINTS - 1)) * c.sweep;
+    const cos = Math.cos(ang);
+    const sin = Math.sin(ang);
+    out.push({ x: c.cx + vx * cos - vy * sin, y: c.cy + vx * sin + vy * cos });
+  }
+  return out;
+}
+
+/** Octilinear polyline through `centres` — a rounded 45° bend per pair. */
 function octilinearPoints(centres: Pt[]): Pt[] {
   if (centres.length < 2) return centres.slice();
   const out: Pt[] = [centres[0]];
   for (let i = 1; i < centres.length; i++) {
-    const bend = octiBend(centres[i - 1], centres[i]);
-    if (bend) out.push(bend);
+    const conn = octiConnector(centres[i - 1], centres[i]);
+    if (conn) for (const p of octiConnArcPoints(conn)) out.push(p);
     out.push(centres[i]);
   }
   return out;
@@ -174,21 +287,12 @@ function morphSegmentPoints(
   const L = Math.sqrt(lenSq) || 1;
   const pux = -cy / L; // unit perpendicular of the chord
   const puy = cx / L;
-  const bend = octiBend(cA, cB);
-  // The bend's own arc-length fraction along the two-leg octilinear connector.
-  const leg1 = bend ? Math.hypot(bend.x - cA.x, bend.y - cA.y) : 0;
-  const leg2 = bend ? Math.hypot(cB.x - bend.x, cB.y - bend.y) : 0;
-  const aBend = bend && leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
-  // The octilinear connector evaluated at arc-length fraction a (0..1).
-  const octiAt = (a: number): Pt => {
-    if (!bend) return { x: cA.x + a * cx, y: cA.y + a * cy };
-    if (a <= aBend) {
-      const f = aBend > 1e-6 ? a / aBend : 0;
-      return { x: cA.x + (bend.x - cA.x) * f, y: cA.y + (bend.y - cA.y) * f };
-    }
-    const f = aBend < 1 - 1e-6 ? (a - aBend) / (1 - aBend) : 0;
-    return { x: bend.x + (cB.x - bend.x) * f, y: bend.y + (cB.y - bend.y) * f };
-  };
+  const conn = octiConnector(cA, cB);
+  // The (rounded) octilinear connector at arc-length fraction a (0..1).
+  const octiAt = (a: number): Pt =>
+    conn
+      ? octiConnPointAt(conn, a).point
+      : { x: cA.x + a * cx, y: cA.y + a * cy };
   // The curve (or straight chord) point at chord-fraction s, perp offset pf.
   const curveAt = (s: number, pf: number): Pt => ({
     x: cA.x + s * cx + pf * L * pux,
@@ -201,18 +305,26 @@ function morphSegmentPoints(
   const along = profile ? profile.along : [0, 1];
   const perp = profile ? profile.perp : [0, 0];
   const arc = profile ? profile.arc : [0, 1];
+  // Inject the fillet arc's samples at their arc fractions: the rounded
+  // corner is drawn exactly at morphFrac 0 and the injected points sit on the
+  // curve (collinear, invisible) at morphFrac 1. Fractions are strictly
+  // inside (0, 1), so each lands between two profile points.
+  const inj = conn
+    ? octiConnArcPoints(conn).map((p, i) => ({
+        f: (conn.L1 + (i / (OCTI_ARC_POINTS - 1)) * conn.LA) / conn.total,
+        p,
+      }))
+    : [];
+  let nextInj = 0;
   const out: Pt[] = [];
-  let injected = !bend; // with a bend, inject its sharp vertex exactly once
   for (let j = 0; j < along.length; j++) {
-    if (!injected && arc[j] > aBend) {
-      // Inject the bend at its arc-length fraction: the 135° corner is sharp at
-      // morphFrac 0 and sits on the curve (collinear, invisible) at morphFrac 1.
+    while (nextInj < inj.length && inj[nextInj].f < arc[j]) {
       const prev = arc[j - 1];
-      const f = (aBend - prev) / (arc[j] - prev || 1);
-      const alongBend = along[j - 1] + (along[j] - along[j - 1]) * f;
-      const perpBend = perp[j - 1] + (perp[j] - perp[j - 1]) * f;
-      out.push(mix(bend!, curveAt(alongBend, perpBend)));
-      injected = true;
+      const f = (inj[nextInj].f - prev) / (arc[j] - prev || 1);
+      const alongI = along[j - 1] + (along[j] - along[j - 1]) * f;
+      const perpI = perp[j - 1] + (perp[j] - perp[j - 1]) * f;
+      out.push(mix(inj[nextInj].p, curveAt(alongI, perpI)));
+      nextInj++;
     }
     // Octilinear point by monotonic arc-length; curve point by chord (along,perp).
     out.push(mix(octiAt(arc[j]), curveAt(along[j], perp[j])));
@@ -244,29 +356,22 @@ function morphPointAt(
   const L = Math.hypot(cx, cy) || 1;
   const pux = -cy / L;
   const puy = cx / L;
-  const bend = octiBend(cA, cB);
-  const leg1 = bend ? Math.hypot(bend.x - cA.x, bend.y - cA.y) : 0;
-  const leg2 = bend ? Math.hypot(cB.x - bend.x, cB.y - bend.y) : 0;
-  const aBend = bend && leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
+  const conn = octiConnector(cA, cB);
   const along = profile ? profile.along : null;
   const perp = profile ? profile.perp : null;
   const arc = profile ? profile.arc : null;
   const n = along ? along.length : 2;
   const xy = (t: number): Pt => {
-    // Octilinear component (arc-length parameterized, exact at the bend).
+    // Octilinear component (arc-length parameterized, rounded at the bend).
     let ox: number;
     let oy: number;
-    if (!bend) {
+    if (!conn) {
       ox = cA.x + t * cx;
       oy = cA.y + t * cy;
-    } else if (t <= aBend) {
-      const f = aBend > 1e-6 ? t / aBend : 0;
-      ox = cA.x + (bend.x - cA.x) * f;
-      oy = cA.y + (bend.y - cA.y) * f;
     } else {
-      const f = aBend < 1 - 1e-6 ? (t - aBend) / (1 - aBend) : 0;
-      ox = bend.x + (cB.x - bend.x) * f;
-      oy = bend.y + (cB.y - bend.y) * f;
+      const p = octiConnPointAt(conn, t).point;
+      ox = p.x;
+      oy = p.y;
     }
     // Curve component: lerp the profile's (along, perp) at arc parameter t.
     let s: number;
@@ -389,30 +494,17 @@ function pointAlongArc(
   };
 }
 
-/** Point + tangent at fraction `f` along the octilinear connector cA->cB. */
+/** Point + tangent at fraction `f` along the (rounded) octilinear connector
+ * cA->cB — trains sweep smoothly through the fillet, tangent included. */
 function octiPointAt(cA: Pt, cB: Pt, f: number): { point: Pt; tangent: Pt } {
-  const bend = octiBend(cA, cB);
-  if (!bend) {
+  const conn = octiConnector(cA, cB);
+  if (!conn) {
     return {
       point: { x: cA.x + f * (cB.x - cA.x), y: cA.y + f * (cB.y - cA.y) },
       tangent: { x: cB.x - cA.x, y: cB.y - cA.y },
     };
   }
-  const leg1 = Math.hypot(bend.x - cA.x, bend.y - cA.y);
-  const leg2 = Math.hypot(cB.x - bend.x, cB.y - bend.y);
-  const aBend = leg1 + leg2 > 1e-6 ? leg1 / (leg1 + leg2) : 0;
-  if (f <= aBend) {
-    const t = aBend > 1e-6 ? f / aBend : 0;
-    return {
-      point: { x: cA.x + (bend.x - cA.x) * t, y: cA.y + (bend.y - cA.y) * t },
-      tangent: { x: bend.x - cA.x, y: bend.y - cA.y },
-    };
-  }
-  const t = aBend < 1 - 1e-6 ? (f - aBend) / (1 - aBend) : 0;
-  return {
-    point: { x: bend.x + (cB.x - bend.x) * t, y: bend.y + (cB.y - bend.y) * t },
-    tangent: { x: cB.x - bend.x, y: cB.y - bend.y },
-  };
+  return octiConnPointAt(conn, f);
 }
 
 /** Point + tangent at fraction `f` along the straight chord cA->cB. */
