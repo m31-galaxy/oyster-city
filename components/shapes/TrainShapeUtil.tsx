@@ -44,10 +44,11 @@ export class TrainShapeUtil extends ShapeUtil<TrainShape> {
   override canEdit = () => false;
   override canBind = () => false;
 
-  // A train marker has tiny geometry bounds, so default culling would unmount it
-  // (and it would pop out) the moment its centre crossed a screen edge — same
-  // reasoning as StationShapeUtil.
-  override canCull = () => false;
+  // Default culling applies: heading lives in the shape's top-level rotation,
+  // so the page bounds cover the rotated marker exactly (the white border is
+  // inside w/h via border-box) — a train is hidden only when it is genuinely
+  // off-viewport. With ~650 trains and ~95% of the map off-screen when zoomed
+  // in, this keeps the compositing layer small while panning.
 
   override getGeometry(shape: TrainShape) {
     return new Rectangle2d({

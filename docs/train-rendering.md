@@ -133,6 +133,19 @@ on top of it):
   before and after the move (positions are absolute, so they're exact when
   they re-enter view).
 
+And for **pan/idle** performance:
+
+- **Culling is enabled for trains and stations** (previously `canCull=false`
+  on both, so ~95% of the map was painted while zoomed in — 62 shapes hidden
+  vs 1300+ now). Train bounds are exact post-rotation-refactor. Station
+  geometry stays the 11×11 marker only (labels are invisible to selection
+  boxes, snapping, and hit-testing); the overflowing HTML label is protected
+  from edge-pop by a custom `canCull` that vetoes the cull while the label's
+  (generously estimated) page rect still intersects the viewport.
+- **No-op ticks touch nothing**: `positionTrains` collects work read-only and
+  only opens `editor.run` (and geo mode's readonly lift, previously a 10Hz
+  instance-state write even when idle) when there is something to write.
+
 For each record:
 
 1. **Blend bookkeeping.** When a record's `fetchMs` changes (fresh poll), the
@@ -255,9 +268,8 @@ timers hard. Techniques that work:
 
 See `train-position-accuracy.md` §5 for the ranked list (app_key, persistent
 run-time table, TrackerNet, timetable prior, currentLocation dwell anchoring,
-stacked-train fan-out). Of the previously deferred perf items, rot-in-props
-and the per-train morph-tick allocations are fixed (§4); `canCull=false`
-still paints off-screen trains (though off-screen *updates* are now skipped).
+stacked-train fan-out). All three previously deferred perf items are now
+done: rot-in-props, per-train morph-tick allocations, and culling (§4).
 
 ## 11. Related commits
 

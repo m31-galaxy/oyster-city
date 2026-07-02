@@ -53,7 +53,9 @@ const TRAIN_H = 6;
 const SHOWN_LINES: string[] | null = null;
 
 type Pt = { x: number; y: number };
-type Pose = { x: number; y: number; rotation: number };
+// Station layout position. Stations have no orientation (StationShapeUtil
+// pins rotation to 0), so a pose is just a point.
+type Pose = { x: number; y: number };
 /**
  * A segment's OSM curve decomposed along/perpendicular to its geo chord, plus
  * each point's normalised arc-length (0..1) — the monotonic parameter that maps
@@ -99,10 +101,18 @@ function pathFromPoints(points: Pt[]) {
   };
 }
 
-/** Current page-space centre of a station shape, if it exists. */
+/**
+ * Current page-space centre of a station's MARKER, if the shape exists.
+ * Computed from the page transform (cheaper than geometry bounds, and
+ * independent of whatever extent the geometry covers).
+ */
 function stationCentre(editor: Editor, id: TLShapeId): Pt | null {
-  const b = editor.getShapePageBounds(id);
-  return b ? { x: b.center.x, y: b.center.y } : null;
+  const shape = editor.getShape(id) as StationShape | undefined;
+  if (!shape) return null;
+  const t = editor.getShapePageTransform(id);
+  if (!t) return null;
+  const p = t.applyToPoint({ x: shape.props.w / 2, y: shape.props.h / 2 });
+  return { x: p.x, y: p.y };
 }
 
 /** Pixel tolerance below which a pair counts as already axis-aligned or 45°. */
@@ -357,7 +367,8 @@ function pointAlongArc(
   f: number,
 ): { point: Pt; tangent: Pt } {
   const n = pts.length;
-  if (n < 2) return { point: pts[0] ?? { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
+  if (n < 2)
+    return { point: pts[0] ?? { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
   const t = f < 0 ? 0 : f > 1 ? 1 : f;
   let lo = 0;
   let hi = n - 1;
@@ -487,7 +498,9 @@ export default function TubeMap() {
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
   const branchesForLineRef = useRef<Map<string, BranchInfo[]>>(new Map());
   const branchStationIdsRef = useRef<Map<string, string[]>>(new Map());
-  const segProfilesRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(new Map());
+  const segProfilesRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(
+    new Map(),
+  );
   const naptanToHubRef = useRef<Record<string, string>>({});
   const stationPosRef = useRef<Map<string, [number, number]>>(new Map());
   const lineColorRef = useRef<Map<string, string>>(new Map());
@@ -530,7 +543,9 @@ export default function TubeMap() {
 
     const net = getTubeNetwork();
     naptanToHubRef.current = net.naptanToHub;
-    stationPosRef.current = new Map(net.stations.map((s) => [s.id, [s.lon, s.lat]]));
+    stationPosRef.current = new Map(
+      net.stations.map((s) => [s.id, [s.lon, s.lat]]),
+    );
     const lines = SHOWN_LINES
       ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
       : net.lines;
@@ -555,9 +570,9 @@ export default function TubeMap() {
     const stationShapes = stations.map((s) => {
       const id = shapeIdFor.get(s.id)!;
       const pos = { x: s.cx - MARKER / 2, y: s.cy - MARKER / 2 };
-      // Both layouts start at the geographic position, unrotated.
-      geoPos.current.set(id, { ...pos, rotation: 0 });
-      customPos.current.set(id, { ...pos, rotation: 0 });
+      // Both layouts start at the geographic position.
+      geoPos.current.set(id, { ...pos });
+      customPos.current.set(id, { ...pos });
       return {
         id,
         type: "station" as const,
@@ -698,7 +713,7 @@ export default function TubeMap() {
     const starts = new Map<TLShapeId, Pose>(
       ids.map((id) => {
         const s = editor.getShape(id);
-        return [id, { x: s?.x ?? 0, y: s?.y ?? 0, rotation: s?.rotation ?? 0 }];
+        return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
       }),
     );
     // Leaving editable mode: remember the user's custom layout first.
@@ -722,11 +737,7 @@ export default function TubeMap() {
     const movingIds = ids.filter((id) => {
       const s = starts.get(id)!;
       const g = targets.get(id)!;
-      return (
-        Math.abs(s.x - g.x) > 0.5 ||
-        Math.abs(s.y - g.y) > 0.5 ||
-        Math.abs(s.rotation - g.rotation) > 1e-4
-      );
+      return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
     });
 
     animating.current = true;
@@ -746,10 +757,6 @@ export default function TubeMap() {
               type: "station",
               x: s.x + (g.x - s.x) * e,
               y: s.y + (g.y - s.y) * e,
-              // Geographic mode is canonical (rotation 0); editable restores the
-              // captured rotation. Leftover rotation would offset a station's
-              // centre off the fixed curve.
-              rotation: s.rotation + (g.rotation - s.rotation) * e,
             });
           }
           // Draw each line by blending every station-pair segment between its
@@ -862,185 +869,193 @@ export default function TubeMap() {
     const onScreen = (px: number, py: number) =>
       px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
 
+    // Read-only pass first: compute poses and collect the create/update/delete
+    // work. Store writes (and geo mode's readonly lift) happen only when there
+    // IS work — most ambient ticks are no-ops thanks to the perceptual gate,
+    // and a no-op tick that toggled instance state 10x/s caused store churn
+    // during panning for nothing.
+    const seen = new Set<string>();
+    const toCreate: {
+      id: TLShapeId;
+      type: "train";
+      x: number;
+      y: number;
+      rotation: number;
+      isLocked: boolean;
+      props: { w: number; h: number; color: string };
+    }[] = [];
+    // One batched updateShapes call; heading goes in the shape's TOP-LEVEL
+    // rotation (props stay constant), so tldraw's memoized component never
+    // re-renders — per-frame React re-renders of 600+ trains were the
+    // mode-morph's dominant cost. Rotation pivots the top-left corner, so
+    // x/y are counter-offset to keep the marker CENTRE on the track point.
+    const toUpdate: {
+      id: TLShapeId;
+      type: "train";
+      x: number;
+      y: number;
+      rotation: number;
+    }[] = [];
+    for (const [key, rec] of store) {
+      // On a fresh poll, convert the correction into a TIME offset that
+      // decays to zero: the train briefly runs slow (or pauses / gently
+      // catches up) instead of teleporting or sliding backward. The blend
+      // window widens with the offset so display speed stays within
+      // 0.25x-1.75x of real. Falls back to a decaying 2D point offset when
+      // the new trajectory doesn't pass the displayed pose (reroute /
+      // branch switch). Skipped during the morph, where the whole line is
+      // already moving.
+      let rs = render.get(key);
+      let capture2D = false;
+      if (rs && rs.fetchMs !== rec.fetchMs) {
+        rs.fetchMs = rec.fetchMs;
+        if (settled) {
+          const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
+          const off = tEq === null ? null : tEq - nowEpoch;
+          if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
+            rs.timeOff = off;
+            rs.offX = 0;
+            rs.offY = 0;
+            rs.offStart = now;
+            rs.blendMs = Math.max(TRAIN_BLEND_MS, 2 * Math.abs(off));
+          } else {
+            capture2D = true;
+          }
+        } else {
+          rs.timeOff = 0;
+          rs.offX = 0;
+          rs.offY = 0;
+        }
+      }
+      let decay = 0;
+      if (rs && settled) {
+        const dt = (now - rs.offStart) / rs.blendMs;
+        decay = dt >= 1 ? 0 : 1 - smoothstepEase(dt);
+      }
+      const pose = trainPose(rec, nowEpoch + (rs ? rs.timeOff * decay : 0));
+      if (!pose) continue;
+      if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
+      const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
+      if (!netIds) continue;
+      const i = pose.segIndex;
+      const idA = shapeIdForRef.current.get(netIds[i]);
+      const idB = shapeIdForRef.current.get(netIds[i + 1]);
+      if (!idA || !idB) continue;
+      const cA = stationCentre(editor, idA);
+      const cB = stationCentre(editor, idB);
+      if (!cA || !cB) continue;
+      const fFwd = pose.reversed ? 1 - pose.f : pose.f;
+      const branchId = pose.branchShapeId as TLShapeId;
+      let placed: { point: Pt; tangent: Pt };
+      if (geo) {
+        const seg = lineSegGeo.current.get(branchId)?.[i];
+        const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
+        placed =
+          seg && seg.length >= 2
+            ? arc
+              ? pointAlongArc(seg, arc, fFwd)
+              : pointAlong(seg, fFwd)
+            : straightAt(cA, cB, fFwd);
+      } else if (octi) {
+        placed = octiPointAt(cA, cB, fFwd);
+      } else {
+        const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
+        placed = morphPointAt(cA, cB, profile, morphFrac, fFwd);
+      }
+      const tx = placed.point.x;
+      const ty = placed.point.y;
+      if (!rs) {
+        rs = {
+          x: tx,
+          y: ty,
+          fetchMs: rec.fetchMs,
+          pose,
+          timeOff: 0,
+          offX: 0,
+          offY: 0,
+          offStart: now,
+          blendMs: TRAIN_BLEND_MS,
+        };
+        render.set(key, rs);
+      }
+      if (capture2D) {
+        rs.timeOff = 0;
+        rs.offX = rs.x - tx;
+        rs.offY = rs.y - ty;
+        rs.offStart = now;
+        rs.blendMs = TRAIN_BLEND_MS;
+        decay = 1;
+      }
+      const dispX = tx + rs.offX * decay;
+      const dispY = ty + rs.offY * decay;
+      rs.x = dispX;
+      rs.y = dispY;
+      rs.pose = pose;
+      const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
+      // Rotation pivots the origin (top-left): offset it so the rotated
+      // centre R(rot)·(w/2, h/2) lands exactly on the track point.
+      const cos = Math.cos(rot);
+      const sin = Math.sin(rot);
+      const x = dispX - ((TRAIN_W / 2) * cos - (TRAIN_H / 2) * sin);
+      const y = dispY - ((TRAIN_W / 2) * sin + (TRAIN_H / 2) * cos);
+      seen.add(key);
+      const shapeId = shapes.get(key);
+      if (!shapeId) {
+        if (onlyBranches) continue; // creation belongs to the full pass
+        const newId = createShapeId();
+        shapes.set(key, newId);
+        toCreate.push({
+          id: newId,
+          type: "train",
+          x,
+          y,
+          rotation: rot,
+          isLocked: true,
+          props: { w: TRAIN_W, h: TRAIN_H, color: rec.color },
+        });
+      } else {
+        const cur = editor.getShape(shapeId) as TrainShape | undefined;
+        if (!cur) continue;
+        if (!onScreen(cur.x, cur.y) && !onScreen(x, y)) continue;
+        // Skip sub-perceptual jitter (< ~0.5 screen px / 0.02 rad). The
+        // rotation delta is wrapped so a heading crossing the ±π seam
+        // doesn't read as a ~2π change.
+        const dRot = Math.abs(
+          ((cur.rotation - rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI,
+        );
+        if (
+          Math.abs(cur.x - x) > minDelta ||
+          Math.abs(cur.y - y) > minDelta ||
+          dRot > 0.02
+        ) {
+          toUpdate.push({ id: shapeId, type: "train", x, y, rotation: rot });
+        }
+      }
+    }
+    const toDelete: TLShapeId[] = [];
+    if (!onlyBranches) {
+      for (const [key, shapeId] of shapes) {
+        if (!seen.has(key)) {
+          toDelete.push(shapeId);
+          shapes.delete(key);
+          render.delete(key);
+        }
+      }
+    }
+    if (!toCreate.length && !toUpdate.length && !toDelete.length) return;
+
     // Trains are programmatic; geo mode's readonly instance state blocks all
     // create/update, so lift it just for this synchronous batch, then restore.
     const readonly = editor.getInstanceState().isReadonly;
     if (readonly) editor.updateInstanceState({ isReadonly: false });
     try {
       editor.run(
-      () => {
-        const seen = new Set<string>();
-        const toCreate: {
-          id: TLShapeId;
-          type: "train";
-          x: number;
-          y: number;
-          rotation: number;
-          isLocked: boolean;
-          props: { w: number; h: number; color: string };
-        }[] = [];
-        // One batched updateShapes call; heading goes in the shape's TOP-LEVEL
-        // rotation (props stay constant), so tldraw's memoized component never
-        // re-renders — per-frame React re-renders of 600+ trains were the
-        // mode-morph's dominant cost. Rotation pivots the top-left corner, so
-        // x/y are counter-offset to keep the marker CENTRE on the track point.
-        const toUpdate: {
-          id: TLShapeId;
-          type: "train";
-          x: number;
-          y: number;
-          rotation: number;
-        }[] = [];
-        for (const [key, rec] of store) {
-          // On a fresh poll, convert the correction into a TIME offset that
-          // decays to zero: the train briefly runs slow (or pauses / gently
-          // catches up) instead of teleporting or sliding backward. The blend
-          // window widens with the offset so display speed stays within
-          // 0.25x-1.75x of real. Falls back to a decaying 2D point offset when
-          // the new trajectory doesn't pass the displayed pose (reroute /
-          // branch switch). Skipped during the morph, where the whole line is
-          // already moving.
-          let rs = render.get(key);
-          let capture2D = false;
-          if (rs && rs.fetchMs !== rec.fetchMs) {
-            rs.fetchMs = rec.fetchMs;
-            if (settled) {
-              const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
-              const off = tEq === null ? null : tEq - nowEpoch;
-              if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
-                rs.timeOff = off;
-                rs.offX = 0;
-                rs.offY = 0;
-                rs.offStart = now;
-                rs.blendMs = Math.max(TRAIN_BLEND_MS, 2 * Math.abs(off));
-              } else {
-                capture2D = true;
-              }
-            } else {
-              rs.timeOff = 0;
-              rs.offX = 0;
-              rs.offY = 0;
-            }
-          }
-          let decay = 0;
-          if (rs && settled) {
-            const dt = (now - rs.offStart) / rs.blendMs;
-            decay = dt >= 1 ? 0 : 1 - smoothstepEase(dt);
-          }
-          const pose = trainPose(rec, nowEpoch + (rs ? rs.timeOff * decay : 0));
-          if (!pose) continue;
-          if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
-          const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
-          if (!netIds) continue;
-          const i = pose.segIndex;
-          const idA = shapeIdForRef.current.get(netIds[i]);
-          const idB = shapeIdForRef.current.get(netIds[i + 1]);
-          if (!idA || !idB) continue;
-          const cA = stationCentre(editor, idA);
-          const cB = stationCentre(editor, idB);
-          if (!cA || !cB) continue;
-          const fFwd = pose.reversed ? 1 - pose.f : pose.f;
-          const branchId = pose.branchShapeId as TLShapeId;
-          let placed: { point: Pt; tangent: Pt };
-          if (geo) {
-            const seg = lineSegGeo.current.get(branchId)?.[i];
-            const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
-            placed =
-              seg && seg.length >= 2
-                ? arc
-                  ? pointAlongArc(seg, arc, fFwd)
-                  : pointAlong(seg, fFwd)
-                : straightAt(cA, cB, fFwd);
-          } else if (octi) {
-            placed = octiPointAt(cA, cB, fFwd);
-          } else {
-            const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
-            placed = morphPointAt(cA, cB, profile, morphFrac, fFwd);
-          }
-          const tx = placed.point.x;
-          const ty = placed.point.y;
-          if (!rs) {
-            rs = {
-              x: tx,
-              y: ty,
-              fetchMs: rec.fetchMs,
-              pose,
-              timeOff: 0,
-              offX: 0,
-              offY: 0,
-              offStart: now,
-              blendMs: TRAIN_BLEND_MS,
-            };
-            render.set(key, rs);
-          }
-          if (capture2D) {
-            rs.timeOff = 0;
-            rs.offX = rs.x - tx;
-            rs.offY = rs.y - ty;
-            rs.offStart = now;
-            rs.blendMs = TRAIN_BLEND_MS;
-            decay = 1;
-          }
-          const dispX = tx + rs.offX * decay;
-          const dispY = ty + rs.offY * decay;
-          rs.x = dispX;
-          rs.y = dispY;
-          rs.pose = pose;
-          const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
-          // Rotation pivots the origin (top-left): offset it so the rotated
-          // centre R(rot)·(w/2, h/2) lands exactly on the track point.
-          const cos = Math.cos(rot);
-          const sin = Math.sin(rot);
-          const x = dispX - ((TRAIN_W / 2) * cos - (TRAIN_H / 2) * sin);
-          const y = dispY - ((TRAIN_W / 2) * sin + (TRAIN_H / 2) * cos);
-          seen.add(key);
-          const shapeId = shapes.get(key);
-          if (!shapeId) {
-            if (onlyBranches) continue; // creation belongs to the full pass
-            const newId = createShapeId();
-            shapes.set(key, newId);
-            toCreate.push({
-              id: newId,
-              type: "train",
-              x,
-              y,
-              rotation: rot,
-              isLocked: true,
-              props: { w: TRAIN_W, h: TRAIN_H, color: rec.color },
-            });
-          } else {
-            const cur = editor.getShape(shapeId) as TrainShape | undefined;
-            if (!cur) continue;
-            if (!onScreen(cur.x, cur.y) && !onScreen(x, y)) continue;
-            // Skip sub-perceptual jitter (< ~0.5 screen px / 0.02 rad). The
-            // rotation delta is wrapped so a heading crossing the ±π seam
-            // doesn't read as a ~2π change.
-            const dRot =
-              Math.abs(((cur.rotation - rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
-            if (
-              Math.abs(cur.x - x) > minDelta ||
-              Math.abs(cur.y - y) > minDelta ||
-              dRot > 0.02
-            ) {
-              toUpdate.push({ id: shapeId, type: "train", x, y, rotation: rot });
-            }
-          }
-        }
-        if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
-        if (toUpdate.length) editor.updateShapes(toUpdate);
-        if (!onlyBranches) {
-          const toDelete: TLShapeId[] = [];
-          for (const [key, shapeId] of shapes) {
-            if (!seen.has(key)) {
-              toDelete.push(shapeId);
-              shapes.delete(key);
-              render.delete(key);
-            }
-          }
+        () => {
+          if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
+          if (toUpdate.length) editor.updateShapes(toUpdate);
           if (toDelete.length) editor.deleteShapes(toDelete);
-        }
-      },
-      { ignoreShapeLock: true },
+        },
+        { ignoreShapeLock: true },
       );
     } finally {
       if (readonly) editor.updateInstanceState({ isReadonly: true });
