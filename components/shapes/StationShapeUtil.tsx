@@ -58,20 +58,43 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
     };
   }
 
-  override canResize = () => false;
+  // Stations are fixed-size, orientation-free markers. Resize handles are
+  // hidden for a single station, but canResize stays TRUE so that resizing a
+  // multi-selection works: with no onResize defined, tldraw's resizeShape
+  // repositions each shape at its scaled geometry-bounds centre (= the marker
+  // centre) without changing its size — the selection spreads out / packs
+  // together while every station keeps its shape.
+  override canResize = () => true;
   override hideResizeHandles = () => true;
   override hideRotateHandle = () => true;
   override canEdit = () => false;
   override canBind = () => false;
 
-  // The name label is HTML that overflows the marker's 11×11 geometry, so the
-  // default culling (which keys off geometry bounds) would unmount the whole
-  // shape — label included — the moment the marker crossed a screen edge, even
-  // while the label is still on-screen. Opt station shapes out of culling so
-  // edge labels stay put. It's cheap: culling only toggles `display`, and the
-  // component renders either way, so this just forgoes hiding off-screen markers.
-  override canCull = () => false;
+  // Stations have no orientation. When a (multi-)selection is rotated, tldraw
+  // proposes a rotated shape; accept the movement but not the spin: place the
+  // unrotated shape so its CENTRE sits where the proposed rotated centre is —
+  // stations orbit the selection pivot while markers, labels, and selection
+  // outlines stay axis-aligned. (A single station can't be rotated from the
+  // UI — hideRotateHandle — and a programmatic rotate just orbits it about
+  // its selection-bounds centre with rotation pinned to 0.)
+  override onRotate = (_initial: StationShape, current: StationShape) => {
+    const { w, h } = current.props;
+    const cos = Math.cos(current.rotation);
+    const sin = Math.sin(current.rotation);
+    const cx = current.x + (w / 2) * cos - (h / 2) * sin;
+    const cy = current.y + (w / 2) * sin + (h / 2) * cos;
+    return {
+      id: current.id,
+      type: "station" as const,
+      x: cx - w / 2,
+      y: cy - h / 2,
+      rotation: 0,
+    };
+  };
 
+  // Geometry is the 11×11 marker rect ONLY: selection boxes, snapping, hit
+  // targets, and every other layout concern see just the marker — the label
+  // is invisible to all of them.
   override getGeometry(shape: StationShape) {
     return new Rectangle2d({
       width: shape.props.w,
@@ -79,6 +102,27 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       isFilled: true,
     });
   }
+
+  // Culling, however, must NOT hide a station whose overflowing HTML label is
+  // still on screen (marker-bounds culling would pop edge labels). canCull is
+  // only consulted for shapes whose bounds are already outside the viewport,
+  // so here we veto the cull while the label's page rect (generously
+  // estimated — overestimating only delays hiding) still intersects the
+  // viewport. Assumes rotation 0, which onRotate pins.
+  override canCull = (shape: StationShape) => {
+    const { name, interchange } = shape.props;
+    if (!name) return true;
+    const labelShown = interchange || this.editor.getZoomLevel() >= LABEL_ZOOM;
+    if (!labelShown) return true;
+    const r = labelRect(shape.props);
+    const vp = this.editor.getViewportPageBounds();
+    return (
+      shape.x + r.x > vp.maxX ||
+      shape.x + r.x + r.w < vp.minX ||
+      shape.y + r.y > vp.maxY ||
+      shape.y + r.y + r.h < vp.minY
+    );
+  };
 
   override component(shape: StationShape) {
     const { name, interchange, labelPos, color, w, h } = shape.props;
@@ -90,14 +134,6 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       "show-label",
       () => interchange || editor.getZoomLevel() >= LABEL_ZOOM,
       [editor, interchange],
-    );
-    // Read rotation reactively: tldraw updates the shape container's transform
-    // for rotation without re-rendering component(), so `shape.rotation` here
-    // is stale. Subscribing forces a re-render when rotation actually changes.
-    const rotation = useValue(
-      "rotation",
-      () => editor.getShape(shape.id)?.rotation ?? 0,
-      [editor, shape.id],
     );
     const marker: CSSProperties = interchange
       ? {
@@ -123,11 +159,9 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
         <div style={{ position: "relative", width: w, height: h }}>
           <div style={marker} />
           {/* Progressive labels: interchanges always, others on zoom-in. The
-              selected station's name also shows in the sidebar. The anchor
-              counter-rotates so the label stays horizontal even when the
-              station's transform is rotated. */}
+              selected station's name also shows in the sidebar. */}
           {showLabel && (
-            <div style={labelAnchorStyle(rotation)}>
+            <div style={labelAnchorStyle()}>
               <span style={labelStyle(labelPos)}>{name}</span>
             </div>
           )}
@@ -145,18 +179,43 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
 }
 
 /**
- * A zero-size anchor at the marker centre that counter-rotates the label by
- * the shape's rotation, keeping the name horizontal (and attached) however the
- * station is rotated.
+ * Conservative shape-local rect over the rendered label's extent (9px/600
+ * system-ui, single line), placed per the labelPos hint — mirrors labelStyle.
+ * Used only by canCull; the label is deliberately NOT part of the geometry.
  */
-function labelAnchorStyle(rotation: number): CSSProperties {
+function labelRect(props: StationProps): {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+} {
+  const { w, h, name, labelPos } = props;
+  const lw = name.length * 5.6 + 10; // ~5.2px/glyph + padding
+  const lh = 14;
+  const off = MARKER / 2 + 3; // matches labelStyle's offset from the centre
+  const cx = w / 2;
+  const cy = h / 2;
+  const x = labelPos.includes("E")
+    ? cx + off
+    : labelPos.includes("W")
+      ? cx - off - lw
+      : cx - lw / 2;
+  const y = labelPos.includes("N")
+    ? cy - off - lh
+    : labelPos.includes("S")
+      ? cy + off
+      : cy - lh / 2;
+  return { x, y, w: lw, h: lh };
+}
+
+/** A zero-size anchor at the marker centre that the label offsets hang off. */
+function labelAnchorStyle(): CSSProperties {
   return {
     position: "absolute",
     left: "50%",
     top: "50%",
     width: 0,
     height: 0,
-    transform: `rotate(${-rotation}rad)`,
   };
 }
 
