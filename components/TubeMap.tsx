@@ -26,8 +26,11 @@ import { selectStation } from "@/lib/tube/selection";
 import {
   deriveTrains,
   makeBranch,
-  trainProgress,
+  stitchTrains,
+  trainPose,
+  trainTimeAt,
   type BranchInfo,
+  type TrainPose,
   type TrainRecord,
 } from "@/lib/tube/trains";
 import type { Prediction } from "@/lib/tfl/types";
@@ -39,8 +42,10 @@ const ANIM_MS = 650;
 const TRAIN_POLL_MS = 30_000;
 /** How often to reposition trains — trains crawl, so this stays smooth. */
 const TRAIN_TICK_MS = 100;
-/** Ease each poll's position correction over this window instead of jumping. */
+/** Minimum window for easing away a poll correction (widened for big ones). */
 const TRAIN_BLEND_MS = 1500;
+/** Corrections implying more than this time shift jump instead of blending. */
+const TRAIN_BLEND_MAX_MS = 90_000;
 const TRAIN_W = 10;
 const TRAIN_H = 6;
 
@@ -58,6 +63,14 @@ type SegProfile = { along: number[]; perp: number[]; arc: number[] };
 
 const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+/**
+ * Smoothstep — used for the train-correction decay because its peak slope is
+ * 1.5 (easeInOutCubic's is 3): with blendMs >= 2x the time offset this keeps
+ * d(displayTime)/dt within [0.25, 1.75], so blended trains never move
+ * backward (verified by the monotonicity unit check in the accuracy work).
+ */
+const smoothstepEase = (t: number) => t * t * (3 - 2 * t);
 
 /** Build an SVG path + bounding box from page-space points (station centres). */
 function pathFromPoints(points: Pt[]) {
@@ -392,10 +405,23 @@ export default function TubeMap() {
   const trainStore = useRef<Map<string, TrainRecord>>(new Map());
   const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
   // Per-train render state for easing away the position correction each poll.
+  // Preferred: a TIME offset (the train runs briefly slow/fast, never visibly
+  // backward); fallback: a 2D point offset when the new trajectory doesn't
+  // pass through the displayed pose (branch switch, reroute).
   const trainRender = useRef<
     Map<
       string,
-      { x: number; y: number; fetchTime: number; offX: number; offY: number; offStart: number }
+      {
+        x: number;
+        y: number;
+        fetchMs: number;
+        pose: TrainPose | null;
+        timeOff: number;
+        offX: number;
+        offY: number;
+        offStart: number;
+        blendMs: number;
+      }
     >
   >(new Map());
   /** 0 = editable, 1 = geographic, in between while the morph tween runs. */
@@ -523,20 +549,27 @@ export default function TubeMap() {
       ...stationShapes,
     ]);
 
-    // Reactive lines: when a station is dragged, redraw the lines through it.
-    // Skipped while animating — the tween redraws lines itself.
+    // Reactive lines: when a station is dragged, redraw the lines through it —
+    // and re-pose the trains on those lines in the SAME batch, so they stay
+    // glued to the moving geometry instead of catching up at the ambient tick.
+    // Skipped while animating — the tween redraws lines (and trains) itself.
     editor.sideEffects.registerAfterChangeHandler("shape", (prev, next) => {
       if (animating.current) return;
       if (next.type !== "station") return;
       if (prev.x === next.x && prev.y === next.y) return;
       editor.run(
         () => {
+          const affected = new Set<string>();
           for (const shape of editor.getCurrentPageShapes()) {
             if (shape.type !== "tube-line") continue;
             const ids = shape.props.stationIds as TLShapeId[];
             // Dragging only happens in editable mode → octilinear connectors.
-            if (ids.includes(next.id)) recomputeLine(editor, shape, null, true);
+            if (ids.includes(next.id)) {
+              recomputeLine(editor, shape, null, true);
+              affected.add(shape.id);
+            }
           }
+          if (affected.size) positionTrains(affected);
         },
         { ignoreShapeLock: true },
       );
@@ -675,6 +708,9 @@ export default function TubeMap() {
         },
         { ignoreShapeLock: true },
       );
+      // Re-pose all trains on the freshly drawn morph frame — the ambient
+      // ~10fps tick would let them visibly lag the 60fps line tween.
+      positionTrains();
       if (t < 1) {
         animFrame.current = requestAnimationFrame(tick);
       } else {
@@ -685,6 +721,7 @@ export default function TubeMap() {
         // editable settles onto octilinear connectors.
         recomputeAllLines(editor, geo ? lineGeo.current : null, !geo);
         editor.updateInstanceState({ isReadonly: geo });
+        positionTrains();
       }
     };
     animFrame.current = requestAnimationFrame(tick);
@@ -702,7 +739,14 @@ export default function TubeMap() {
 
   // Reposition every live train onto its current segment, matching how the line
   // is drawn: the geo curve, the octilinear connector, or the live morph blend.
-  const positionTrains = useCallback(() => {
+  //
+  // `onlyBranches` limits the pass to trains on those tube-line shapes — used
+  // by the station-drag side effect and the mode-morph tick to move trains in
+  // the SAME synchronous batch that redraws the lines (otherwise trains lag
+  // the line at the ambient ~10fps tick and look detached). A filtered pass
+  // only updates existing shapes: create/delete must see every key, so they
+  // stay with the full ambient pass.
+  const positionTrains = useCallback((onlyBranches?: ReadonlySet<string>) => {
     const editor = editorRef.current;
     if (!editor) return;
     const store = trainStore.current;
@@ -710,9 +754,11 @@ export default function TubeMap() {
     const render = trainRender.current;
     if (store.size === 0 && shapes.size === 0) return;
     const now = performance.now();
+    const nowEpoch = Date.now();
     const morphFrac = morphFracRef.current;
     const geo = morphFrac >= 1 - 1e-6;
     const octi = morphFrac <= 1e-6;
+    const settled = geo || octi;
 
     // Trains are programmatic; geo mode's readonly instance state blocks all
     // create/update, so lift it just for this synchronous batch, then restore.
@@ -731,18 +777,55 @@ export default function TubeMap() {
           props: { w: number; h: number; color: string; rot: number };
         }[] = [];
         for (const [key, rec] of store) {
-          const netIds = branchStationIdsRef.current.get(rec.branchShapeId);
+          // On a fresh poll, convert the correction into a TIME offset that
+          // decays to zero: the train briefly runs slow (or pauses / gently
+          // catches up) instead of teleporting or sliding backward. The blend
+          // window widens with the offset so display speed stays within
+          // 0.25x-1.75x of real. Falls back to a decaying 2D point offset when
+          // the new trajectory doesn't pass the displayed pose (reroute /
+          // branch switch). Skipped during the morph, where the whole line is
+          // already moving.
+          let rs = render.get(key);
+          let capture2D = false;
+          if (rs && rs.fetchMs !== rec.fetchMs) {
+            rs.fetchMs = rec.fetchMs;
+            if (settled) {
+              const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
+              const off = tEq === null ? null : tEq - nowEpoch;
+              if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
+                rs.timeOff = off;
+                rs.offX = 0;
+                rs.offY = 0;
+                rs.offStart = now;
+                rs.blendMs = Math.max(TRAIN_BLEND_MS, 2 * Math.abs(off));
+              } else {
+                capture2D = true;
+              }
+            } else {
+              rs.timeOff = 0;
+              rs.offX = 0;
+              rs.offY = 0;
+            }
+          }
+          let decay = 0;
+          if (rs && settled) {
+            const dt = (now - rs.offStart) / rs.blendMs;
+            decay = dt >= 1 ? 0 : 1 - smoothstepEase(dt);
+          }
+          const pose = trainPose(rec, nowEpoch + (rs ? rs.timeOff * decay : 0));
+          if (!pose) continue;
+          if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
+          const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
           if (!netIds) continue;
-          const i = rec.segIndex;
+          const i = pose.segIndex;
           const idA = shapeIdForRef.current.get(netIds[i]);
           const idB = shapeIdForRef.current.get(netIds[i + 1]);
           if (!idA || !idB) continue;
           const cA = stationCentre(editor, idA);
           const cB = stationCentre(editor, idB);
           if (!cA || !cB) continue;
-          const f = trainProgress(rec, now);
-          const fFwd = rec.reversed ? 1 - f : f;
-          const branchId = rec.branchShapeId as TLShapeId;
+          const fFwd = pose.reversed ? 1 - pose.f : pose.f;
+          const branchId = pose.branchShapeId as TLShapeId;
           let placed: { point: Pt; tangent: Pt };
           if (geo) {
             const seg = lineSegGeo.current.get(branchId)?.[i];
@@ -762,40 +845,42 @@ export default function TubeMap() {
               fFwd,
             );
           }
-          // Ease the per-poll correction: when a fresh record arrives, keep
-          // showing the current point and glide onto the new trajectory over
-          // TRAIN_BLEND_MS, so trains don't teleport each 30s refresh. Skipped
-          // during the morph, where the whole line is already moving.
           const tx = placed.point.x;
           const ty = placed.point.y;
-          const settled = geo || octi;
-          let rs = render.get(key);
           if (!rs) {
-            rs = { x: tx, y: ty, fetchTime: rec.fetchTime, offX: 0, offY: 0, offStart: now };
+            rs = {
+              x: tx,
+              y: ty,
+              fetchMs: rec.fetchMs,
+              pose,
+              timeOff: 0,
+              offX: 0,
+              offY: 0,
+              offStart: now,
+              blendMs: TRAIN_BLEND_MS,
+            };
             render.set(key, rs);
           }
-          if (settled && rs.fetchTime !== rec.fetchTime) {
+          if (capture2D) {
+            rs.timeOff = 0;
             rs.offX = rs.x - tx;
             rs.offY = rs.y - ty;
             rs.offStart = now;
+            rs.blendMs = TRAIN_BLEND_MS;
+            decay = 1;
           }
-          rs.fetchTime = rec.fetchTime;
-          let dispX = tx;
-          let dispY = ty;
-          if (settled) {
-            const dt = (now - rs.offStart) / TRAIN_BLEND_MS;
-            const decay = dt >= 1 ? 0 : 1 - easeInOutCubic(dt);
-            dispX = tx + rs.offX * decay;
-            dispY = ty + rs.offY * decay;
-          }
+          const dispX = tx + rs.offX * decay;
+          const dispY = ty + rs.offY * decay;
           rs.x = dispX;
           rs.y = dispY;
+          rs.pose = pose;
           const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
           const x = dispX - TRAIN_W / 2;
           const y = dispY - TRAIN_H / 2;
           seen.add(key);
           const shapeId = shapes.get(key);
           if (!shapeId) {
+            if (onlyBranches) continue; // creation belongs to the full pass
             const newId = createShapeId();
             shapes.set(key, newId);
             toCreate.push({
@@ -820,15 +905,17 @@ export default function TubeMap() {
           }
         }
         if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
-        const toDelete: TLShapeId[] = [];
-        for (const [key, shapeId] of shapes) {
-          if (!seen.has(key)) {
-            toDelete.push(shapeId);
-            shapes.delete(key);
-            render.delete(key);
+        if (!onlyBranches) {
+          const toDelete: TLShapeId[] = [];
+          for (const [key, shapeId] of shapes) {
+            if (!seen.has(key)) {
+              toDelete.push(shapeId);
+              shapes.delete(key);
+              render.delete(key);
+            }
           }
+          if (toDelete.length) editor.deleteShapes(toDelete);
         }
-        if (toDelete.length) editor.deleteShapes(toDelete);
       },
       { ignoreShapeLock: true },
       );
@@ -852,30 +939,50 @@ export default function TubeMap() {
       ac?.abort();
       ac = new AbortController();
       const signal = ac.signal;
-      const results = await Promise.all(
-        lineIds.map(async (lineId) => {
-          try {
-            const res = await fetch(`/api/tfl/Line/${lineId}/Arrivals`, { signal });
-            if (!res.ok) return null;
-            const preds = (await res.json()) as Prediction[];
-            return deriveTrains(
-              preds,
-              branchesForLineRef.current.get(lineId) ?? [],
+      // ONE request for every line: /Line/{ids}/Arrivals accepts a comma list.
+      // Per-line requests burst 20 upstream fetches per poll, which exceeds
+      // TfL's anonymous rate budget (~12/min measured) and got whole lines
+      // 429-dropped. `no-store` skips the browser HTTP cache — one less layer
+      // of staleness on the ladder.
+      try {
+        const res = await fetch(`/api/tfl/Line/${lineIds.join(",")}/Arrivals`, {
+          signal,
+          cache: "no-store",
+        });
+        if (!res.ok) return; // keep the old store — trajectories cover the gap
+        const preds = (await res.json()) as Prediction[];
+        if (cancelled || signal.aborted) return;
+        const fetchMs = Date.now();
+        const byLine = new Map<string, Prediction[]>();
+        for (const p of preds) {
+          const list = byLine.get(p.lineId);
+          if (list) list.push(p);
+          else byLine.set(p.lineId, [p]);
+        }
+        const next = new Map<string, TrainRecord>();
+        for (const [lineId, linePreds] of byLine) {
+          const branches = branchesForLineRef.current.get(lineId);
+          if (!branches) continue;
+          // Stitch each fresh record's synthetic step-0 start from the
+          // previous record's exact window (see stitchTrains).
+          const recs = stitchTrains(
+            trainStore.current,
+            deriveTrains(
+              linePreds,
+              branches,
               naptanToHubRef.current,
               stationPosRef.current,
               lineId,
               lineColorRef.current.get(lineId) ?? "#666666",
-              performance.now(),
-            );
-          } catch {
-            return null; // aborted or network error — skip this line this round
-          }
-        }),
-      );
-      if (cancelled || signal.aborted) return;
-      const next = new Map<string, TrainRecord>();
-      for (const recs of results) if (recs) for (const r of recs) next.set(r.key, r);
-      trainStore.current = next;
+              fetchMs,
+            ),
+          );
+          for (const r of recs) next.set(r.key, r);
+        }
+        trainStore.current = next;
+      } catch {
+        // aborted or network error — keep the old store this round
+      }
     };
 
     // Wait for the editor + branch registry before the first poll.
