@@ -8,6 +8,7 @@ import {
   useValue,
   type TLBaseShape,
 } from "tldraw";
+import { hiddenLabels } from "@/lib/tube/labels";
 
 export interface StationProps {
   w: number;
@@ -108,12 +109,15 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   // only consulted for shapes whose bounds are already outside the viewport,
   // so here we veto the cull while the label's page rect (generously
   // estimated — overestimating only delays hiding) still intersects the
-  // viewport. Assumes rotation 0, which onRotate pins.
+  // viewport. Labels hidden by decluttering don't veto. Assumes rotation 0,
+  // which onRotate pins.
   override canCull = (shape: StationShape) => {
     const { name, interchange } = shape.props;
     if (!name) return true;
-    const labelShown = interchange || this.editor.getZoomLevel() >= LABEL_ZOOM;
-    if (!labelShown) return true;
+    const zoomed = this.editor.getZoomLevel() >= LABEL_ZOOM;
+    if (!interchange && !zoomed) return true;
+    const hidden = hiddenLabels.get();
+    if ((zoomed ? hidden.all : hidden.interOnly).has(shape.id)) return true;
     const r = labelRect(shape.props);
     const vp = this.editor.getViewportPageBounds();
     return (
@@ -127,13 +131,22 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   override component(shape: StationShape) {
     const { name, interchange, labelPos, color, w, h } = shape.props;
     const editor = useEditor();
-    // Interchanges are always labelled; other stations reveal as you zoom in.
-    // The computed value is a boolean, so a shape only re-renders when it
-    // crosses the threshold — not on every camera frame.
+    // Interchanges are always labelled; other stations reveal as you zoom in;
+    // decluttering hides the loser of any label-label overlap. The computed
+    // value is a boolean, so a shape only re-renders when it flips — not on
+    // every camera frame. The label element stays mounted and fades via CSS
+    // (opacity + delayed visibility), so show/hide reads as a cross-fade
+    // instead of a pop.
     const showLabel = useValue(
       "show-label",
-      () => interchange || editor.getZoomLevel() >= LABEL_ZOOM,
-      [editor, interchange],
+      () => {
+        if (!name) return false;
+        const zoomed = editor.getZoomLevel() >= LABEL_ZOOM;
+        if (!interchange && !zoomed) return false;
+        const hidden = hiddenLabels.get();
+        return !(zoomed ? hidden.all : hidden.interOnly).has(shape.id);
+      },
+      [editor, interchange, name, shape.id],
     );
     const marker: CSSProperties = interchange
       ? {
@@ -160,9 +173,13 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           <div style={marker} />
           {/* Progressive labels: interchanges always, others on zoom-in. The
               selected station's name also shows in the sidebar. */}
-          {showLabel && (
+          {name && (
             <div style={labelAnchorStyle()}>
-              <span style={labelStyle(labelPos)}>{name}</span>
+              <span
+                style={{ ...labelStyle(labelPos), ...labelFade(showLabel) }}
+              >
+                {name}
+              </span>
             </div>
           )}
         </div>
@@ -178,12 +195,23 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   }
 }
 
+/** Cross-fade for label show/hide. `visibility` flips after the fade ends so
+ * a hidden label neither paints nor lingers as an invisible box. */
+function labelFade(show: boolean): CSSProperties {
+  return {
+    opacity: show ? 1 : 0,
+    visibility: show ? "visible" : "hidden",
+    transition: "opacity 150ms ease, visibility 150ms",
+  };
+}
+
 /**
  * Conservative shape-local rect over the rendered label's extent (9px/600
  * system-ui, single line), placed per the labelPos hint — mirrors labelStyle.
- * Used only by canCull; the label is deliberately NOT part of the geometry.
+ * Used by canCull and the declutter pass; the label is deliberately NOT part
+ * of the geometry.
  */
-function labelRect(props: StationProps): {
+export function labelRect(props: StationProps): {
   x: number;
   y: number;
   w: number;

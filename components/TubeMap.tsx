@@ -22,6 +22,8 @@ import {
   type TrainShape,
 } from "@/components/shapes/TrainShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
+import { hiddenLabels } from "@/lib/tube/labels";
+import { labelRect } from "@/components/shapes/StationShapeUtil";
 import { selectStation } from "@/lib/tube/selection";
 import {
   deriveTrains,
@@ -105,6 +107,70 @@ function pathFromPoints(points: Pt[]) {
     h: maxY - minY || 1,
     d,
   };
+}
+
+/**
+ * Recompute which station labels are hidden by decluttering: greedy
+ * label-label overlap resolution, interchanges outrank regular stations,
+ * ties broken by station id for stability. Label rects live in PAGE space
+ * (they scale with the map), so the result is zoom-INDEPENDENT — this only
+ * needs to run when the station layout changes (mount, drag, morph settle,
+ * selection scale/rotate), never on camera moves. Two regimes are computed:
+ * one with every label, one with interchange labels only (below LABEL_ZOOM).
+ */
+function recomputeLabelDeclutter(editor: Editor) {
+  type Entry = {
+    id: string;
+    interchange: boolean;
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  };
+  const entries: Entry[] = [];
+  for (const s of editor.getCurrentPageShapes()) {
+    if (s.type !== "station") continue;
+    const st = s as StationShape;
+    if (!st.props.name) continue;
+    const r = labelRect(st.props);
+    entries.push({
+      id: st.id,
+      interchange: st.props.interchange,
+      x0: st.x + r.x,
+      y0: st.y + r.y,
+      x1: st.x + r.x + r.w,
+      y1: st.y + r.y + r.h,
+    });
+  }
+  entries.sort((a, b) =>
+    a.interchange !== b.interchange
+      ? a.interchange
+        ? -1
+        : 1
+      : a.id < b.id
+        ? -1
+        : 1,
+  );
+  const resolve = (list: Entry[]): ReadonlySet<string> => {
+    const hidden = new Set<string>();
+    const kept: Entry[] = [];
+    for (const e of list) {
+      let collides = false;
+      for (const k of kept) {
+        if (e.x0 < k.x1 && e.x1 > k.x0 && e.y0 < k.y1 && e.y1 > k.y0) {
+          collides = true;
+          break;
+        }
+      }
+      if (collides) hidden.add(e.id);
+      else kept.push(e);
+    }
+    return hidden;
+  };
+  hiddenLabels.set({
+    all: resolve(entries),
+    interOnly: resolve(entries.filter((e) => e.interchange)),
+  });
 }
 
 /**
@@ -591,6 +657,8 @@ export default function TubeMap() {
   const lineSegGeo = useRef<Map<TLShapeId, (Pt[] | null)[]>>(new Map());
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
+  const lastDeclutter = useRef(0);
+  const declutterTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Live-train state (populated in handleMount, driven by the poll + rAF loops).
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
@@ -761,6 +829,7 @@ export default function TubeMap() {
       ...lineShapes,
       ...stationShapes,
     ]);
+    recomputeLabelDeclutter(editor);
 
     // Selection-gesture modifiers: rotation snaps to 45° increments by
     // default and resizing keeps the aspect ratio by default; holding Shift
@@ -825,6 +894,22 @@ export default function TubeMap() {
             }
           }
           if (affected.size) positionTrains(affected);
+          // Station moved -> label overlaps may change. Throttled (this fires
+          // per pointer move) with a trailing debounce so the drag's FINAL
+          // position always gets a recompute.
+          const t = performance.now();
+          if (t - lastDeclutter.current > 150) {
+            lastDeclutter.current = t;
+            recomputeLabelDeclutter(editor);
+          } else {
+            if (declutterTimer.current !== null)
+              clearTimeout(declutterTimer.current);
+            declutterTimer.current = setTimeout(() => {
+              declutterTimer.current = null;
+              lastDeclutter.current = performance.now();
+              recomputeLabelDeclutter(editor);
+            }, 180);
+          }
         },
         { ignoreShapeLock: true },
       );
@@ -969,6 +1054,7 @@ export default function TubeMap() {
         recomputeAllLines(editor, geo ? lineGeo.current : null, !geo);
         editor.updateInstanceState({ isReadonly: geo });
         positionTrains();
+        recomputeLabelDeclutter(editor); // layout changed with the mode
       }
     };
     animFrame.current = requestAnimationFrame(tick);
