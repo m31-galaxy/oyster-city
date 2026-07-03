@@ -27,13 +27,21 @@ const TOL = 0.004; // sum of the two endpoint gaps (each station ~<200m off)
 const KX = Math.cos((51.5 * Math.PI) / 180);
 const metres = (a, b) => Math.hypot((a[0] - b[0]) * KX, a[1] - b[1]) * 111320;
 const SNAP_TOL_M = 450; // max station-to-track gap to trust a routed segment
-const MAX_DETOUR = 2.2; // reject routes far longer than the straight line
+const MAX_DETOUR = 2.6; // reject routes far longer than the straight line
+// (2.6 admits the legitimate Heathrow T4 loop, measured 2.34x straight)
+const STITCH_TOL_M = 30; // join way endpoints across tiny junction gaps
 
 /**
  * Build an undirected routing graph from a line's OSM ways: vertices quantised
  * to ~1m become shared nodes, consecutive way vertices become weighted edges.
  * Lets us recover a station-pair curve even when the source stores the section
  * as one long way through several stations (e.g. the Elizabeth line tunnels).
+ *
+ * The source's ways don't share exactly-coincident vertices where a branch
+ * meets its trunk (measured gaps ~3m), leaving each line's graph in dozens of
+ * disconnected islands — every "two termini off one second-last stop" pair
+ * (Chesham/Amersham, Heathrow T4/T5, Bank/Tower Gateway) was unreachable. So
+ * after building, stitch every way ENDPOINT to any node within STITCH_TOL_M.
  */
 function buildTrackGraph(segs) {
   const coord = new Map();
@@ -46,6 +54,7 @@ function buildTrackGraph(segs) {
     }
     return k;
   };
+  const ends = new Set();
   for (const seg of segs) {
     for (let i = 0; i < seg.length - 1; i++) {
       const a = node(seg[i]);
@@ -55,8 +64,23 @@ function buildTrackGraph(segs) {
       adj.get(a).push([b, w]);
       adj.get(b).push([a, w]);
     }
+    if (seg.length >= 2) {
+      ends.add(node(seg[0]));
+      ends.add(node(seg[seg.length - 1]));
+    }
   }
   const nodes = [...coord.keys()];
+  for (const e of ends) {
+    const pe = coord.get(e);
+    for (const n of nodes) {
+      if (n === e) continue;
+      const d = metres(pe, coord.get(n));
+      if (d > 0 && d <= STITCH_TOL_M && !adj.get(e).some(([v]) => v === n)) {
+        adj.get(e).push([n, d]);
+        adj.get(n).push([e, d]);
+      }
+    }
+  }
   return nodes.length ? { coord, adj, nodes } : null;
 }
 
@@ -153,7 +177,11 @@ const OVERGROUND = new Set([
 
 /** OSM segment polylines for a line (each a [lon,lat][]). */
 function segmentsFor(lineName) {
-  const wanted = OVERGROUND.has(lineName) ? "London Overground" : lineName;
+  const wanted = OVERGROUND.has(lineName)
+    ? "London Overground"
+    : lineName === "Tram"
+      ? "Tramlink" // the source predates the "Trams"/"Tram" branding
+      : lineName;
   const out = [];
   for (const f of geo.features) {
     if (!(f.properties.lines || []).some((l) => l.name === wanted)) continue;
