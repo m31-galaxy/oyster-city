@@ -46,6 +46,12 @@ const TRAIN_TICK_MS = 100;
 const TRAIN_BLEND_MS = 1500;
 /** Corrections implying more than this time shift jump instead of blending. */
 const TRAIN_BLEND_MAX_MS = 90_000;
+/** Heading smoothing time constant — reversals/departures rotate over ~0.4s
+ * (shortest arc) instead of snapping; fillet sweeps are barely affected. */
+const TRAIN_HEADING_TAU_MS = 120;
+/** Trajectory look-ahead offsets (ms) used to find the departure heading of a
+ * dwelling train, so it turns on the platform before it moves. */
+const HEADING_PROBES = [5_000, 15_000, 35_000];
 const TRAIN_W = 10;
 const TRAIN_H = 6;
 
@@ -620,6 +626,8 @@ export default function TubeMap() {
         springW: number;
         springT: number;
         dispTime: number;
+        /** Smoothed displayed heading (rad); NaN until first placement. */
+        rot: number;
         offX: number;
         offY: number;
         offStart: number;
@@ -1027,6 +1035,37 @@ export default function TubeMap() {
       const onScreen = (px: number, py: number) =>
         px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
 
+      // Page-space point + tangent for a pose, using the geometry that matches
+      // how the line is currently drawn. Shared by the main placement and the
+      // dwell look-ahead that pre-aims a stopped train's heading.
+      const placedFor = (
+        pose: TrainPose,
+      ): { point: Pt; tangent: Pt } | null => {
+        const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
+        if (!netIds) return null;
+        const i = pose.segIndex;
+        const idA = shapeIdForRef.current.get(netIds[i]);
+        const idB = shapeIdForRef.current.get(netIds[i + 1]);
+        if (!idA || !idB) return null;
+        const cA = stationCentre(editor, idA);
+        const cB = stationCentre(editor, idB);
+        if (!cA || !cB) return null;
+        const fFwd = pose.reversed ? 1 - pose.f : pose.f;
+        const branchId = pose.branchShapeId as TLShapeId;
+        if (geo) {
+          const seg = lineSegGeo.current.get(branchId)?.[i];
+          const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
+          return seg && seg.length >= 2
+            ? arc
+              ? pointAlongArc(seg, arc, fFwd)
+              : pointAlong(seg, fFwd)
+            : straightAt(cA, cB, fFwd);
+        }
+        if (octi) return octiPointAt(cA, cB, fFwd);
+        const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
+        return morphPointAt(cA, cB, profile, morphFrac, fFwd);
+      };
+
       // Read-only pass first: compute poses and collect the create/update/delete
       // work. Store writes (and geo mode's readonly lift) happen only when there
       // IS work — most ambient ticks are no-ops thanks to the perceptual gate,
@@ -1099,7 +1138,9 @@ export default function TubeMap() {
         }
         let decay = 0;
         let dispTime = nowEpoch;
+        let headDtMs = 0;
         if (rs) {
+          headDtMs = Math.max(0, nowEpoch - rs.springT);
           if (settled) {
             // Integrate the critically damped spring (closed form), then
             // clamp display time to monotonic forward within [0.25, 1.75]x.
@@ -1137,33 +1178,8 @@ export default function TubeMap() {
         const pose = trainPose(rec, dispTime);
         if (!pose) continue;
         if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
-        const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
-        if (!netIds) continue;
-        const i = pose.segIndex;
-        const idA = shapeIdForRef.current.get(netIds[i]);
-        const idB = shapeIdForRef.current.get(netIds[i + 1]);
-        if (!idA || !idB) continue;
-        const cA = stationCentre(editor, idA);
-        const cB = stationCentre(editor, idB);
-        if (!cA || !cB) continue;
-        const fFwd = pose.reversed ? 1 - pose.f : pose.f;
-        const branchId = pose.branchShapeId as TLShapeId;
-        let placed: { point: Pt; tangent: Pt };
-        if (geo) {
-          const seg = lineSegGeo.current.get(branchId)?.[i];
-          const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
-          placed =
-            seg && seg.length >= 2
-              ? arc
-                ? pointAlongArc(seg, arc, fFwd)
-                : pointAlong(seg, fFwd)
-              : straightAt(cA, cB, fFwd);
-        } else if (octi) {
-          placed = octiPointAt(cA, cB, fFwd);
-        } else {
-          const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
-          placed = morphPointAt(cA, cB, profile, morphFrac, fFwd);
-        }
+        const placed = placedFor(pose);
+        if (!placed) continue;
         const tx = placed.point.x;
         const ty = placed.point.y;
         if (!rs) {
@@ -1177,6 +1193,7 @@ export default function TubeMap() {
             springW: 3,
             springT: nowEpoch,
             dispTime: nowEpoch,
+            rot: Number.NaN,
             offX: 0,
             offY: 0,
             offStart: now,
@@ -1196,7 +1213,33 @@ export default function TubeMap() {
         rs.x = dispX;
         rs.y = dispY;
         rs.pose = pose;
-        const rot = Math.atan2(placed.tangent.y, placed.tangent.x);
+        // Heading: smooth the displayed rotation toward the target tangent
+        // (shortest arc, tau ~120ms) so reversals and departures swing over
+        // ~0.4s instead of snapping. A dwelling on-screen train aims at its
+        // DEPARTURE tangent (probe the trajectory ahead), turning on the
+        // platform before it moves.
+        let targetRot = Math.atan2(placed.tangent.y, placed.tangent.x);
+        if (settled && !pose.moving && onScreen(dispX, dispY)) {
+          for (const k of HEADING_PROBES) {
+            const fut = trainPose(rec, dispTime + k);
+            if (!fut) break;
+            if (fut.moving) {
+              const fp = placedFor(fut);
+              if (fp) targetRot = Math.atan2(fp.tangent.y, fp.tangent.x);
+              break;
+            }
+          }
+        }
+        let rot: number;
+        if (Number.isFinite(rs.rot)) {
+          const delta =
+            ((targetRot - rs.rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
+          rot =
+            rs.rot + delta * (1 - Math.exp(-headDtMs / TRAIN_HEADING_TAU_MS));
+        } else {
+          rot = targetRot; // first placement — no spawn swing
+        }
+        rs.rot = rot;
         // Rotation pivots the origin (top-left): offset it so the rotated
         // centre R(rot)·(w/2, h/2) lands exactly on the track point.
         const cos = Math.cos(rot);
