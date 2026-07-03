@@ -28,10 +28,22 @@ function cleanName(name) {
     .trim();
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Fetch JSON politely: anonymous TfL access sustains ~12 req/min, so space
+ * requests out and back off on 429 instead of failing the build. */
 async function getJSON(url) {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
-  return res.json();
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (res.status === 429 && attempt < 5) {
+      console.warn(`  … 429, backing off (${url})`);
+      await sleep(15_000);
+      continue;
+    }
+    if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+    await sleep(3_000);
+    return res.json();
+  }
 }
 
 const KX = Math.cos((51.5 * Math.PI) / 180); // London longitude compression
@@ -113,18 +125,21 @@ const naptanToHub = {};
 
 for (const line of lines) {
   const colour = colourFor(line.id);
-  let seq;
-  try {
-    seq = await getJSON(`${BASE}/Line/${line.id}/Route/Sequence/outbound`);
-    if (!seq.stopPointSequences?.length) {
-      seq = await getJSON(`${BASE}/Line/${line.id}/Route/Sequence/inbound`);
+  // BOTH directions: for two-way lines the inbound sequences are mirrors and
+  // pruneBranches drops them as reversed duplicates, but one-way loops serve
+  // DIFFERENT stops per direction — the Croydon town loop's northern side
+  // (Reeves Corner, Centrale, West Croydon, Wellesley Road) exists only in
+  // the inbound data and vanished entirely when only outbound was fetched.
+  const seqs = [];
+  for (const dir of ["outbound", "inbound"]) {
+    try {
+      const seq = await getJSON(`${BASE}/Line/${line.id}/Route/Sequence/${dir}`);
+      seqs.push(...(seq.stopPointSequences ?? []));
+    } catch (e) {
+      console.warn(`  ! ${line.id} ${dir}: ${e.message}`);
     }
-  } catch (e) {
-    console.warn(`  ! ${line.id}: ${e.message}`);
-    continue;
   }
-
-  const seqs = seq.stopPointSequences ?? [];
+  if (!seqs.length) continue;
   let branches = 0;
   for (const sps of seqs) {
     const stops = (sps.stopPoint ?? []).filter(
