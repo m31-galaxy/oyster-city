@@ -19,7 +19,6 @@ export default async function Home() {
     <main className="layout">
       <CollapsibleSidebar>
         <h1>Oyster City</h1>
-        <p className="tagline">Live London transport — a TfL Go for the web.</p>
 
         <StationReadout />
 

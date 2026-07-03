@@ -1,8 +1,7 @@
 # Oyster City
 
-A browser-based equivalent of TfL's **TfL Go** app — live London transport
-arrivals, line status, journey planning and an interactive schematic Tube map —
-at [oyster.city](https://oyster.city).
+Live London transport in the browser: arrivals, line status and an
+interactive Tube map, at [oyster.city](https://oyster.city).
 
 Built with **Next.js (App Router) + React + tldraw**, using the public
 [TfL Unified API](https://api.tfl.gov.uk).

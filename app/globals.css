@@ -19,9 +19,18 @@ body {
 }
 
 body {
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family:
+    var(--font-tube), system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   color: var(--text);
   background: var(--bg);
+}
+
+/* Form controls don't inherit the font by default. */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
 }
 
 .layout {
@@ -88,12 +97,6 @@ body {
 .sidebar h1 {
   margin: 0 0 4px;
   font-size: 22px;
-}
-
-.tagline {
-  margin: 0 0 20px;
-  color: var(--muted);
-  font-size: 13px;
 }
 
 .sidebar h2 {

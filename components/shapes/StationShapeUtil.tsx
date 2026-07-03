@@ -258,7 +258,7 @@ function labelStyle(pos: string): CSSProperties {
     color: "#111111",
     whiteSpace: "nowrap",
     pointerEvents: "none",
-    fontFamily: "system-ui, -apple-system, sans-serif",
+    fontFamily: "var(--font-tube), system-ui, -apple-system, sans-serif",
   };
   const transforms: string[] = [];
 
