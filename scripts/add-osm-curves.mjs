@@ -30,6 +30,16 @@ const SNAP_TOL_M = 450; // max station-to-track gap to trust a routed segment
 const MAX_DETOUR = 2.6; // reject routes far longer than the straight line
 // (2.6 admits the legitimate Heathrow T4 loop, measured 2.34x straight)
 const STITCH_TOL_M = 30; // join way endpoints across tiny junction gaps
+// Soft avoidance: a leg between two adjacent stops shouldn't thread through a
+// THIRD station of the same line. Track near other stations costs extra, so
+// near-ties (the T4 loop's fold-back through Hatton Cross beat the proper
+// western arm by ~2%) resolve away from foreign platforms — but a route that
+// genuinely must pass close to another station still wins (penalty, not
+// exclusion), and MAX_DETOUR judges the TRUE length, not the penalised one.
+const AVOID_M = 250; // "near another station" radius (the T4 loop fold-back
+// passes 164m from the Hatton Cross station point — tracks run beside
+// stations, not through their centroids)
+const AVOID_PENALTY = 3; // weight multiplier on penalised edges
 
 /**
  * Build an undirected routing graph from a line's OSM ways: vertices quantised
@@ -42,8 +52,12 @@ const STITCH_TOL_M = 30; // join way endpoints across tiny junction gaps
  * disconnected islands — every "two termini off one second-last stop" pair
  * (Chesham/Amersham, Heathrow T4/T5, Bank/Tower Gateway) was unreachable. So
  * after building, stitch every way ENDPOINT to any node within STITCH_TOL_M.
+ *
+ * `lineStations` ([id, [lon,lat]] of every station on the line, across all
+ * fragments) marks which nodes sit within AVOID_M of which stations, for the
+ * soft-avoidance penalty in routeAlongTrack.
  */
-function buildTrackGraph(segs) {
+function buildTrackGraph(segs, lineStations) {
   const coord = new Map();
   const adj = new Map();
   const node = (p) => {
@@ -81,17 +95,35 @@ function buildTrackGraph(segs) {
       }
     }
   }
-  return nodes.length ? { coord, adj, nodes } : null;
+  // Which stations each node is close to (usually none or one).
+  const nearStations = new Map();
+  if (lineStations?.length) {
+    for (const n of nodes) {
+      const p = coord.get(n);
+      let ids = null;
+      for (const [id, sp] of lineStations) {
+        if (metres(p, sp) <= AVOID_M) (ids ??= []).push(id);
+      }
+      if (ids) nearStations.set(n, ids);
+    }
+  }
+  return nodes.length ? { coord, adj, nodes, nearStations } : null;
 }
 
 /**
  * Shortest path along the track between the nodes nearest A and B. Returns the
  * polyline (endpoints snapped exactly to A,B for station attachment), or null
  * if either station is too far from the track or the route is an implausible
- * detour (a wrong branch).
+ * detour (a wrong branch). Edges near OTHER stations of the line (any id not
+ * in `pairIds`) are penalised, so the search prefers routes that don't thread
+ * through a third station's platforms; the detour check uses the true length.
  */
-function routeAlongTrack(graph, A, B) {
-  const { coord, adj, nodes } = graph;
+function routeAlongTrack(graph, A, B, pairIds) {
+  const { coord, adj, nodes, nearStations } = graph;
+  const foreign = (n) => {
+    const ids = nearStations.get(n);
+    return !!ids && ids.some((id) => !pairIds.has(id));
+  };
   const snap = (pt) => {
     let best = null;
     let bd = Infinity;
@@ -117,8 +149,9 @@ function routeAlongTrack(graph, A, B) {
     const [d, u] = pq.splice(mi, 1)[0];
     if (u === sb) break;
     if (d > distTo.get(u)) continue;
+    const uForeign = foreign(u);
     for (const [v, w] of adj.get(u)) {
-      const nd = d + w;
+      const nd = d + w * (uForeign || foreign(v) ? AVOID_PENALTY : 1);
       if (nd < distTo.get(v)) {
         distTo.set(v, nd);
         prev.set(v, u);
@@ -127,9 +160,11 @@ function routeAlongTrack(graph, A, B) {
     }
   }
   if (distTo.get(sb) === Infinity) return null;
-  if (distTo.get(sb) > metres(A, B) * MAX_DETOUR) return null;
   const path = [];
   for (let u = sb; u; u = prev.get(u)) path.unshift(coord.get(u));
+  let trueLen = 0;
+  for (let i = 1; i < path.length; i++) trueLen += metres(path[i - 1], path[i]);
+  if (trueLen > metres(A, B) * MAX_DETOUR) return null;
   path[0] = [A[0], A[1]];
   path[path.length - 1] = [B[0], B[1]];
   return path;
@@ -192,7 +227,7 @@ function segmentsFor(lineName) {
 }
 
 /** Build a branch's curve by matching each station pair to its OSM segment. */
-function buildBranchCurve(stationIds, segs) {
+function buildBranchCurve(stationIds, segs, lineStations) {
   const curve = [];
   // geoSegments[i] is the curve connecting stationIds[i]..stationIds[i+1]
   // (or null if a station position is missing) — kept aligned with the pairs.
@@ -239,8 +274,15 @@ function buildBranchCurve(stationIds, segs) {
       // No station-to-station segment lines up. Try routing along the line's
       // stitched OSM track graph — recovers the curve where the source stores a
       // whole section as one long way (e.g. the post-2022 Elizabeth tunnels).
-      if (graph === undefined) graph = buildTrackGraph(segs);
-      const routed = graph && routeAlongTrack(graph, A, B);
+      if (graph === undefined) graph = buildTrackGraph(segs, lineStations);
+      const routed =
+        graph &&
+        routeAlongTrack(
+          graph,
+          A,
+          B,
+          new Set([stationIds[i], stationIds[i + 1]]),
+        );
       if (routed) {
         segPts = routed;
         matched++;
@@ -269,9 +311,19 @@ for (const line of net.lines) {
   if (line.stationIds.length < 2) continue;
   const segs = segmentsFor(line.name);
   if (!segs.length) continue;
+  // Every station of this line (across all its fragments), for the routing
+  // penalty — "other station" must include e.g. Hatton Cross when routing the
+  // T4 loop fragment, which doesn't itself contain Hatton Cross.
+  const lineStationIds = new Set(
+    net.lines.filter((x) => x.name === line.name).flatMap((x) => x.stationIds),
+  );
+  const lineStations = [...lineStationIds]
+    .map((id) => [id, stationPos.get(id)])
+    .filter(([, p]) => p);
   const { curve, geoSegments, matched, pairs } = buildBranchCurve(
     line.stationIds,
     segs,
+    lineStations,
   );
   if (curve.length >= 2) {
     // geoPath (settle render) = the per-pair segments concatenated; they pass
