@@ -1,7 +1,7 @@
 import TubeMap from "@/components/TubeMap";
 import CollapsibleSidebar from "@/components/CollapsibleSidebar";
 import { getLineStatus } from "@/lib/tfl/client";
-import { lineColour } from "@/lib/tfl/lines";
+import { isHollowLine, lineColour } from "@/lib/tfl/lines";
 import type { LineStatus } from "@/lib/tfl/types";
 
 export default async function Home() {
@@ -35,7 +35,12 @@ export default async function Home() {
                 <li key={line.id}>
                   <span
                     className="swatch"
-                    style={{ background: lineColour(line.id) }}
+                    style={{
+                      background: isHollowLine(line.id)
+                        ? // National Rail-style casing, like the map lines.
+                          `linear-gradient(to bottom, ${lineColour(line.id)} 0 33%, #fff 33% 67%, ${lineColour(line.id)} 67% 100%)`
+                        : lineColour(line.id),
+                    }}
                   />
                   <span className="line-name">{line.name}</span>
                   <span className={good ? "status good" : "status bad"}>

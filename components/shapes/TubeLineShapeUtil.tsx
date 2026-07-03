@@ -11,6 +11,10 @@ export interface TubeLineProps {
   h: number;
   color: string;
   d: string;
+  /** National Rail-style casing (Elizabeth line / Overground): two colour
+   * rails around a white core, cross-section 1/3 colour, 1/3 white, 1/3
+   * colour — as on official TfL maps. */
+  hollow: boolean;
   /** tldraw shape ids of the stations this line connects, in order. */
   stationIds: string[];
 }
@@ -33,11 +37,19 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     h: T.number,
     color: T.string,
     d: T.string,
+    hollow: T.boolean,
     stationIds: T.arrayOf(T.string),
   };
 
   override getDefaultProps(): TubeLineShape["props"] {
-    return { w: 1, h: 1, color: "#666666", d: "", stationIds: [] };
+    return {
+      w: 1,
+      h: 1,
+      color: "#666666",
+      d: "",
+      hollow: false,
+      stationIds: [],
+    };
   }
 
   // Read-only decoration: never editable, resizable, or bindable.
@@ -56,7 +68,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
   }
 
   override component(shape: TubeLineShape) {
-    const { w, h, color, d } = shape.props;
+    const { w, h, color, d, hollow } = shape.props;
     return (
       // pointer-events off so the stations layered on top receive taps.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -73,6 +85,16 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
             strokeLinejoin="round"
             strokeLinecap="round"
           />
+          {hollow && (
+            <path
+              d={d}
+              fill="none"
+              stroke="#ffffff"
+              strokeWidth={2}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+          )}
         </svg>
       </HTMLContainer>
     );

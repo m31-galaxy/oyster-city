@@ -23,6 +23,7 @@ import {
 } from "@/components/shapes/TrainShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
+import { isHollowLine } from "@/lib/tfl/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
 import {
   deriveTrains,
@@ -830,6 +831,7 @@ export default function TubeMap() {
           h: path.h,
           color: line.color,
           d: path.d,
+          hollow: isHollowLine(line.id),
           stationIds: ids,
         },
       };

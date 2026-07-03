@@ -9,3 +9,21 @@ export const LINE_COLOURS: Record<string, string> = lineColours;
 export function lineColour(id: string): string {
   return LINE_COLOURS[id] ?? "#666666";
 }
+
+/** Lines drawn "hollow" on official TfL maps (National Rail-style casing):
+ * two colour rails around a white core, cross-section 1/3-1/3-1/3. */
+const HOLLOW_LINES = new Set([
+  "dlr",
+  "elizabeth",
+  "liberty",
+  "lioness",
+  "mildmay",
+  "suffragette",
+  "tram",
+  "weaver",
+  "windrush",
+]);
+
+export function isHollowLine(id: string): boolean {
+  return HOLLOW_LINES.has(id);
+}
