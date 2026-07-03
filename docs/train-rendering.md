@@ -110,9 +110,16 @@ clamped to a ≥15s window. Removes the dominant residual warp (~p90 300m).
 
 ## 4. Rendering — `positionTrains()` (components/TubeMap.tsx)
 
-Runs every rAF tick (throttled to `TRAIN_TICK_MS`) — plus **event-driven
-passes whenever line geometry moves faster than the ambient tick**, so trains
-stay glued to the line instead of catching up in visible ~100ms hops:
+Runs on a single rAF loop with two cadences: a **full pass** every
+`TRAIN_TICK_MS` (create/delete, off-screen bookkeeping, ~0.5-screen-px gate)
+and a **fine pass on every other frame** that advances *visible* trains with a
+~0.08-screen-px gate — sub-pixel per-frame motion instead of half-pixel hops
+at 10Hz (that stepping is what reads as "not buttery" once zoomed in). Fine
+passes bail entirely below zoom 0.5, where 10Hz steps are already sub-pixel,
+and skip trains whose last rendered point is off-screen. There are also
+**event-driven passes whenever line geometry moves faster than the ambient
+tick**, so trains stay glued to the line instead of catching up in visible
+~100ms hops:
 
 - the station-drag side effect re-poses trains **in the same synchronous
   batch** that redraws the dragged lines, filtered via
@@ -220,7 +227,7 @@ Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 | Constant | File | Value | Effect |
 |---|---|---|---|
 | `TRAIN_POLL_MS` | TubeMap.tsx | 30000 | data refresh. Don't go lower (TfL TTL + rate limits). |
-| `TRAIN_TICK_MS` | TubeMap.tsx | 100 | ~10 fps reposition. |
+| `TRAIN_TICK_MS` | TubeMap.tsx | 100 | full-pass cadence; visible trains also get per-frame fine passes. |
 | `TRAIN_BLEND_MS` | TubeMap.tsx | 1500 | min correction-ease window (auto-widens: `2×|timeOff|`). |
 | `TRAIN_BLEND_MAX_MS` | TubeMap.tsx | 90000 | corrections beyond this jump via the 2D fallback. |
 | `STEP_HORIZON_MS` / `MAX_STEPS` | trains.ts | 180s / 10 | trajectory coverage past fetch. |
