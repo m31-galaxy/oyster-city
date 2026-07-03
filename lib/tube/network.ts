@@ -121,7 +121,10 @@ export function getTubeNetwork(): TubeNetwork {
     const [cx, cy] = project(s.lon, s.lat);
     return {
       id: s.id,
-      name: s.name,
+      // TfL's tram stop commonNames all carry a "Tram Stop" suffix that
+      // just wastes label space ("East Croydon Tram Stop") — drop it here,
+      // at the single point where generated data enters the app.
+      name: s.name.replace(/\s+Tram Stop$/, ""),
       cx,
       cy,
       lon: s.lon,
