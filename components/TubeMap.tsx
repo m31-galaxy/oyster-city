@@ -24,7 +24,6 @@ import {
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
-import { selectStation } from "@/lib/tube/selection";
 import {
   deriveTrains,
   makeBranch,
@@ -923,16 +922,6 @@ export default function TubeMap() {
           }
         },
         { ignoreShapeLock: true },
-      );
-    });
-
-    // Selecting a station drives the sidebar readout.
-    editor.sideEffects.registerAfterChangeHandler("instance_page_state", () => {
-      const sel = editor.getOnlySelectedShape();
-      selectStation(
-        sel && sel.type === "station"
-          ? { id: sel.props.stationId, name: sel.props.name }
-          : null,
       );
     });
 

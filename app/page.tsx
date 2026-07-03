@@ -1,5 +1,4 @@
 import TubeMap from "@/components/TubeMap";
-import StationReadout from "@/components/StationReadout";
 import CollapsibleSidebar from "@/components/CollapsibleSidebar";
 import { getLineStatus } from "@/lib/tfl/client";
 import { lineColour } from "@/lib/tfl/lines";
@@ -19,8 +18,6 @@ export default async function Home() {
     <main className="layout">
       <CollapsibleSidebar>
         <h1>Oyster City</h1>
-
-        <StationReadout />
 
         <section>
           <h2>Line status</h2>
