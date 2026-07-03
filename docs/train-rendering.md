@@ -164,16 +164,21 @@ For each record:
 
 1. **Blend bookkeeping.** When a record's `fetchMs` changes (fresh poll), the
    correction is converted to a **time offset**: `trainTimeAt(newRec, lastPose)`
-   gives the moment the new trajectory passes the currently-displayed pose;
-   display time starts there and decays to real time over
-   `max(TRAIN_BLEND_MS, 2×|offset|)` with a **smoothstep** decay (peak slope
-   1.5 — easeInOutCubic's is 3, which would run display time backward;
-   caught by the monotonicity unit check). Guarantees: display
-   speed stays within 0.25×–1.75× of real, trains **never move backward** and
-   **never leave the track** during corrections. If the new trajectory never
-   visits the displayed pose (reroute, branch switch, |offset| > 90s), fall
-   back to the old decaying 2D point offset. Both are skipped during the
-   mode-morph (the whole line is already moving).
+   gives the moment the new trajectory passes the currently-displayed pose. A
+   **critically damped spring** drives the offset to zero (stiffness
+   `~4/|offset|s`, capped at 3/s, so small corrections settle in ~2s and a 45s
+   correction in ~2min). The spring's velocity carries across captures —
+   a poll landing mid-glide re-aims it with **no speed jump** — and a hard
+   monotonic clamp bounds display speed to [0.25×, 1.75×] of real, re-syncing
+   the spring's velocity when it binds so its release doesn't kink either.
+   Everything integrates on the same clock as display time (`Date.now`) —
+   deriving dt from `performance.now` freezes trains whenever the clocks
+   diverge (system sleep/clock slew, and the virtual-time test harness).
+   Guarantees: trains **never move backward** and **never leave the track**
+   during corrections. If the new trajectory never visits the displayed pose
+   (reroute, branch switch, |offset| > 90s), fall back to the old decaying 2D
+   point offset. Both are skipped during the mode-morph (the whole line is
+   already moving).
 2. `pose = trainPose(rec, Date.now() + timeOff·decay)`.
 3. Resolve the pose's station pair to **live** centres via
    `shapeIdFor.get(...)` → `getShapePageBounds().center` (tracks drags and the

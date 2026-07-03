@@ -599,9 +599,12 @@ export default function TubeMap() {
   const trainStore = useRef<Map<string, TrainRecord>>(new Map());
   const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
   // Per-train render state for easing away the position correction each poll.
-  // Preferred: a TIME offset (the train runs briefly slow/fast, never visibly
-  // backward); fallback: a 2D point offset when the new trajectory doesn't
-  // pass through the displayed pose (branch switch, reroute).
+  // Preferred: a TIME offset driven by a critically damped spring — display
+  // time = wall clock + offset, so the train runs briefly slow/fast, never
+  // visibly backward, and a fresh poll mid-glide re-aims the spring WITHOUT a
+  // speed jump (springV carries across captures — velocity continuity).
+  // Fallback: a decaying 2D point offset when the new trajectory doesn't pass
+  // through the displayed pose (branch switch, reroute).
   const trainRender = useRef<
     Map<
       string,
@@ -610,7 +613,13 @@ export default function TubeMap() {
         y: number;
         fetchMs: number;
         pose: TrainPose | null;
-        timeOff: number;
+        /** Spring state: time offset (ms), its velocity (ms/s), stiffness (1/s),
+         * last integration timestamp (perf ms), last displayed epoch (ms). */
+        springO: number;
+        springV: number;
+        springW: number;
+        springT: number;
+        dispTime: number;
         offX: number;
         offY: number;
         offStart: number;
@@ -1046,14 +1055,15 @@ export default function TubeMap() {
         rotation: number;
       }[] = [];
       for (const [key, rec] of store) {
-        // On a fresh poll, convert the correction into a TIME offset that
-        // decays to zero: the train briefly runs slow (or pauses / gently
-        // catches up) instead of teleporting or sliding backward. The blend
-        // window widens with the offset so display speed stays within
-        // 0.25x-1.75x of real. Falls back to a decaying 2D point offset when
-        // the new trajectory doesn't pass the displayed pose (reroute /
-        // branch switch). Skipped during the morph, where the whole line is
-        // already moving.
+        // On a fresh poll, convert the correction into a TIME offset that a
+        // critically damped spring drives back to zero: the train runs
+        // briefly slow (or gently catches up) instead of teleporting or
+        // sliding backward. The spring's velocity carries across captures, so
+        // a poll landing mid-glide re-aims it with NO speed jump; a hard
+        // monotonic clamp keeps display speed within 0.25x-1.75x of real.
+        // Falls back to a decaying 2D point offset when the new trajectory
+        // doesn't pass the displayed pose (reroute / branch switch). Skipped
+        // during the morph, where the whole line is already moving.
         let rs = render.get(key);
         // Fine passes smooth what's already on screen; initialisation and
         // newly-visible trains belong to the 10Hz full pass.
@@ -1065,26 +1075,66 @@ export default function TubeMap() {
             const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
             const off = tEq === null ? null : tEq - nowEpoch;
             if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
-              rs.timeOff = off;
+              // Position-continuous by construction (the new trajectory
+              // passes the displayed pose at nowEpoch + off); springV is
+              // deliberately NOT reset — velocity continuity.
+              rs.springO = off;
+              // Stiffness ~4/|off|s: small corrections settle in ~1.5-3s and
+              // a 45s correction in ~80s (like the old 2x|off| window). The
+              // steepest stretch rides the 0.25x monotonic clamp below.
+              rs.springW = Math.min(3, 4000 / Math.max(1334, Math.abs(off)));
               rs.offX = 0;
               rs.offY = 0;
-              rs.offStart = now;
-              rs.blendMs = Math.max(TRAIN_BLEND_MS, 2 * Math.abs(off));
             } else {
               capture2D = true;
+              rs.springO = 0;
+              rs.springV = 0;
             }
           } else {
-            rs.timeOff = 0;
+            rs.springO = 0;
+            rs.springV = 0;
             rs.offX = 0;
             rs.offY = 0;
           }
         }
         let decay = 0;
-        if (rs && settled) {
-          const dt = (now - rs.offStart) / rs.blendMs;
-          decay = dt >= 1 ? 0 : 1 - smoothstepEase(dt);
+        let dispTime = nowEpoch;
+        if (rs) {
+          if (settled) {
+            // Integrate the critically damped spring (closed form), then
+            // clamp display time to monotonic forward within [0.25, 1.75]x.
+            // Everything runs on the SAME clock as display time (Date.now):
+            // deriving dt from performance.now would freeze trains whenever
+            // the two clocks diverge (system sleep/clock slew — and the
+            // virtual-time test harness).
+            const dtMs = Math.max(0, nowEpoch - rs.springT);
+            const dtS = dtMs / 1000;
+            const a = rs.springV + rs.springW * rs.springO;
+            const e = Math.exp(-rs.springW * dtS);
+            rs.springO = (rs.springO + a * dtS) * e;
+            rs.springV = (rs.springV - a * rs.springW * dtS) * e;
+            dispTime = nowEpoch + rs.springO;
+            if (dtMs > 0) {
+              const lo = rs.dispTime + 0.25 * dtMs;
+              const hi = rs.dispTime + 1.75 * dtMs;
+              if (dispTime < lo || dispTime > hi) {
+                dispTime = dispTime < lo ? lo : hi;
+                rs.springO = dispTime - nowEpoch;
+                // Re-sync the spring's velocity to the APPLIED derivative so
+                // the clamp releasing doesn't kink the display speed.
+                rs.springV = (dispTime - rs.dispTime - dtMs) / dtS;
+              }
+            }
+            const dt2D = (now - rs.offStart) / rs.blendMs;
+            decay = dt2D >= 1 ? 0 : 1 - smoothstepEase(dt2D);
+          } else {
+            rs.springO = 0;
+            rs.springV = 0;
+          }
+          rs.springT = nowEpoch;
+          rs.dispTime = dispTime;
         }
-        const pose = trainPose(rec, nowEpoch + (rs ? rs.timeOff * decay : 0));
+        const pose = trainPose(rec, dispTime);
         if (!pose) continue;
         if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
         const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
@@ -1122,7 +1172,11 @@ export default function TubeMap() {
             y: ty,
             fetchMs: rec.fetchMs,
             pose,
-            timeOff: 0,
+            springO: 0,
+            springV: 0,
+            springW: 3,
+            springT: nowEpoch,
+            dispTime: nowEpoch,
             offX: 0,
             offY: 0,
             offStart: now,
@@ -1131,7 +1185,6 @@ export default function TubeMap() {
           render.set(key, rs);
         }
         if (capture2D) {
-          rs.timeOff = 0;
           rs.offX = rs.x - tx;
           rs.offY = rs.y - ty;
           rs.offStart = now;
