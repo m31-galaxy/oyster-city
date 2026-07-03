@@ -48,6 +48,14 @@ const TRAIN_TICK_MS = 100;
 const TRAIN_BLEND_MS = 1500;
 /** Corrections implying more than this time shift jump instead of blending. */
 const TRAIN_BLEND_MAX_MS = 90_000;
+/** A gap between positioning passes longer than this means nobody was
+ * watching (hidden tab, system sleep, paused debugger): snap to the current
+ * state instead of animating a catch-up — only animate what the user could
+ * have seen. */
+const WAKE_GAP_MS = 4_000;
+/** After a wake, keep snapping (instead of blending) through the first fresh
+ * poll, which carries the whole absence's accumulated drift. */
+const RESYNC_MS = 35_000;
 /** Heading smoothing time constant — reversals/departures rotate over ~0.4s
  * (shortest arc) instead of snapping; fillet sweeps are barely affected. */
 const TRAIN_HEADING_TAU_MS = 120;
@@ -659,6 +667,9 @@ export default function TubeMap() {
   const animFrame = useRef<number | null>(null);
   const lastDeclutter = useRef(0);
   const declutterTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Wall-clock of the last positioning pass + the post-wake snap window. */
+  const lastPassRef = useRef(0);
+  const resyncUntilRef = useRef(0);
 
   // Live-train state (populated in handleMount, driven by the poll + rAF loops).
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
@@ -1097,6 +1108,17 @@ export default function TubeMap() {
       if (store.size === 0 && shapes.size === 0) return;
       const now = performance.now();
       const nowEpoch = Date.now();
+      // Absence detection: if positioning passes stopped for a while (hidden
+      // tab, sleep), drop all per-train blend/heading state — the next pass
+      // places everything at its true current position before the user sees a
+      // frame, instead of animating a mass catch-up they never watched. Keep
+      // snapping through the first fresh poll (RESYNC_MS), which carries the
+      // absence's accumulated data drift.
+      if (lastPassRef.current && nowEpoch - lastPassRef.current > WAKE_GAP_MS) {
+        resyncUntilRef.current = nowEpoch + RESYNC_MS;
+        render.clear();
+      }
+      lastPassRef.current = nowEpoch;
       const morphFrac = morphFracRef.current;
       const geo = morphFrac >= 1 - 1e-6;
       const octi = morphFrac <= 1e-6;
@@ -1196,7 +1218,13 @@ export default function TubeMap() {
         let capture2D = false;
         if (rs && rs.fetchMs !== rec.fetchMs) {
           rs.fetchMs = rec.fetchMs;
-          if (settled) {
+          if (nowEpoch < resyncUntilRef.current) {
+            // Post-wake window: present fresh data instantly, no blending.
+            rs.springO = 0;
+            rs.springV = 0;
+            rs.offX = 0;
+            rs.offY = 0;
+          } else if (settled) {
             const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
             const off = tEq === null ? null : tEq - nowEpoch;
             if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
@@ -1471,11 +1499,20 @@ export default function TubeMap() {
     };
     start();
 
+    // Refresh immediately on tab return: the interval is throttled while
+    // hidden, and the post-wake resync window wants fresh data right away
+    // rather than up to TRAIN_POLL_MS later.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") poll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
     return () => {
       cancelled = true;
       ac?.abort();
       if (iv) clearInterval(iv);
       if (retry) clearTimeout(retry);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [mounted]);
 
