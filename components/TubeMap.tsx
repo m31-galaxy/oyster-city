@@ -892,39 +892,67 @@ export default function TubeMap() {
           }
         }
       }
-      // The full constraint set can be unsatisfiable (the DLR delta: two
-      // crossing pairs chained through fork links). When a crossing pair
-      // can't be layered because a fork link stretches a core's window past
-      // the crossing partner, drop that fork link: the sacrificed merge sits
-      // within a few px of the shared station — hidden by the station marker
-      // — while the crossing is out in the open. Each round removes one
-      // link, so this terminates.
-      let lastSharer: number[] = [];
-      for (let guard = 0; guard <= demotedPairs.length * n; guard++) {
-        lastSharer = group.map((_, j) => {
-          let last = j;
+      // A crossing pair is violated when a fork link stretches a core's
+      // window past the crossing counterpart's casing. The emission ORDER is
+      // itself a degree of freedom: first try relocating the offending fork
+      // partner's casing to just before the counterpart — that satisfies the
+      // layering while keeping the junction merge. (Thameslink's King's
+      // Cross: the main fragment crosses London Bridge–Peckham Rye away from
+      // their shared station, and its Finsbury Park fork partner was emitted
+      // after that counterpart; moving the partner earlier keeps both the
+      // crossing occlusion and the King's Cross channel merge.) Only when a
+      // move repeats — a genuine cycle, like the DLR delta's two crossings
+      // chained through fork links — is the fork link dropped as before: the
+      // sacrificed merge sits within a few px of the shared station, hidden
+      // by the station marker, while the crossing is out in the open. Every
+      // round either performs a never-tried move or removes a link, so this
+      // terminates.
+      const ord = group.map((_, i) => i); // emission slots -> fragment index
+      const slotOf: number[] = new Array(n).fill(0);
+      const tried = new Set<string>();
+      let coreSlot: number[] = [];
+      for (let guard = 0; guard <= n * n + demotedPairs.length * n; guard++) {
+        ord.forEach((f, s) => (slotOf[f] = s));
+        coreSlot = group.map((_, j) => {
+          let last = slotOf[j];
           for (let k = 0; k < n; k++)
-            if (partner[j][k]) last = Math.max(last, k);
+            if (partner[j][k]) last = Math.max(last, slotOf[k]);
           return last;
         });
-        // Fragment j occupies z-slots [j .. lastSharer(j)+core]; with a < b,
-        // the crossing pair is strictly layered iff a's core lands before b's
-        // casing, i.e. lastSharer(a) < b.
-        const violated = demotedPairs.find(([a, b]) => lastSharer[a] >= b);
-        if (!violated) break;
-        const [a] = violated;
-        // Drop a's furthest fork link (the one stretching its window past b).
-        let worst = -1;
-        for (let k = 0; k < n; k++) if (partner[a][k]) worst = k;
-        if (worst < 0) break;
-        partner[a][worst] = partner[worst][a] = false;
+        // With a's casing emitted before b's, the crossing pair is strictly
+        // layered iff a's core also lands before b's casing.
+        let va = -1;
+        let vb = -1;
+        for (const [i, j] of demotedPairs) {
+          const [a, b] = slotOf[i] < slotOf[j] ? [i, j] : [j, i];
+          if (coreSlot[a] >= slotOf[b]) {
+            va = a;
+            vb = b;
+            break;
+          }
+        }
+        if (va < 0) break;
+        // The fork partner holding a's core at/after b's casing.
+        let off = -1;
+        for (let k = 0; k < n; k++)
+          if (partner[va][k] && slotOf[k] >= slotOf[vb])
+            if (off < 0 || slotOf[k] > slotOf[off]) off = k;
+        if (off < 0) break;
+        const moveKey = `${off}->${vb}`;
+        if (!tried.has(moveKey)) {
+          tried.add(moveKey);
+          ord.splice(slotOf[off], 1);
+          ord.splice(ord.indexOf(vb), 0, off);
+        } else {
+          partner[va][off] = partner[off][va] = false;
+        }
       }
-      group.forEach((g, i) => {
-        lineShapes.push(g.casing);
+      for (const f of ord) {
+        lineShapes.push(group[f].casing);
         group.forEach((h, j) => {
-          if (h.core && lastSharer[j] === i) lineShapes.push(h.core);
+          if (h.core && coreSlot[j] === slotOf[f]) lineShapes.push(h.core);
         });
-      });
+      }
       group = [];
     };
     for (const line of lines) {
