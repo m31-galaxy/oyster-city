@@ -23,7 +23,7 @@ import {
 } from "@/components/shapes/TrainShapeUtil";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
-import { isHollowLine } from "@/lib/tfl/lines";
+import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
 import {
   deriveTrains,
@@ -988,6 +988,7 @@ export default function TubeMap() {
           d: path.d,
           hollow,
           core: false,
+          dashed: isNationalRailLine(line.id),
           stationIds: ids,
         },
       };

@@ -20,6 +20,10 @@ export interface TubeLineProps {
   hollow: boolean;
   /** True for the white-core twin of a hollow fragment. */
   core: boolean;
+  /** National Rail (non-TfL) hollow lines draw their white core DASHED, as
+   * on official TfL maps — the mark that distinguishes e.g. Thameslink from
+   * the solid-cored Elizabeth line / Overground family. */
+  dashed: boolean;
   /** tldraw shape ids of the stations this line connects, in order. */
   stationIds: string[];
 }
@@ -44,6 +48,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     d: T.string,
     hollow: T.boolean,
     core: T.boolean,
+    dashed: T.boolean,
     stationIds: T.arrayOf(T.string),
   };
 
@@ -55,6 +60,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       d: "",
       hollow: false,
       core: false,
+      dashed: false,
       stationIds: [],
     };
   }
@@ -75,7 +81,10 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
   }
 
   override component(shape: TubeLineShape) {
-    const { w, h, color, d, core } = shape.props;
+    const { w, h, color, d, core, dashed } = shape.props;
+    // National Rail cores are dashed; butt caps keep the dashes crisp
+    // (round caps would bleed 1px into each gap).
+    const dash = core && dashed;
     return (
       // pointer-events off so the stations layered on top receive taps.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -90,7 +99,8 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
             stroke={core ? "#ffffff" : color}
             strokeWidth={core ? 2 : 6}
             strokeLinejoin="round"
-            strokeLinecap="round"
+            strokeLinecap={dash ? "butt" : "round"}
+            strokeDasharray={dash ? "7 4" : undefined}
           />
         </svg>
       </HTMLContainer>

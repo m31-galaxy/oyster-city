@@ -28,3 +28,11 @@ const HOLLOW_LINES = new Set([
 export function isHollowLine(id: string): boolean {
   return HOLLOW_LINES.has(id);
 }
+
+/** True National Rail services (not TfL): drawn hollow like the Overground
+ * family but with a DASHED white core, as on official TfL maps. */
+const NATIONAL_RAIL_LINES = new Set(["thameslink"]);
+
+export function isNationalRailLine(id: string): boolean {
+  return NATIONAL_RAIL_LINES.has(id);
+}
