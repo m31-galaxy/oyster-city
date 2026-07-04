@@ -605,6 +605,7 @@ function recomputeLine(
   line: TubeLineShape,
   curve: Pt[] | null,
   octi: boolean,
+  coreId?: TLShapeId,
 ) {
   let pts: Pt[];
   if (curve && curve.length >= 2) {
@@ -624,22 +625,41 @@ function recomputeLine(
     y: path.y,
     props: { w: path.w, h: path.h, d: path.d },
   });
+  // A hollow fragment's white core rides along as a twin shape: mirror the
+  // computed path instead of recomputing it.
+  if (coreId) {
+    editor.updateShape<TubeLineShape>({
+      id: coreId,
+      type: "tube-line",
+      x: path.x,
+      y: path.y,
+      props: { w: path.w, h: path.h, d: path.d },
+    });
+  }
 }
 
 /**
  * Redraw every line. Pass `lineGeo` to draw OSM curves where available; lines
  * without a curve fall back to `octi` octilinear (editable) or straight chords.
+ * Core twins are never recomputed directly — they mirror their casing.
  */
 function recomputeAllLines(
   editor: Editor,
   lineGeo: Map<TLShapeId, Pt[]> | null,
   octi: boolean,
+  coreIdFor: ReadonlyMap<TLShapeId, TLShapeId>,
 ) {
   editor.run(
     () => {
       for (const shape of editor.getCurrentPageShapes()) {
-        if (shape.type === "tube-line") {
-          recomputeLine(editor, shape, lineGeo?.get(shape.id) ?? null, octi);
+        if (shape.type === "tube-line" && !shape.props.core) {
+          recomputeLine(
+            editor,
+            shape,
+            lineGeo?.get(shape.id) ?? null,
+            octi,
+            coreIdFor.get(shape.id),
+          );
         }
       }
     },
@@ -670,6 +690,8 @@ export default function TubeMap() {
   /** Wall-clock of the last positioning pass + the post-wake snap window. */
   const lastPassRef = useRef(0);
   const resyncUntilRef = useRef(0);
+  /** Hollow casing shape id -> its white-core twin (mirrors the casing's path). */
+  const coreIdForRef = useRef<Map<TLShapeId, TLShapeId>>(new Map());
 
   // Live-train state (populated in handleMount, driven by the poll + rAF loops).
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
@@ -778,7 +800,31 @@ export default function TubeMap() {
       };
     });
 
-    const lineShapes = lines.map((line) => {
+    // One casing shape per fragment, plus a white-core twin for hollow lines.
+    // Twins are appended after ALL of their line's casings so every core sits
+    // above every casing of the same line — at forks, one fragment's colour
+    // stroke can then never truncate another fragment's white channel. Cross-
+    // line z-order is unchanged (later lines still occlude earlier ones).
+    type TubeLineInit = {
+      id: TLShapeId;
+      type: "tube-line";
+      x: number;
+      y: number;
+      isLocked: boolean;
+      props: TubeLineShape["props"];
+    };
+    const lineShapes: TubeLineInit[] = [];
+    let pendingCores: TubeLineInit[] = [];
+    let prevLineId: string | null = null;
+    const flushCores = () => {
+      lineShapes.push(...pendingCores);
+      pendingCores = [];
+    };
+    for (const line of lines) {
+      if (line.id !== prevLineId) {
+        flushCores();
+        prevLineId = line.id;
+      }
       const lineId = createShapeId();
       const ids = line.stationIds
         .map((sid) => shapeIdFor.get(sid))
@@ -820,7 +866,8 @@ export default function TubeMap() {
       if (branches) branches.push(branch);
       else branchesForLineRef.current.set(line.id, [branch]);
       lineColorRef.current.set(line.id, line.color);
-      return {
+      const hollow = isHollowLine(line.id);
+      const casing: TubeLineInit = {
         id: lineId,
         type: "tube-line" as const,
         x: path.x,
@@ -831,11 +878,23 @@ export default function TubeMap() {
           h: path.h,
           color: line.color,
           d: path.d,
-          hollow: isHollowLine(line.id),
+          hollow,
+          core: false,
           stationIds: ids,
         },
       };
-    });
+      lineShapes.push(casing);
+      if (hollow) {
+        const coreId = createShapeId();
+        coreIdForRef.current.set(lineId, coreId);
+        pendingCores.push({
+          ...casing,
+          id: coreId,
+          props: { ...casing.props, core: true },
+        });
+      }
+    }
+    flushCores();
 
     editor.createShapes<TubeLineShape | StationShape>([
       ...lineShapes,
@@ -897,11 +956,17 @@ export default function TubeMap() {
         () => {
           const affected = new Set<string>();
           for (const shape of editor.getCurrentPageShapes()) {
-            if (shape.type !== "tube-line") continue;
+            if (shape.type !== "tube-line" || shape.props.core) continue;
             const ids = shape.props.stationIds as TLShapeId[];
             // Dragging only happens in editable mode → octilinear connectors.
             if (ids.includes(next.id)) {
-              recomputeLine(editor, shape, null, true);
+              recomputeLine(
+                editor,
+                shape,
+                null,
+                true,
+                coreIdForRef.current.get(shape.id),
+              );
               affected.add(shape.id);
             }
           }
@@ -963,9 +1028,12 @@ export default function TubeMap() {
     // between the two live stations, keeping stations on the line.
     const lineMorph = editor
       .getCurrentPageShapes()
-      .filter((s): s is TubeLineShape => s.type === "tube-line")
+      .filter(
+        (s): s is TubeLineShape => s.type === "tube-line" && !s.props.core,
+      )
       .map((s) => ({
         id: s.id,
+        coreId: coreIdForRef.current.get(s.id),
         stationIds: s.props.stationIds as TLShapeId[],
         segMorph: segProfilesRef.current.get(s.id) ?? [],
       }));
@@ -1038,6 +1106,16 @@ export default function TubeMap() {
               y: path.y,
               props: { w: path.w, h: path.h, d: path.d },
             });
+            // Mirror the frame's path to the white-core twin (no recompute).
+            if (lm.coreId) {
+              editor.updateShape<TubeLineShape>({
+                id: lm.coreId,
+                type: "tube-line",
+                x: path.x,
+                y: path.y,
+                props: { w: path.w, h: path.h, d: path.d },
+              });
+            }
           }
         },
         { ignoreShapeLock: true },
@@ -1053,7 +1131,12 @@ export default function TubeMap() {
         morphFracRef.current = geo ? 1 : 0;
         // Settle: geographic snaps lines onto the real OSM track curves;
         // editable settles onto octilinear connectors.
-        recomputeAllLines(editor, geo ? lineGeo.current : null, !geo);
+        recomputeAllLines(
+          editor,
+          geo ? lineGeo.current : null,
+          !geo,
+          coreIdForRef.current,
+        );
         editor.updateInstanceState({ isReadonly: geo });
         positionTrains();
         recomputeLabelDeclutter(editor); // layout changed with the mode

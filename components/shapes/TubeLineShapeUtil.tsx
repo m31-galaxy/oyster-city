@@ -11,10 +11,15 @@ export interface TubeLineProps {
   h: number;
   color: string;
   d: string;
-  /** National Rail-style casing (Elizabeth line / Overground): two colour
-   * rails around a white core, cross-section 1/3 colour, 1/3 white, 1/3
-   * colour — as on official TfL maps. */
+  /** National Rail-style casing (Elizabeth line / Overground / DLR / trams):
+   * two colour rails around a white core, cross-section 1/3 colour, 1/3
+   * white, 1/3 colour — as on official TfL maps. A hollow line is TWO shapes:
+   * the casing (solid 6px colour) and a `core` twin (2px white) z-ordered
+   * above ALL of the line's casings, so at forks one fragment's colour can
+   * never overpaint another fragment's white channel. */
   hollow: boolean;
+  /** True for the white-core twin of a hollow fragment. */
+  core: boolean;
   /** tldraw shape ids of the stations this line connects, in order. */
   stationIds: string[];
 }
@@ -38,6 +43,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     color: T.string,
     d: T.string,
     hollow: T.boolean,
+    core: T.boolean,
     stationIds: T.arrayOf(T.string),
   };
 
@@ -48,6 +54,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       color: "#666666",
       d: "",
       hollow: false,
+      core: false,
       stationIds: [],
     };
   }
@@ -68,7 +75,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
   }
 
   override component(shape: TubeLineShape) {
-    const { w, h, color, d, hollow } = shape.props;
+    const { w, h, color, d, core } = shape.props;
     return (
       // pointer-events off so the stations layered on top receive taps.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -80,21 +87,11 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
           <path
             d={d}
             fill="none"
-            stroke={color}
-            strokeWidth={6}
+            stroke={core ? "#ffffff" : color}
+            strokeWidth={core ? 2 : 6}
             strokeLinejoin="round"
             strokeLinecap="round"
           />
-          {hollow && (
-            <path
-              d={d}
-              fill="none"
-              stroke="#ffffff"
-              strokeWidth={2}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-          )}
         </svg>
       </HTMLContainer>
     );
