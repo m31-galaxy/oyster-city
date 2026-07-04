@@ -48,15 +48,24 @@ async function getJSON(url) {
 
 const KX = Math.cos((51.5 * Math.PI) / 180); // London longitude compression
 const SKIP_TOL_M = 600; // a bypassed station this close to the chord => express skip
+/** ...and no further off-axis than this fraction of the chord length: only a
+ * C nearly ON the line of travel marks a true express skip. The Elizabeth
+ * Shenfield express (the case this prune exists for) measures 0.08; the DLR
+ * West India Quay delta's connectors measure 0.20–0.29 and are all REAL
+ * track (including the 2009 WIQ bypass viaduct), so they must survive —
+ * when in doubt, keep the connector: extra real edges only help train
+ * resolution, while a wrong drop orphans stations. */
+const SKIP_REL_TOL = 0.12;
 
-/** Perpendicular distance (m) from station `p` to the chord a–b. */
-function chordDist(p, a, b) {
+/** Unclamped projection of station `p` onto the chord a–b: `t` (fraction
+ * along the chord) and perpendicular distance + chord length in metres. */
+function chordProject(p, a, b) {
   const ax = a.lon * KX, ay = a.lat, bx = b.lon * KX, by = b.lat;
   const px = p.lon * KX, py = p.lat;
   const vx = bx - ax, vy = by - ay, L2 = vx * vx + vy * vy;
-  let t = L2 ? ((px - ax) * vx + (py - ay) * vy) / L2 : 0;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(px - (ax + t * vx), py - (ay + t * vy)) * 111320;
+  const t = L2 ? ((px - ax) * vx + (py - ay) * vy) / L2 : 0;
+  const perp = Math.hypot(px - (ax + t * vx), py - (ay + t * vy)) * 111320;
+  return { t, perp, chordLen: Math.sqrt(L2) * 111320 };
 }
 
 /**
@@ -86,25 +95,54 @@ function pruneBranches(paths, stationMap) {
       else seen.add(sig);
     }
     const live = group.filter((p) => !drop.has(p));
-    const edges = new Set();
+    // Edge multiset over live fragments — decremented as skips are dropped so
+    // a drop is only justified by edges that actually SURVIVE. Without this,
+    // the three 2-stop sides of the DLR's West India Quay delta junction
+    // mutually eliminated each other and orphaned Westferry entirely.
+    const edgeCount = new Map();
+    const ekey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+    const bump = (k, d) => edgeCount.set(k, (edgeCount.get(k) ?? 0) + d);
     for (const p of live)
-      for (let i = 0; i < p.stationIds.length - 1; i++) {
-        edges.add(p.stationIds[i] + "|" + p.stationIds[i + 1]);
-        edges.add(p.stationIds[i + 1] + "|" + p.stationIds[i]);
-      }
+      for (let i = 0; i < p.stationIds.length - 1; i++)
+        bump(ekey(p.stationIds[i], p.stationIds[i + 1]), 1);
+    const alive = (a, b) => (edgeCount.get(ekey(a, b)) ?? 0) > 0;
     const served = new Set(live.flatMap((p) => p.stationIds));
-    for (const p of live) {
-      if (p.stationIds.length !== 2) continue;
+    // Longest chord first: the true express/bypass chords are the long ones,
+    // and dropping them consumes the "alternate path" budget before shorter
+    // genuine junction sides come up for consideration.
+    const candidates = live
+      .filter((p) => p.stationIds.length === 2)
+      .map((p) => {
+        const sa = stationMap.get(p.stationIds[0]);
+        const sb = stationMap.get(p.stationIds[1]);
+        return sa && sb ? { p, sa, sb } : null;
+      })
+      .filter(Boolean)
+      .sort(
+        (x, y) =>
+          chordProject(x.sa, x.sa, x.sb).chordLen -
+          chordProject(y.sa, y.sa, y.sb).chordLen,
+      )
+      .reverse();
+    for (const { p, sa, sb } of candidates) {
       const [A, B] = p.stationIds;
-      const sa = stationMap.get(A);
-      const sb = stationMap.get(B);
-      if (!sa || !sb) continue;
       for (const C of served) {
         if (C === A || C === B) continue;
-        if (!(edges.has(A + "|" + C) && edges.has(C + "|" + B))) continue;
+        if (!(alive(A, C) && alive(C, B))) continue;
         const sc = stationMap.get(C);
-        if (sc && chordDist(sc, sa, sb) < SKIP_TOL_M) {
+        if (!sc) continue;
+        const { t, perp, chordLen } = chordProject(sc, sa, sb);
+        // C must sit strictly BETWEEN A and B (unclamped projection) and
+        // close to the chord both absolutely and relative to its length —
+        // otherwise C is a junction neighbour, not a bypassed stop.
+        if (
+          t > 0.1 &&
+          t < 0.9 &&
+          perp < SKIP_TOL_M &&
+          perp < SKIP_REL_TOL * chordLen
+        ) {
           drop.add(p);
+          bump(ekey(A, B), -1);
           break;
         }
       }
@@ -236,6 +274,46 @@ console.log(
   `Edge dedup: ${prunedBranches.length} -> ${prunedPaths.length} fragments ` +
     `(every station pair drawn once)`,
 );
+
+// Sanity: every line's stations must form ONE connected component through its
+// fragment edges — pruning/dedup must never orphan a station (as the mutual
+// elimination of the West India Quay delta's connectors once did to Westferry).
+{
+  const byLine = new Map();
+  for (const p of prunedPaths) {
+    if (!byLine.has(p.id)) byLine.set(p.id, []);
+    byLine.get(p.id).push(p);
+  }
+  for (const [id, group] of byLine) {
+    const adj = new Map();
+    for (const p of group)
+      for (let i = 0; i < p.stationIds.length - 1; i++) {
+        const [a, b] = [p.stationIds[i], p.stationIds[i + 1]];
+        (adj.get(a) ?? adj.set(a, new Set()).get(a)).add(b);
+        (adj.get(b) ?? adj.set(b, new Set()).get(b)).add(a);
+      }
+    const all = [...adj.keys()];
+    if (!all.length) continue;
+    const seen = new Set([all[0]]);
+    const stack = [all[0]];
+    while (stack.length) {
+      for (const n of adj.get(stack.pop()) ?? []) {
+        if (!seen.has(n)) {
+          seen.add(n);
+          stack.push(n);
+        }
+      }
+    }
+    const stranded = all.filter((s) => !seen.has(s));
+    if (stranded.length) {
+      console.warn(
+        `  !! ${id}: DISCONNECTED stations: ${stranded
+          .map((s) => stations.get(s)?.name ?? s)
+          .join(", ")}`,
+      );
+    }
+  }
+}
 
 const stationList = [...stations.values()].map((s) => ({
   id: s.id,
