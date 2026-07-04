@@ -113,6 +113,49 @@ function pruneBranches(paths, stationMap) {
   return paths.filter((p) => !drop.has(p));
 }
 
+/**
+ * One drawn connection per station pair: with both directions fetched, later
+ * fragments (typically inbound) re-cover edges already drawn by earlier ones
+ * wherever a sequence isn't an exact mirror (one-way loops, express stopping
+ * patterns). A re-covered edge is NOT invisible — the octilinear connector is
+ * direction-dependent (its 45° diagonal leaves from the first endpoint), so
+ * an A→B and a B→A drawing of the same pair double up as a parallelogram.
+ * Trim each fragment to its maximal runs of unseen undirected edges,
+ * splitting where needed; loop-only stretches survive, mirrored arms go.
+ */
+function dedupEdges(paths) {
+  const seenByLine = new Map();
+  const out = [];
+  for (const p of paths) {
+    let seen = seenByLine.get(p.id);
+    if (!seen) seenByLine.set(p.id, (seen = new Set()));
+    const ids = p.stationIds;
+    const emit = (s, e) => {
+      if (e - s < 1) return;
+      out.push({
+        ...p,
+        points: p.points.slice(s, e + 1),
+        stationIds: ids.slice(s, e + 1),
+      });
+    };
+    let runStart = 0;
+    for (let i = 0; i < ids.length - 1; i++) {
+      const key =
+        ids[i] < ids[i + 1]
+          ? `${ids[i]}|${ids[i + 1]}`
+          : `${ids[i + 1]}|${ids[i]}`;
+      if (seen.has(key)) {
+        emit(runStart, i);
+        runStart = i + 1;
+      } else {
+        seen.add(key);
+      }
+    }
+    emit(runStart, ids.length - 1);
+  }
+  return out;
+}
+
 const lines = await getJSON(`${BASE}/Line/Mode/${MODES}`);
 console.log(`Fetched ${lines.length} lines`);
 
@@ -183,10 +226,15 @@ for (const line of lines) {
   console.log(`  ${line.id.padEnd(16)} ${seqs.length} seq, ${branches} branch(es)`);
 }
 
-const prunedPaths = pruneBranches(linePaths, stations);
+const prunedBranches = pruneBranches(linePaths, stations);
 console.log(
-  `Pruned ${linePaths.length - prunedPaths.length} redundant branch(es) ` +
+  `Pruned ${linePaths.length - prunedBranches.length} redundant branch(es) ` +
     `(duplicates + express skips)`,
+);
+const prunedPaths = dedupEdges(prunedBranches);
+console.log(
+  `Edge dedup: ${prunedBranches.length} -> ${prunedPaths.length} fragments ` +
+    `(every station pair drawn once)`,
 );
 
 const stationList = [...stations.values()].map((s) => ({

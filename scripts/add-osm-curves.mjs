@@ -19,33 +19,9 @@ const netPath = join(root, "lib/tube/network.generated.json");
 const net = JSON.parse(readFileSync(netPath, "utf8"));
 const geo = await (await fetch(SRC)).json();
 
-// --- Known-topology patches (applied before curve building) ----------------
-// The Heathrow T4 balloon loop is one-way (Hatton Cross -> T4 -> T2&3), but
-// TfL's stopPointSequences model it as a bare [T4, T2&3] stub — the
-// Hatton Cross -> T4 approach edge exists on no fragment, so the editable map
-// showed a plain fork, the loop's eastern arm was never drawn, and live
-// trains between Hatton Cross and T4 had no branch pair to resolve onto.
-// Prepend Hatton Cross so the fragment matches the physical running order.
-// (Lives here rather than in build-tube-data.mjs so the curve pipeline stays
-// rerunnable without TfL API access; it is idempotent either way.)
-{
-  const byName = new Map(net.stations.map((s) => [s.name, s]));
-  const hx = byName.get("Hatton Cross");
-  const t4 = byName.get("Heathrow Terminal 4");
-  const t23 = byName.get("Heathrow Terminals 2 & 3");
-  const stub = net.lines.find(
-    (l) =>
-      l.id === "piccadilly" &&
-      l.stationIds.length === 2 &&
-      l.stationIds[0] === t4?.id &&
-      l.stationIds[1] === t23?.id,
-  );
-  if (stub && hx) {
-    stub.stationIds.unshift(hx.id);
-    stub.points.unshift([hx.lon, hx.lat]);
-    console.log("Patched Piccadilly T4 loop: [Hatton Cross, T4, T2&3]");
-  }
-}
+// (The former Heathrow T4 loop patch is gone: with build-tube-data fetching
+// both route directions, the Hatton Cross -> T4 approach arrives natively as
+// an inbound-only fragment, and re-adding it here would duplicate the edge.)
 
 const stationPos = new Map(net.stations.map((s) => [s.id, [s.lon, s.lat]]));
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
