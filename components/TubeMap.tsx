@@ -776,6 +776,11 @@ export default function TubeMap() {
       stations.map((s) => [s.id, createShapeId()]),
     );
     shapeIdForRef.current = shapeIdFor;
+    // Station shape id -> initial centre point, for fork/crossing detection
+    // while grouping the line shapes below.
+    const editorStationCentres = new Map<TLShapeId, Pt>(
+      stations.map((s) => [shapeIdFor.get(s.id)!, { x: s.cx, y: s.cy }]),
+    );
 
     const stationShapes = stations.map((s) => {
       const id = shapeIdFor.get(s.id)!;
@@ -814,15 +819,117 @@ export default function TubeMap() {
       props: TubeLineShape["props"];
     };
     const lineShapes: TubeLineInit[] = [];
-    let pendingCores: TubeLineInit[] = [];
+    // The current line's fragments, accumulated until the line id changes:
+    // casing init + optional core init + station set + drawn polyline (for
+    // fork/crossing detection).
+    let group: {
+      casing: TubeLineInit;
+      core: TubeLineInit | null;
+      stations: Set<TLShapeId>;
+      poly: Pt[];
+    }[] = [];
     let prevLineId: string | null = null;
-    const flushCores = () => {
-      lineShapes.push(...pendingCores);
-      pendingCores = [];
+    const segsCross = (a: Pt, b: Pt, c: Pt, d: Pt) => {
+      const d1 = (d.x - c.x) * (a.y - c.y) - (d.y - c.y) * (a.x - c.x);
+      const d2 = (d.x - c.x) * (b.y - c.y) - (d.y - c.y) * (b.x - c.x);
+      const d3 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+      const d4 = (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
+      return d1 * d2 < 0 && d3 * d4 < 0;
+    };
+    // Emit a line's fragments with cores interleaved so channels merge ONLY
+    // between fragments that fork from a shared station: each core is placed
+    // right after the last casing among itself and its fork partners. Fork
+    // partners' casings land before the core (no channel cut-off at the
+    // junction); unrelated later casings land after it, so a same-line
+    // CROSSING occludes like two distinct lines instead of reading as a
+    // four-way junction. A pair that shares a station but ALSO crosses
+    // elsewhere (the DLR delta's bypass) is demoted to strict layering: the
+    // shared station still merges via the other fragments converging there,
+    // while the mid-route crossing occludes.
+    const flushGroup = () => {
+      const partners = (
+        g: (typeof group)[number],
+        h: (typeof group)[number],
+      ) => {
+        let shared: Pt[] | null = null;
+        for (const s of h.stations) {
+          if (g.stations.has(s)) {
+            const st = editorStationCentres.get(s);
+            if (st) (shared ??= []).push(st);
+          }
+        }
+        if (!shared) return false;
+        // Crossing away from every shared station -> not fork partners.
+        for (let i = 1; i < g.poly.length; i++) {
+          for (let j = 1; j < h.poly.length; j++) {
+            if (!segsCross(g.poly[i - 1], g.poly[i], h.poly[j - 1], h.poly[j]))
+              continue;
+            const mid = {
+              x: (g.poly[i - 1].x + g.poly[i].x) / 2,
+              y: (g.poly[i - 1].y + g.poly[i].y) / 2,
+            };
+            if (shared.every((s) => Math.hypot(s.x - mid.x, s.y - mid.y) > 25))
+              return false;
+          }
+        }
+        return true;
+      };
+      const n = group.length;
+      const partner: boolean[][] = Array.from({ length: n }, () =>
+        Array(n).fill(false),
+      );
+      const demotedPairs: [number, number][] = [];
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const shares = [...group[j].stations].some((s) =>
+            group[i].stations.has(s),
+          );
+          if (!shares) continue;
+          if (partners(group[i], group[j])) {
+            partner[i][j] = partner[j][i] = true;
+          } else {
+            demotedPairs.push([i, j]);
+          }
+        }
+      }
+      // The full constraint set can be unsatisfiable (the DLR delta: two
+      // crossing pairs chained through fork links). When a crossing pair
+      // can't be layered because a fork link stretches a core's window past
+      // the crossing partner, drop that fork link: the sacrificed merge sits
+      // within a few px of the shared station — hidden by the station marker
+      // — while the crossing is out in the open. Each round removes one
+      // link, so this terminates.
+      let lastSharer: number[] = [];
+      for (let guard = 0; guard <= demotedPairs.length * n; guard++) {
+        lastSharer = group.map((_, j) => {
+          let last = j;
+          for (let k = 0; k < n; k++)
+            if (partner[j][k]) last = Math.max(last, k);
+          return last;
+        });
+        // Fragment j occupies z-slots [j .. lastSharer(j)+core]; with a < b,
+        // the crossing pair is strictly layered iff a's core lands before b's
+        // casing, i.e. lastSharer(a) < b.
+        const violated = demotedPairs.find(([a, b]) => lastSharer[a] >= b);
+        if (!violated) break;
+        const [a] = violated;
+        // Drop a's furthest fork link (the one stretching its window past b).
+        let worst = -1;
+        for (let k = 0; k < n; k++) if (partner[a][k]) worst = k;
+        if (worst < 0) break;
+        partner[a][worst] = partner[worst][a] = false;
+      }
+      group.forEach((g, i) => {
+        lineShapes.push(g.casing);
+        group.forEach((h, j) => {
+          if (h.core && lastSharer[j] === i) lineShapes.push(h.core);
+        });
+      });
+      group = [];
     };
     for (const line of lines) {
       if (line.id !== prevLineId) {
-        flushCores();
+        flushGroup();
         prevLineId = line.id;
       }
       const lineId = createShapeId();
@@ -833,7 +940,8 @@ export default function TubeMap() {
         .map((sid) => centreFor.get(sid))
         .filter((c): c is Pt => !!c);
       // Mount starts in editable mode → octilinear connectors.
-      const path = pathFromPoints(octilinearPoints(centres));
+      const poly = octilinearPoints(centres);
+      const path = pathFromPoints(poly);
       // Stash the projected OSM track curve (settle) + per-pair segments (morph).
       if (line.geoPoints.length >= 2) {
         lineGeo.current.set(
@@ -883,18 +991,19 @@ export default function TubeMap() {
           stationIds: ids,
         },
       };
-      lineShapes.push(casing);
+      let core: TubeLineInit | null = null;
       if (hollow) {
         const coreId = createShapeId();
         coreIdForRef.current.set(lineId, coreId);
-        pendingCores.push({
+        core = {
           ...casing,
           id: coreId,
           props: { ...casing.props, core: true },
-        });
+        };
       }
+      group.push({ casing, core, stations: new Set(ids), poly });
     }
-    flushCores();
+    flushGroup();
 
     editor.createShapes<TubeLineShape | StationShape>([
       ...lineShapes,
