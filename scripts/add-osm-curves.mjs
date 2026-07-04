@@ -19,6 +19,60 @@ const netPath = join(root, "lib/tube/network.generated.json");
 const net = JSON.parse(readFileSync(netPath, "utf8"));
 const geo = await (await fetch(SRC)).json();
 
+// Thameslink isn't in the TfL-only source above (it's National Rail), so its
+// track geometry comes straight from OSM: every railway way that belongs to a
+// Thameslink train-route relation, clipped to a Greater-London bbox matching
+// the network's Tube-map clip (build-tube-data.mjs THAMESLINK_KEEP).
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
+const THAMESLINK_QUERY = `
+[out:json][timeout:180][bbox:51.27,-0.56,51.76,0.37];
+(
+  rel["route"="train"]["name"~"Thameslink",i];
+  rel["route"="train"]["operator"~"Thameslink",i];
+)->.tl;
+(
+  way(r.tl)["railway"="rail"];
+  // The Victoria–Sevenoaks service (a December 2025 takeover) has no OSM
+  // route relation yet, so its Victoria–Brixton–Denmark Hill approach is
+  // missing from the relation ways — pull that corridor's track directly.
+  way["railway"="rail"](51.462,-0.155,51.502,-0.082);
+);
+out geom;`;
+
+async function thameslinkSegments() {
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          // overpass-api.de rejects anonymous default agents with a 406.
+          "User-Agent": "oyster-city-build/1.0 (map data; contact via repo)",
+        },
+        body: "data=" + encodeURIComponent(THAMESLINK_QUERY),
+      });
+      if (!res.ok) throw new Error(`-> ${res.status}`);
+      const data = await res.json();
+      const segs = (data.elements ?? [])
+        .filter((e) => e.type === "way" && (e.geometry ?? []).length >= 2)
+        .map((e) => e.geometry.map((p) => [p.lon, p.lat]));
+      if (segs.length) return segs;
+      throw new Error("empty result");
+    } catch (e) {
+      console.warn(`  ! Overpass ${endpoint}: ${e.message}`);
+    }
+  }
+  console.warn("  ! No Thameslink OSM geometry — falling back to chords.");
+  return [];
+}
+
+const thameslinkSegs = net.lines.some((l) => l.id === "thameslink")
+  ? await thameslinkSegments()
+  : [];
+
 // (The former Heathrow T4 loop patch is gone: with build-tube-data fetching
 // both route directions, the Hatton Cross -> T4 approach arrives natively as
 // an inbound-only fragment, and re-adding it here would duplicate the edge.)
@@ -88,14 +142,37 @@ function buildTrackGraph(segs, lineStations) {
     }
   }
   const nodes = [...coord.keys()];
+  // Endpoint stitching via a spatial grid (cell pitch = the stitch tolerance,
+  // so ±1 cell covers every candidate): the all-pairs scan was fine for
+  // tube-line graphs but quadratic-slow on the ~50k-node Thameslink one.
+  const cell = STITCH_TOL_M / 111320;
+  const cellOf = (p) => [
+    Math.round((p[0] * KX) / cell),
+    Math.round(p[1] / cell),
+  ];
+  const grid = new Map();
+  for (const n of nodes) {
+    const [cx, cy] = cellOf(coord.get(n));
+    const k = `${cx},${cy}`;
+    (grid.get(k) ?? grid.set(k, []).get(k)).push(n);
+  }
   for (const e of ends) {
     const pe = coord.get(e);
-    for (const n of nodes) {
-      if (n === e) continue;
-      const d = metres(pe, coord.get(n));
-      if (d > 0 && d <= STITCH_TOL_M && !adj.get(e).some(([v]) => v === n)) {
-        adj.get(e).push([n, d]);
-        adj.get(n).push([e, d]);
+    const [cx, cy] = cellOf(pe);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (const n of grid.get(`${cx + dx},${cy + dy}`) ?? []) {
+          if (n === e) continue;
+          const d = metres(pe, coord.get(n));
+          if (
+            d > 0 &&
+            d <= STITCH_TOL_M &&
+            !adj.get(e).some(([v]) => v === n)
+          ) {
+            adj.get(e).push([n, d]);
+            adj.get(n).push([e, d]);
+          }
+        }
       }
     }
   }
@@ -142,15 +219,48 @@ function routeAlongTrack(graph, A, B, pairIds) {
   };
   const [sa, da] = snap(A);
   const [sb, db] = snap(B);
-  if (sa === sb || da > SNAP_TOL_M || db > SNAP_TOL_M) return null;
+  if (sa === sb || da > SNAP_TOL_M || db > SNAP_TOL_M) {
+    if (process.env.CURVE_DEBUG)
+      console.warn(
+        `    debug: snap fail sa==sb=${sa === sb} da=${da.toFixed(0)} db=${db.toFixed(0)}`,
+      );
+    return null;
+  }
   const distTo = new Map(nodes.map((n) => [n, Infinity]));
   const prev = new Map();
   distTo.set(sa, 0);
-  const pq = [[0, sa]];
-  while (pq.length) {
-    let mi = 0;
-    for (let i = 1; i < pq.length; i++) if (pq[i][0] < pq[mi][0]) mi = i;
-    const [d, u] = pq.splice(mi, 1)[0];
+  // Binary min-heap: the linear-scan queue was O(V^2) — fine for tube-line
+  // graphs, minutes per pair on the ~50k-node Thameslink one.
+  const heap = [[0, sa]];
+  const hpush = (item) => {
+    heap.push(item);
+    for (let i = heap.length - 1; i > 0;) {
+      const p = (i - 1) >> 1;
+      if (heap[p][0] <= heap[i][0]) break;
+      [heap[p], heap[i]] = [heap[i], heap[p]];
+      i = p;
+    }
+  };
+  const hpop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  while (heap.length) {
+    const [d, u] = hpop();
     if (u === sb) break;
     if (d > distTo.get(u)) continue;
     const uForeign = foreign(u);
@@ -159,16 +269,25 @@ function routeAlongTrack(graph, A, B, pairIds) {
       if (nd < distTo.get(v)) {
         distTo.set(v, nd);
         prev.set(v, u);
-        pq.push([nd, v]);
+        hpush([nd, v]);
       }
     }
   }
-  if (distTo.get(sb) === Infinity) return null;
+  if (distTo.get(sb) === Infinity) {
+    if (process.env.CURVE_DEBUG) console.warn(`    debug: unreachable`);
+    return null;
+  }
   const path = [];
   for (let u = sb; u; u = prev.get(u)) path.unshift(coord.get(u));
   let trueLen = 0;
   for (let i = 1; i < path.length; i++) trueLen += metres(path[i - 1], path[i]);
-  if (trueLen > metres(A, B) * MAX_DETOUR) return null;
+  if (trueLen > metres(A, B) * MAX_DETOUR) {
+    if (process.env.CURVE_DEBUG)
+      console.warn(
+        `    debug: detour x${(trueLen / metres(A, B)).toFixed(2)} (${trueLen.toFixed(0)}m)`,
+      );
+    return null;
+  }
   path[0] = [A[0], A[1]];
   path[path.length - 1] = [B[0], B[1]];
   return path;
@@ -216,6 +335,7 @@ const OVERGROUND = new Set([
 
 /** OSM segment polylines for a line (each a [lon,lat][]). */
 function segmentsFor(lineName) {
+  if (lineName === "Thameslink") return thameslinkSegs;
   const wanted = OVERGROUND.has(lineName)
     ? "London Overground"
     : lineName === "Tram"
@@ -225,7 +345,9 @@ function segmentsFor(lineName) {
   for (const f of geo.features) {
     if (!(f.properties.lines || []).some((l) => l.name === wanted)) continue;
     const g = f.geometry;
-    out.push(g.type === "MultiLineString" ? g.coordinates.flat() : g.coordinates);
+    out.push(
+      g.type === "MultiLineString" ? g.coordinates.flat() : g.coordinates,
+    );
   }
   return out;
 }
@@ -279,6 +401,8 @@ function buildBranchCurve(stationIds, segs, lineStations) {
       // stitched OSM track graph — recovers the curve where the source stores a
       // whole section as one long way (e.g. the post-2022 Elizabeth tunnels).
       if (graph === undefined) graph = buildTrackGraph(segs, lineStations);
+      if (process.env.CURVE_DEBUG)
+        console.warn(`  routing ${stationIds[i]} -> ${stationIds[i + 1]}`);
       const routed =
         graph &&
         routeAlongTrack(
@@ -336,10 +460,14 @@ for (const line of net.lines) {
     line.geoPath = curve;
     line.geoSegments = geoSegments;
     added++;
-    if (pairs && matched / pairs < 0.8) poor.push(`${line.name}(${matched}/${pairs})`);
+    if (pairs && matched / pairs < 0.8)
+      poor.push(`${line.name}(${matched}/${pairs})`);
   }
 }
 
 writeFileSync(netPath, JSON.stringify(net));
-console.log(`Added per-branch geoPath to ${added}/${net.lines.length} line records.`);
-if (poor.length) console.log(`Low match rate (chord fallback) on: ${poor.join(", ")}`);
+console.log(
+  `Added per-branch geoPath to ${added}/${net.lines.length} line records.`,
+);
+if (poor.length)
+  console.log(`Low match rate (chord fallback) on: ${poor.join(", ")}`);
