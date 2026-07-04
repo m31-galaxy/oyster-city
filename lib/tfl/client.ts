@@ -13,7 +13,9 @@ const TFL_BASE = "https://api.tfl.gov.uk";
 async function tflFetch<T>(path: string, revalidate = 30): Promise<T> {
   const key = process.env.TFL_APP_KEY;
   const sep = path.includes("?") ? "&" : "?";
-  const url = key ? `${TFL_BASE}${path}${sep}app_key=${key}` : `${TFL_BASE}${path}`;
+  const url = key
+    ? `${TFL_BASE}${path}${sep}app_key=${key}`
+    : `${TFL_BASE}${path}`;
 
   const res = await fetch(url, {
     headers: { Accept: "application/json" },
@@ -26,10 +28,17 @@ async function tflFetch<T>(path: string, revalidate = 30): Promise<T> {
 }
 
 /** Live status for every line on the given modes. Note: `elizabeth-line`, not the dead `tflrail`. */
-export function getLineStatus(
+export async function getLineStatus(
   modes = "tube,dlr,overground,elizabeth-line,tram",
 ): Promise<LineStatus[]> {
-  return tflFetch(`/Line/Mode/${modes}/Status`, 60);
+  // Thameslink is mode "national-rail" (25 operators share it), so it can't
+  // ride the mode fetch — request the single line separately. If just that
+  // request fails, show the TfL lines rather than an empty sidebar.
+  const [modeLines, thameslink] = await Promise.all([
+    tflFetch<LineStatus[]>(`/Line/Mode/${modes}/Status`, 60),
+    tflFetch<LineStatus[]>(`/Line/thameslink/Status`, 60).catch(() => []),
+  ]);
+  return [...modeLines, ...thameslink];
 }
 
 /** Live arrival predictions for one or more comma-separated line ids. */
@@ -43,6 +52,8 @@ export function getStopArrivals(stopId: string): Promise<Prediction[]> {
 }
 
 /** Free-text station/stop search. */
-export function searchStopPoints(query: string): Promise<{ matches: StopPoint[] }> {
+export function searchStopPoints(
+  query: string,
+): Promise<{ matches: StopPoint[] }> {
   return tflFetch(`/StopPoint/Search/${encodeURIComponent(query)}`, 3600);
 }

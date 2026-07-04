@@ -19,6 +19,7 @@ const HOLLOW_LINES = new Set([
   "lioness",
   "mildmay",
   "suffragette",
+  "thameslink",
   "tram",
   "weaver",
   "windrush",
