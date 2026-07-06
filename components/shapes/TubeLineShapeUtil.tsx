@@ -82,9 +82,14 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
 
   override component(shape: TubeLineShape) {
     const { w, h, color, d, core, dashed } = shape.props;
-    // National Rail cores are dashed; butt caps keep the dashes crisp
-    // (round caps would bleed 1px into each gap).
-    const dash = core && dashed;
+    // A National Rail core is NOT stroked with a dashed white line: where two
+    // fragments' cores overlap along a junction stem, independent dash phases
+    // union additively and can fill each other's gaps into solid white.
+    // Instead the core is solid white with the colour interruptions stamped
+    // ON TOP (the inverse pattern), so the topmost core owns any shared
+    // stretch outright and phase interference can't happen. Same rhythm as a
+    // "7 4" white dash: 4-long colour marks on an 11 period. Butt caps keep
+    // the marks crisp (round caps would bleed 1px into the white).
     return (
       // pointer-events off so the stations layered on top receive taps.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -99,9 +104,20 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
             stroke={core ? "#ffffff" : color}
             strokeWidth={core ? 2 : 6}
             strokeLinejoin="round"
-            strokeLinecap={dash ? "butt" : "round"}
-            strokeDasharray={dash ? "7 4" : undefined}
+            strokeLinecap="round"
           />
+          {core && dashed && (
+            <path
+              d={d}
+              fill="none"
+              stroke={color}
+              strokeWidth={2}
+              strokeLinejoin="round"
+              strokeLinecap="butt"
+              strokeDasharray="4 7"
+              strokeDashoffset={4}
+            />
+          )}
         </svg>
       </HTMLContainer>
     );
