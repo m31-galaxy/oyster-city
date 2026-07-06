@@ -19,8 +19,17 @@ export default function CollapsibleSidebar({
 
   return (
     <>
+      {/* Mobile-only (display:none on desktop): with the sidebar open, taps
+          on the remaining map sliver land here and tuck the sidebar away. */}
+      {!collapsed && (
+        <button
+          type="button"
+          className="sidebar-scrim"
+          aria-label="Collapse sidebar"
+          onClick={() => setCollapsed(true)}
+        />
+      )}
       <aside className={collapsed ? "sidebar sidebar--collapsed" : "sidebar"}>
-        {/* Fixed-width inner so text doesn't reflow as the aside animates. */}
         <div className="sidebar-content">{children}</div>
       </aside>
       <button

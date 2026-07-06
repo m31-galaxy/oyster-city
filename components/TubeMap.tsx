@@ -1,12 +1,6 @@
 "use client";
 
-import {
-  type CSSProperties,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Tldraw, createShapeId, type Editor, type TLShapeId } from "tldraw";
 import "tldraw/tldraw.css";
 import {
@@ -1137,6 +1131,14 @@ export default function TubeMap() {
         return;
       }
       editor.zoomToFit();
+      // A phone fits the whole network into a sliver — start closer in,
+      // centred on the same spot, and let the user pan out for the edges.
+      if (vp.w <= 640) {
+        const cam = editor.getCamera();
+        const z = cam.z * 1.5;
+        const c = editor.getViewportPageBounds().center;
+        editor.setCamera({ x: vp.w / 2 / z - c.x, y: vp.h / 2 / z - c.y, z });
+      }
     };
     requestAnimationFrame(fit);
 
@@ -1768,10 +1770,10 @@ export default function TubeMap() {
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
-      <div style={toggleWrapStyle} role="group" aria-label="Map layout mode">
+      <div className="mode-toggle" role="group" aria-label="Map layout mode">
         <button
           type="button"
-          style={segStyle(!geoMode)}
+          className={!geoMode ? "active" : undefined}
           aria-pressed={!geoMode}
           onClick={() => setGeoMode(false)}
         >
@@ -1779,7 +1781,7 @@ export default function TubeMap() {
         </button>
         <button
           type="button"
-          style={segStyle(geoMode)}
+          className={geoMode ? "active" : undefined}
           aria-pressed={geoMode}
           onClick={() => setGeoMode(true)}
         >
@@ -1789,31 +1791,4 @@ export default function TubeMap() {
       <Tldraw shapeUtils={shapeUtils} hideUi onMount={handleMount} />
     </div>
   );
-}
-
-const toggleWrapStyle: CSSProperties = {
-  position: "absolute",
-  top: 12,
-  right: 12,
-  zIndex: 10,
-  display: "flex",
-  gap: 2,
-  padding: 3,
-  background: "#ffffff",
-  border: "1px solid #e4e4e7",
-  borderRadius: 8,
-  boxShadow: "0 1px 3px rgba(0, 0, 0, 0.08)",
-};
-
-function segStyle(active: boolean): CSSProperties {
-  return {
-    padding: "5px 11px",
-    border: "none",
-    borderRadius: 6,
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-    color: active ? "#ffffff" : "#52525b",
-    background: active ? "#18181b" : "transparent",
-  };
 }
