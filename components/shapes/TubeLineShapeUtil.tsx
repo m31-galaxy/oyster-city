@@ -87,9 +87,10 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     // union additively and can fill each other's gaps into solid white.
     // Instead the core is solid white with the colour interruptions stamped
     // ON TOP (the inverse pattern), so the topmost core owns any shared
-    // stretch outright and phase interference can't happen. Same rhythm as a
-    // "7 4" white dash: 4-long colour marks on an 11 period. Butt caps keep
-    // the marks crisp (round caps would bleed 1px into the white).
+    // stretch outright and phase interference can't happen. White dashes and
+    // colour gaps are equal-length: 10-long marks on a 20 period, offset so
+    // the white leads. Butt caps keep the marks crisp (round caps would
+    // bleed 1px into the white).
     return (
       // pointer-events off so the stations layered on top receive taps.
       <HTMLContainer style={{ pointerEvents: "none" }}>
@@ -114,8 +115,8 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
               strokeWidth={2}
               strokeLinejoin="round"
               strokeLinecap="butt"
-              strokeDasharray="4 7"
-              strokeDashoffset={4}
+              strokeDasharray="10 10"
+              strokeDashoffset={10}
             />
           )}
         </svg>

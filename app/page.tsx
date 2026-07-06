@@ -38,9 +38,10 @@ export default async function Home() {
                     className="swatch"
                     style={{
                       // National Rail-style casing, like the map lines —
-                      // with a dashed core for true National Rail services.
+                      // for true National Rail services the core reads as a
+                      // dash: the middle band partitioned white/colour/white.
                       background: isNationalRailLine(line.id)
-                        ? `repeating-linear-gradient(90deg, #fff 0 5px, ${c} 5px 8px) center / 100% 34% no-repeat, ${c}`
+                        ? `linear-gradient(90deg, #fff 0 33%, ${c} 33% 67%, #fff 67% 100%) center / 100% 34% no-repeat, ${c}`
                         : isHollowLine(line.id)
                           ? `linear-gradient(to bottom, ${c} 0 33%, #fff 33% 67%, ${c} 67% 100%)`
                           : c,
