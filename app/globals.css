@@ -20,7 +20,12 @@ body {
 
 body {
   font-family:
-    var(--font-tube), system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    var(--font-tube),
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
   color: var(--text);
   background: var(--bg);
 }
@@ -35,26 +40,28 @@ textarea {
 
 .layout {
   position: relative;
-  display: flex;
   height: 100vh;
 }
 
 .sidebar {
-  flex: 0 0 320px;
-  min-width: 0;
-  /* Collapse by animating max-width (flex-basis/width transitions are
-     unreliable for flex items; max-width animates cleanly and caps the used
-     width to 0). */
-  max-width: 320px;
+  /* An overlay, not a flex sibling: sliding it must never resize the map
+     canvas (that re-layout made the collapse animation laggy). transform is
+     compositor-only, and the extra 12px hides the shadow when tucked away. */
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 320px;
+  z-index: 20;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.08);
   overflow: hidden;
-  transition: max-width 0.25s ease;
+  transition: transform 0.25s ease;
 }
 
 .sidebar.sidebar--collapsed {
-  max-width: 0;
-  border-right: none;
+  transform: translateX(calc(-100% - 12px));
 }
 
 .sidebar-content {
@@ -68,7 +75,9 @@ textarea {
   position: absolute;
   top: 12px;
   left: 332px;
-  z-index: 10;
+  /* Above the sidebar (20) and the map's mode toggle (10) — the handle must
+     never hide behind either. */
+  z-index: 30;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -157,6 +166,7 @@ textarea {
 }
 
 .map {
-  position: relative;
-  flex: 1;
+  /* Full-bleed at all times — the sidebar slides over it. */
+  position: absolute;
+  inset: 0;
 }
