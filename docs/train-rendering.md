@@ -177,8 +177,13 @@ For each record:
    Guarantees: trains **never move backward** and **never leave the track**
    during corrections. If the new trajectory never visits the displayed pose
    (reroute, branch switch, |offset| > 90s), fall back to the old decaying 2D
-   point offset. Both are skipped during the mode-morph (the whole line is
-   already moving).
+   point offset — unless the correction exceeds `TRAIN_GLIDE_SNAP_UNITS`
+   (150 page units), where it SNAPS instead: a cross-map streak draws the eye
+   far more than a blink, and corrections that size are data artefacts (see
+   train-position-accuracy.md §3b — derivation now also passes the previous
+   records into `deriveTrains` for identity/placement continuity, which is
+   what keeps such corrections rare). Both blends are skipped during the
+   mode-morph (the whole line is already moving).
 2. `pose = trainPose(rec, Date.now() + timeOff·decay)`.
 3. Resolve the pose's station pair to **live** centres via
    `shapeIdFor.get(...)` → `getShapePageBounds().center` (tracks drags and the

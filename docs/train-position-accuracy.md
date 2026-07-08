@@ -3,7 +3,7 @@
 > Companion to `train-rendering.md`. Written 2026-07-02 after a monitored hour
 > of live TfL Arrivals polls (victoria/central/northern/district, 20s cadence,
 > 180 polls/line, 422k predictions, 37k poll-boundary comparisons) and a
-> replay harness that runs the *production* derivation code over the recording. Scripts live in the session scratchpad (`collect-arrivals.mjs`,
+> replay harness that runs the _production_ derivation code over the recording. Scripts live in the session scratchpad (`collect-arrivals.mjs`,
 > `analyze-v2.mjs`, `diagnose-new.mjs`, `dwell-horizon.mjs`) — trivially
 > recreatable; the methodology is documented here.
 
@@ -18,8 +18,8 @@ reduced but did not eliminate it.
 Method: record `/Line/{id}/Arrivals` every 20s for an hour (trimmed
 predictions + response headers + local clocks); replay the derivation exactly
 as the client runs it; at each poll boundary measure the distance between
-where the *old* record renders the train at the new poll's receipt time and
-where the *new* record puts it — the visible pre-blend warp.
+where the _old_ record renders the train at the new poll's receipt time and
+where the _new_ record puts it — the visible pre-blend warp.
 
 Findings, in causal order:
 
@@ -40,7 +40,7 @@ Findings, in causal order:
    poll: the train sits at the platform, then leaps a whole segment
    (median 350–850m) when the poll moves it on.
 4. **Synthetic step starts disagree across polls.** A fresh record only knows
-   its current segment's *end* time; backing out the start via the run-time
+   its current segment's _end_ time; backing out the start via the run-time
    median contradicts what the previous poll knew exactly, adding a p90
    ~300m same-segment warp.
 5. Segment run-time medians are stable (σ 6–12s per segment) and the ladder
@@ -87,12 +87,12 @@ In `lib/tube/trains.ts` (pure, replay-validated) + `components/TubeMap.tsx`:
 **Replay-validated result** (full-hour recording, n=37,184 poll boundaries,
 old vs new pipeline):
 
-| metric (per poll boundary) | old | new |
-|---|---|---|
-| median warp | 168m | **0m** |
-| mean warp | 247m | **72m** |
-| p90 warp | 564m | **230m** |
-| boundaries with >50m warp | 83.6% | **22.2%** |
+| metric (per poll boundary) | old   | new       |
+| -------------------------- | ----- | --------- |
+| median warp                | 168m  | **0m**    |
+| mean warp                  | 247m  | **72m**   |
+| p90 warp                   | 564m  | **230m**  |
+| boundaries with >50m warp  | 83.6% | **22.2%** |
 
 Residual attribution (new pipeline): same-segment f disagreement from TfL's
 own near-station revisions p90 204m (17.7% of boundaries >50m), cross-segment
@@ -105,12 +105,53 @@ reversals in 37.5k steps (poll-fallback artifacts), max step 67px in 0.1% of
 steps (degenerate short subdivided windows — TfL's own ea deltas; consistent
 across polls so they don't warp, just briefly hurry).
 
+## 3b. The residual "train warps across the screen" (fixed 2026-07-07)
+
+A second monitored session (20 min, all lines, 2.5Hz sampling of live render
+state + captured payloads) chased the remaining occasional cross-screen warp:
+**3.3 glides/minute network-wide exceeded 150 page units** pre-fix. Four
+mechanisms, all reproduced offline from captured polls:
+
+1. **vehicleId collisions** — TfL vehicleIds are NOT unique; two physical
+   trains regularly share one (small numeric ids recur per line). Their
+   merged arrival ladder read as one train teleporting kilometres in seconds:
+   direction flips, zero-width steps (a scripted 14-segment sprint in 1s of
+   wall clock), cross-map warps. _Fix: per-vehicle ladder coherence filter —
+   drop stops not physically reachable link-by-link (straight-line distance
+   at 25 m/s, 45s slack), seeded from the stop matching the previous record
+   (earliest consistent stop, 3-min tolerance) so the record keeps following
+   the same physical train._
+2. **Fragment-seam ambiguity** — "first fragment containing both stations"
+   plus a terminus-style fallback at fragment endpoints made sparse/churning
+   ladders oscillate between distant fragments (Wembley Park: 465 units;
+   Elizabeth line: 350 units, provably not a collision — its ids are unique).
+   _Fix: resolution hysteresis — prefer adjacency, then the previous record's
+   fragment; single-stop fallback only at TRUE termini (one neighbour
+   line-wide) or on the previous fragment; junction relocation prefers the
+   approach step the train was already travelling._
+3. **Head-drop teleports** — when the next stop's prediction disappears
+   (served, or churn), the fresh step-0 reaches back only one segment; its
+   backed-out start sits in the future and the pose pins at the segment's
+   start station — a forward teleport past every intermediate station
+   (measured 5.5km: Hayes & Harlington dropped, marker pinned at Hanwell).
+   _Fix: `stitchTrains` prepends the previous trajectory's steps from its
+   active one up to the fresh step-0's segment._
+4. **Renderer safety net** — any residual 2D correction beyond 150 page
+   units (genuine TfL-side relocations exist) now snaps instead of gliding:
+   a blink, not a streak (`TRAIN_GLIDE_SNAP_UNITS`).
+
+Offline replay of 5 captured polls (piccadilly/metropolitan/elizabeth,
+~2,300 predictions each) through old vs new derivation: cross-poll implied
+position jumps >800m fell **37 → 5** (max 7.7km → 1.0km, all survivors below
+the snap threshold and consistent with data churn); records preserved rose
+809 → 875 (fewer vehicles dropped at seams).
+
 ## 4. Remaining error budget (what the shown position can still be wrong by)
 
 - **Prediction churn near stations** — TfL revises arrivals as trains
   approach (p90 31–55s). Irreducible from Arrivals alone; presented as gentle
   speed variation by the time blend. This is the accuracy floor of the feed.
-- **Ladder freshness** — the ladder itself is 60–100s old, so *which* segment
+- **Ladder freshness** — the ladder itself is 60–100s old, so _which_ segment
   a train is on can lag reality by ~1 stop right after it happens; the
   trajectory model hides the seam.
 - **Within-segment shape** — position between two stations is a kinematic
@@ -128,7 +169,7 @@ across polls so they don't warp, just briefly hurry).
    from a recorded day) — warms the first poll and covers segments with no
    train behind. Small win now that stitching exists.
 3. **TrackerNet detailed predictions** (needs the app_key; new endpoint since
-   2024, XML) — per-train track-code locations, i.e. actual *positions* not
+   2024, XML) — per-train track-code locations, i.e. actual _positions_ not
    just ETAs. The only data source that could beat expectedArrival anchoring.
    Big integration cost; revisit if within-segment truth ever matters.
 4. **`/Line/{id}/Timetable/{stop}`** — scheduled inter-station run times

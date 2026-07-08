@@ -84,6 +84,18 @@ const MIN_SEG_SECONDS = 25;
 const MAX_SEG_SECONDS = 240;
 /** Reject a ladder gap larger than one plausible segment when learning run times. */
 const LADDER_MAX_SECONDS = 360;
+/** Generous top speed for the ladder coherence check (m/s). Faster than any
+ * real metro segment average, but slow enough that a SECOND physical train's
+ * interleaved stops — typically kilometres away at a near-equal arrival time
+ * — are unreachable and get dropped. */
+const MAX_TRAVEL_MPS = 25;
+/** Grace subtracted from the minimum travel time (dwell noise, short hops). */
+const REACH_SLACK_S = 45;
+/** Ignore previous-record matches further than this from a ladder stop's
+ * arrival time when seeding the coherent chain. Loose enough for ea churn
+ * plus a couple of missed polls (churn is p90 ~55s), tight enough not to
+ * mistake a FOLLOWING train's arrival at the same station for ours. */
+const SEED_MATCH_MAX_MS = 180_000;
 /** Build steps until they cover this far past fetch (poll interval + staleness + slack). */
 const STEP_HORIZON_MS = 180_000;
 const MAX_STEPS = 10;
@@ -135,7 +147,10 @@ const epoch = (iso: string): number => Date.parse(iso);
  * `branches` are that line's branch fragments; `naptanToHub` resolves an
  * arrival's platform NaPTAN to our station id. `fetchMs` is Date.now() at
  * receipt — used only as the blend trigger and the step-horizon origin, never
- * as a time base for positions.
+ * as a time base for positions. `prev` (last poll's records) provides
+ * CONTINUITY: it seeds each vehicle's coherent ladder chain and breaks
+ * branch-resolution ties, so a record keeps following the same physical
+ * train down the same fragment instead of oscillating on data churn.
  */
 export function deriveTrains(
   predictions: Prediction[],
@@ -145,6 +160,7 @@ export function deriveTrains(
   lineId: string,
   color: string,
   fetchMs: number,
+  prev?: ReadonlyMap<string, TrainRecord>,
 ): TrainRecord[] {
   const resolve = (naptan: string) => naptanToHub[naptan] ?? naptan;
 
@@ -155,6 +171,41 @@ export function deriveTrains(
     if (list) list.push(p);
     else byVehicle.set(p.vehicleId, [p]);
   }
+
+  const branchById = new Map(branches.map((b) => [b.shapeId, b]));
+
+  /** Minimum seconds to travel between two stations (straight line at a
+   * generous top speed) — the physical-coherence yardstick. Zero when either
+   * position is unknown, so unknown geometry never rejects a stop. */
+  const straightSecs = (aId: string, bId: string): number => {
+    const a = stationPos.get(aId);
+    const b = stationPos.get(bId);
+    if (!a || !b) return 0;
+    const metres = Math.hypot((a[0] - b[0]) * KX, a[1] - b[1]) * 111320;
+    return metres / MAX_TRAVEL_MPS;
+  };
+
+  /** Each travel-end station of the previous record's steps -> its predicted
+   * arrival time, for matching fresh ladder stops to the train we were
+   * already following. */
+  const prevEnds = (rec: TrainRecord): Map<string, number> => {
+    const ends = new Map<string, number>();
+    for (const s of rec.steps) {
+      const b = branchById.get(s.branchShapeId);
+      if (!b) continue;
+      const endId = b.stationIds[s.reversed ? s.segIndex : s.segIndex + 1];
+      if (endId !== undefined && !ends.has(endId)) ends.set(endId, s.endMs);
+    }
+    return ends;
+  };
+
+  /** The previous record's branch at fetch time — the continuity tiebreak
+   * for every ambiguous branch resolution below. */
+  const prevBranchId = (rec: TrainRecord | undefined): string | null => {
+    if (!rec) return null;
+    for (const s of rec.steps) if (fetchMs < s.endMs) return s.branchShapeId;
+    return rec.steps[rec.steps.length - 1]?.branchShapeId ?? null;
+  };
 
   // First pass: each vehicle's ladder — its remaining stops in visit order,
   // each with its absolute predicted arrival time.
@@ -171,10 +222,46 @@ export function deriveTrains(
       const cur = minEa.get(sid);
       if (cur === undefined || ms < cur) minEa.set(sid, ms);
     }
-    const ladder = [...minEa.entries()]
+    const sorted = [...minEa.entries()]
       .map(([stationId, eaMs]) => ({ stationId, eaMs }))
       .sort((a, b) => a.eaMs - b.eaMs);
-    if (ladder.length) ladders.push({ vehicleId, ladder });
+    if (!sorted.length) continue;
+
+    // Coherence filter: TfL vehicleIds are NOT unique — two physical trains
+    // regularly share one (small numeric ids recur per line), interleaving
+    // both trains' stops into this ladder. Sorted by arrival time that reads
+    // as a train teleporting kilometres in seconds: direction flips,
+    // zero-width steps, cross-map warps. Keep only the chain of stops that
+    // is physically reachable link by link; seed the chain from the stop
+    // that best matches the PREVIOUS record's predicted arrivals, so across
+    // polls the record keeps following the same physical train (seeding by
+    // earliest arrival alone flips trains whenever the other one's next
+    // stop sorts first).
+    let seedIdx = 0;
+    const old = prev?.get(`${lineId}:${vehicleId}`);
+    if (old && sorted.length > 1) {
+      const ends = prevEnds(old);
+      // The FIRST (earliest-arrival) stop consistent with the previous
+      // trajectory. Not min-|delta|: the whole chain matches the previous
+      // record, so a 1-second fluke at a LATER chain station would beat the
+      // true head and discard still-valid stops (measured at Hatton Cross
+      // vs Hounslow West — the marker moved 1.3km to the wrong approach).
+      const i = sorted.findIndex((stop) => {
+        const e = ends.get(stop.stationId);
+        return e !== undefined && Math.abs(e - stop.eaMs) < SEED_MATCH_MAX_MS;
+      });
+      if (i >= 0) seedIdx = i;
+    }
+    const ladder: Stop[] = [sorted[seedIdx]];
+    for (let i = seedIdx + 1; i < sorted.length; i++) {
+      const last = ladder[ladder.length - 1];
+      const stop = sorted[i];
+      const dt = (stop.eaMs - last.eaMs) / 1000;
+      if (dt >= straightSecs(last.stationId, stop.stationId) - REACH_SLACK_S) {
+        ladder.push(stop);
+      }
+    }
+    ladders.push({ vehicleId, ladder });
   }
 
   // Learn per-segment run times from TfL's own predictions: the gap between
@@ -262,37 +349,73 @@ export function deriveTrains(
     }
   };
 
+  // A station's distinct neighbours across every fragment of the line. A
+  // TRUE line terminus has exactly one; a fragment endpoint at an interior
+  // junction has more — treating those as termini placed single-stop trains
+  // a full segment down the wrong fragment (the Wembley Park oscillation).
+  const neighbours = new Map<string, Set<string>>();
+  for (const b of branches) {
+    for (let i = 0; i < b.stationIds.length - 1; i++) {
+      const x = b.stationIds[i];
+      const y = b.stationIds[i + 1];
+      (neighbours.get(x) ?? neighbours.set(x, new Set()).get(x)!).add(y);
+      (neighbours.get(y) ?? neighbours.set(y, new Set()).get(y)!).add(x);
+    }
+  }
+
   const out: TrainRecord[] = [];
   for (const { vehicleId, ladder } of ladders) {
     const next = ladder[0];
     const second = ladder[1];
+    const oldRec = prev?.get(`${lineId}:${vehicleId}`);
+    const prevBid = prevBranchId(oldRec);
 
     // Pick the branch + travel direction for the CURRENT segment from the
-    // ladder's index order.
+    // ladder's index order. The pair can sit on several fragments: prefer
+    // one where it's ADJACENT (edge dedup means at most one such), then the
+    // previous record's fragment (continuity), then scan order — "first
+    // fragment containing both" alone flip-flopped on poll churn.
     let branch: BranchInfo | undefined;
     let j0 = -1;
     let step = 0;
     if (second) {
+      let bestScore = Infinity;
       for (const b of branches) {
         const a = b.indexOf.get(next.stationId);
         const c = b.indexOf.get(second.stationId);
         if (a === undefined || c === undefined || a === c) continue;
-        branch = b;
-        j0 = a;
-        step = Math.sign(c - a);
-        break;
+        const score =
+          (Math.abs(c - a) === 1 ? 0 : 2) + (b.shapeId === prevBid ? 0 : 1);
+        if (score < bestScore) {
+          bestScore = score;
+          branch = b;
+          j0 = a;
+          step = Math.sign(c - a);
+          if (score === 0) break;
+        }
       }
     }
     if (!branch) {
-      // Single prediction (or a ladder that shares no branch): only placeable
-      // when the next stop is a branch terminus, where prev is unambiguous.
+      // Single prediction (or a ladder sharing no branch): placeable only
+      // when unambiguous — at the line's TRUE terminus, or on the fragment
+      // the previous record was already following (a seam is fine when it's
+      // the same seam).
+      const trueTerminus = (neighbours.get(next.stationId)?.size ?? 0) === 1;
+      let fallback: { b: BranchInfo; a: number } | null = null;
       for (const b of branches) {
         const a = b.indexOf.get(next.stationId);
         if (a === undefined) continue;
-        if (a === 0) { branch = b; j0 = 0; step = -1; break; }
-        if (a === b.stationIds.length - 1) {
-          branch = b; j0 = a; step = 1; break;
+        if (a !== 0 && a !== b.stationIds.length - 1) continue;
+        if (b.shapeId === prevBid) {
+          fallback = { b, a };
+          break;
         }
+        if (trueTerminus && !fallback) fallback = { b, a };
+      }
+      if (fallback) {
+        branch = fallback.b;
+        j0 = fallback.a;
+        step = j0 === 0 ? -1 : 1;
       }
     }
     if (!branch || step === 0) continue;
@@ -303,23 +426,41 @@ export function deriveTrains(
       // adjacent fragment (lines are split into overlapping branch fragments).
       // Relocate the train onto the branch that holds its real predecessor —
       // the neighbour of `next` on the side away from `second` — instead of
-      // dropping it (otherwise trains vanish approaching junctions).
-      let relocated = false;
+      // dropping it (otherwise trains vanish approaching junctions). The
+      // side is ambiguous (several fragments, two neighbours each): prefer
+      // the candidate whose implied approach step EXISTS in the previous
+      // trajectory (the train was already travelling it), then the previous
+      // fragment, then scan order — a blind first-match guessed the wrong
+      // approach to Hatton Cross and teleported the train across Heathrow.
+      let bestReloc: {
+        b: BranchInfo;
+        a: number;
+        p: number;
+        score: number;
+      } | null = null;
       for (const b of branches) {
         const a = b.indexOf.get(next.stationId);
         if (a === undefined) continue;
         for (const p of [a - 1, a + 1]) {
           if (p < 0 || p >= b.stationIds.length) continue;
           if (second && b.stationIds[p] === second.stationId) continue;
-          branch = b;
-          j0 = a;
-          prevIdx = p;
-          relocated = true;
-          break;
+          const wasTravelling = oldRec?.steps.some(
+            (os) =>
+              os.branchShapeId === b.shapeId &&
+              os.segIndex === Math.min(a, p) &&
+              os.reversed === a < p,
+          );
+          const score = wasTravelling ? 0 : b.shapeId === prevBid ? 1 : 2;
+          if (!bestReloc || score < bestReloc.score)
+            bestReloc = { b, a, p, score };
+          if (score === 0) break;
         }
-        if (relocated) break;
+        if (bestReloc?.score === 0) break;
       }
-      if (!relocated) continue; // a true terminus — nothing precedes it
+      if (!bestReloc) continue; // a true terminus — nothing precedes it
+      branch = bestReloc.b;
+      j0 = bestReloc.a;
+      prevIdx = bestReloc.p;
     }
 
     // Step 0 — the segment the train is on now. Its start time is synthetic
@@ -340,7 +481,8 @@ export function deriveTrains(
     // a directed segment with exact absolute times at both ends.
     for (let i = 0; i < ladder.length - 1; i++) {
       const last = steps[steps.length - 1];
-      if (steps.length >= MAX_STEPS || last.endMs - fetchMs > STEP_HORIZON_MS) break;
+      if (steps.length >= MAX_STEPS || last.endMs - fetchMs > STEP_HORIZON_MS)
+        break;
       const a = ladder[i];
       const b = ladder[i + 1];
       if (b.eaMs <= a.eaMs) continue; // dedup artefact — no usable window
@@ -374,23 +516,39 @@ const MIN_STEP_WINDOW_MS = 15_000;
  * (measured: p90 same-segment warp ~308m -> ~ea-churn only).
  */
 export function stitchTrains(
-  prev: Map<string, TrainRecord>,
+  prev: ReadonlyMap<string, TrainRecord>,
   next: TrainRecord[],
 ): TrainRecord[] {
   for (const rec of next) {
     const old = prev.get(rec.key);
     const s0 = rec.steps[0];
     if (!old || !s0) continue;
-    for (const os of old.steps) {
-      if (
+    const k = old.steps.findIndex(
+      (os) =>
         os.branchShapeId === s0.branchShapeId &&
         os.segIndex === s0.segIndex &&
-        os.reversed === s0.reversed
-      ) {
-        s0.startMs = Math.min(os.startMs, s0.endMs - MIN_STEP_WINDOW_MS);
+        os.reversed === s0.reversed,
+    );
+    if (k < 0) continue;
+    s0.startMs = Math.min(old.steps[k].startMs, s0.endMs - MIN_STEP_WINDOW_MS);
+    // The fresh ladder reaches back only to its NEXT stop: when the head
+    // prediction just dropped (stop served, or churn), the new step-0's
+    // backed-out start can still lie in the future, and the pose would pin
+    // at that segment's start station — a forward TELEPORT past every
+    // intermediate station, where the train then freezes until the clock
+    // catches up (measured 5.5km on the Elizabeth line: Hayes & Harlington
+    // dropped, marker pinned at Hanwell). The old trajectory knows the
+    // missing stretch: prepend its steps from the one active at fetch up to
+    // the matched segment, so the train keeps walking the geometry it was
+    // on and reaches the new step-0 when it genuinely gets there.
+    let j = old.steps.length - 1;
+    for (let i = 0; i < old.steps.length; i++) {
+      if (rec.fetchMs < old.steps[i].endMs) {
+        j = i;
         break;
       }
     }
+    if (j < k) rec.steps.unshift(...old.steps.slice(j, k));
   }
   return next;
 }

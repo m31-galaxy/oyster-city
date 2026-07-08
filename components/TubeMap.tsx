@@ -42,6 +42,10 @@ const TRAIN_TICK_MS = 100;
 const TRAIN_BLEND_MS = 1500;
 /** Corrections implying more than this time shift jump instead of blending. */
 const TRAIN_BLEND_MAX_MS = 90_000;
+/** A 2D correction longer than this (page units) snaps instead of gliding:
+ * a cross-map streak draws the eye far more than a blink, and corrections
+ * that size are identity/rerouting artefacts, not motion. */
+const TRAIN_GLIDE_SNAP_UNITS = 150;
 /** A gap between positioning passes longer than this means nobody was
  * watching (hidden tab, system sleep, paused debugger): snap to the current
  * state instead of animating a catch-up — only animate what the user could
@@ -1530,11 +1534,19 @@ export default function TubeMap() {
           render.set(key, rs);
         }
         if (capture2D) {
-          rs.offX = rs.x - tx;
-          rs.offY = rs.y - ty;
-          rs.offStart = now;
-          rs.blendMs = TRAIN_BLEND_MS;
-          decay = 1;
+          const ox = rs.x - tx;
+          const oy = rs.y - ty;
+          if (Math.hypot(ox, oy) > TRAIN_GLIDE_SNAP_UNITS) {
+            rs.offX = 0;
+            rs.offY = 0;
+            decay = 0;
+          } else {
+            rs.offX = ox;
+            rs.offY = oy;
+            rs.offStart = now;
+            rs.blendMs = TRAIN_BLEND_MS;
+            decay = 1;
+          }
         }
         const dispX = tx + rs.offX * decay;
         const dispY = ty + rs.offY * decay;
@@ -1691,6 +1703,9 @@ export default function TubeMap() {
               lineId,
               lineColorRef.current.get(lineId) ?? "#666666",
               fetchMs,
+              // Continuity: seeds each vehicle's coherent ladder chain and
+              // breaks branch-resolution ties toward last poll's placement.
+              trainStore.current,
             ),
           );
           for (const r of recs) next.set(r.key, r);
@@ -1744,6 +1759,15 @@ export default function TubeMap() {
           __trainTick?: (b?: ReadonlySet<string>, fine?: boolean) => void;
         }
       ).__trainTick = positionTrains;
+      // Read-only views of the live train state, for diagnosing position
+      // anomalies in situ (the refs are REPLACED on poll, hence getters).
+      (
+        window as unknown as { __trainDebug?: Record<string, () => unknown> }
+      ).__trainDebug = {
+        store: () => trainStore.current,
+        render: () => trainRender.current,
+        shapes: () => trainShapes.current,
+      };
     }
     let raf: number | null = null;
     let lastFull = 0;
