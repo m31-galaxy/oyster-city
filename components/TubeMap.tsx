@@ -1090,6 +1090,27 @@ export default function TubeMap() {
     // down otherwise).
     editor.user.updateUserPreferences({ isSnapMode: true });
 
+    // Camera constraints: the viewport can never lose the map. With
+    // 'outside', the network bounds must always stay touching the viewport
+    // inset by the padding — so at least ~130 screen px of map remains
+    // visible however far you pan or zoom. The bounds sit exactly on the
+    // network (the projection starts at 0,0): tldraw's 'outside' clamp
+    // ignores bounds.x/y (it anchors the region at the origin), so any
+    // margin baked into the bounds would just let the map escape by that
+    // much on one side and over-restrict the other. Edge-scrolling while
+    // dragging a selection pans through this same constrained camera, so it
+    // keeps working, just not past the limit.
+    editor.setCameraOptions({
+      constraints: {
+        bounds: { x: 0, y: 0, w: net.bounds.w, h: net.bounds.h },
+        padding: { x: 128, y: 128 },
+        origin: { x: 0.5, y: 0.5 },
+        initialZoom: "fit-max",
+        baseZoom: "default",
+        behavior: "outside",
+      },
+    });
+
     // Multi-selection drags: tldraw snaps the selection BOX — point snaps use
     // its corners+centre and gap snaps its borders — rather than the shapes
     // inside it. No hook exists, so wrap snapTranslateShapes: substitute the
