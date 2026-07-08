@@ -1080,6 +1080,22 @@ export default function TubeMap() {
     inputs.getShiftKey = () =>
       editor.isIn("select.resizing") ? !realGetShiftKey() : realGetShiftKey();
 
+    // Snapping: a dragged station snaps exactly when its centre comes IN LINE
+    // with another station's centre, and never otherwise. The pieces:
+    //  - stations expose only their centre as snap geometry (StationShapeUtil)
+    //    and lines/trains opt out of snapping entirely (canSnap false);
+    //  - snap mode is ON by default (hold Cmd/Ctrl to drag free — tldraw only
+    //    snaps while the modifier is down otherwise);
+    //  - equal-SPACING "gap" snapping reads raw shape bounds regardless of
+    //    snap geometry, with no public off-switch — stub its gap discovery so
+    //    only the in-line point alignments remain.
+    editor.user.updateUserPreferences({ isSnapMode: true });
+    (
+      editor.snaps.shapeBounds as unknown as {
+        getVisibleGaps(): { horizontal: unknown[]; vertical: unknown[] };
+      }
+    ).getVisibleGaps = () => ({ horizontal: [], vertical: [] });
+
     // Reactive lines: when a station is dragged, redraw the lines through it —
     // and re-pose the trains on those lines in the SAME batch, so they stay
     // glued to the moving geometry instead of catching up at the ambient tick.

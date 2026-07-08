@@ -65,12 +65,14 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     };
   }
 
-  // Read-only decoration: never editable, resizable, or bindable.
+  // Read-only decoration: never editable, resizable, or bindable — and
+  // invisible to snapping (stations align only to other stations).
   override canResize = () => false;
   override hideResizeHandles = () => true;
   override hideRotateHandle = () => true;
   override canEdit = () => false;
   override canBind = () => false;
+  override canSnap = () => false;
 
   override getGeometry(shape: TubeLineShape) {
     return new Rectangle2d({

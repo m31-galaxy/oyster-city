@@ -37,12 +37,13 @@ export class TrainShapeUtil extends ShapeUtil<TrainShape> {
     return { w: TRAIN_W, h: TRAIN_H, color: "#111111" };
   }
 
-  // Inert decoration: never resized, edited, bound, or selected by the user.
+  // Inert decoration: never resized, edited, bound, selected — or snapped to.
   override canResize = () => false;
   override hideResizeHandles = () => true;
   override hideRotateHandle = () => true;
   override canEdit = () => false;
   override canBind = () => false;
+  override canSnap = () => false;
 
   // Default culling applies: heading lives in the shape's top-level rotation,
   // so the page bounds cover the rotated marker exactly (the white border is

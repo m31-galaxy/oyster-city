@@ -71,6 +71,14 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
   override canEdit = () => false;
   override canBind = () => false;
 
+  // Snapping: a station's ONLY snap point is its marker centre, so a dragged
+  // station snaps exactly when it comes in line (horizontally/vertically)
+  // with another station's centre — never to bounds corners or edges, and
+  // the label stays invisible to snapping like it is to all other layout.
+  override getBoundsSnapGeometry() {
+    return { points: [{ x: MARKER / 2, y: MARKER / 2 }] };
+  }
+
   // Stations have no orientation. When a (multi-)selection is rotated, tldraw
   // proposes a rotated shape; accept the movement but not the spin: place the
   // unrotated shape so its CENTRE sits where the proposed rotated centre is —
