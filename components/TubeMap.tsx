@@ -1090,6 +1090,61 @@ export default function TubeMap() {
     // down otherwise).
     editor.user.updateUserPreferences({ isSnapMode: true });
 
+    // Multi-selection drags: tldraw snaps the selection BOX — point snaps use
+    // its corners+centre and gap snaps its borders — rather than the shapes
+    // inside it. No hook exists, so wrap snapTranslateShapes: substitute the
+    // selected stations' initial marker centres as the dragged snap points
+    // (every member then snaps in line against the stations outside the
+    // selection, like a lone drag), and suppress gap snapping for the call —
+    // its box-border semantics is exactly the reported confusion, and
+    // equal-spacing against a whole moving group has no member-wise meaning.
+    // Mixed/single selections keep the default behaviour.
+    {
+      const sb = editor.snaps.shapeBounds;
+      const origSnapTranslate = sb.snapTranslateShapes.bind(sb);
+      type TranslateArgs = Parameters<typeof sb.snapTranslateShapes>[0];
+      const gapless = sb as unknown as {
+        getVisibleGaps?: () => { horizontal: never[]; vertical: never[] };
+      };
+      sb.snapTranslateShapes = (args: TranslateArgs) => {
+        const translating = editor.getStateDescendant(
+          "select.translating",
+        ) as unknown as
+          | {
+              snapshot?: {
+                shapeSnapshots?: {
+                  shape: { type: string; props: { w: number; h: number } };
+                  pagePoint: { x: number; y: number };
+                }[];
+              };
+            }
+          | undefined;
+        const snaps = translating?.snapshot?.shapeSnapshots;
+        if (
+          !snaps ||
+          snaps.length < 2 ||
+          !snaps.every((s) => s.shape.type === "station")
+        ) {
+          return origSnapTranslate(args);
+        }
+        gapless.getVisibleGaps = () => ({ horizontal: [], vertical: [] });
+        try {
+          return origSnapTranslate({
+            ...args,
+            initialSelectionSnapPoints: snaps.map((s, i) => ({
+              id: `selection:${i}`,
+              x: s.pagePoint.x + s.shape.props.w / 2,
+              y: s.pagePoint.y + s.shape.props.h / 2,
+            })),
+          });
+        } finally {
+          // Remove the instance shadow so the prototype's computed gap
+          // discovery resumes for single-station drags.
+          delete gapless.getVisibleGaps;
+        }
+      };
+    }
+
     // Reactive lines: when a station is dragged, redraw the lines through it —
     // and re-pose the trains on those lines in the SAME batch, so they stay
     // glued to the moving geometry instead of catching up at the ambient tick.
