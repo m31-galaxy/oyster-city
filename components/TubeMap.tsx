@@ -717,6 +717,9 @@ export default function TubeMap() {
   const lineSegGeo = useRef<Map<TLShapeId, (Pt[] | null)[]>>(new Map());
   const animating = useRef(false);
   const animFrame = useRef<number | null>(null);
+  /** Deferred settle work (declutter + camera re-measure), one frame after
+   * the morph's settle redraw — cancelled if a new morph starts first. */
+  const settleExtras = useRef<number | null>(null);
   const lastDeclutter = useRef(0);
   const declutterTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Wall-clock of the last positioning pass + the post-wake snap window. */
@@ -1397,13 +1400,20 @@ export default function TubeMap() {
           }
           if (acc.length) editor.updateShapes(acc);
           if (affected.size) positionTrains(affected);
-          // Station moved -> label overlaps may change. Throttled (this fires
-          // per pointer move) with a trailing debounce so the drag's FINAL
-          // position always gets a recompute.
+          // Station moved -> label overlaps may change, and the camera-
+          // constraint region moves with the content (getCurrentPageBounds is
+          // invalidated by EVERY shape change — trains tick at 10Hz — so each
+          // call re-folds ~1,500 shape bounds; per pointer-move was pure
+          // waste). Both are throttled together (leading edge keeps the
+          // edge-scroll frontier growing mid-drag) with a trailing debounce
+          // so the drag's FINAL position always gets a recompute. They run
+          // AFTER the line redraw above, so an inward move sees the shrunk
+          // lines too, not their stale extent.
           const t = performance.now();
           if (t - lastDeclutter.current > 150) {
             lastDeclutter.current = t;
             recomputeLabelDeclutter(editor);
+            updateCameraConstraints();
           } else {
             if (declutterTimer.current !== null)
               clearTimeout(declutterTimer.current);
@@ -1411,15 +1421,12 @@ export default function TubeMap() {
               declutterTimer.current = null;
               lastDeclutter.current = performance.now();
               recomputeLabelDeclutter(editor);
+              updateCameraConstraints();
             }, 180);
           }
         },
         { ignoreShapeLock: true },
       );
-      // A station moved — the camera-constraint region moves with it (no-op
-      // when the content bounds are unchanged). AFTER the line redraw above,
-      // so an inward move sees the shrunk lines too, not their stale extent.
-      updateCameraConstraints();
     });
 
     const fit = () => {
@@ -1448,6 +1455,10 @@ export default function TubeMap() {
   // Animate stations to the target layout (and follow with the lines).
   const applyMode = useCallback((editor: Editor, geo: boolean) => {
     if (animFrame.current !== null) cancelAnimationFrame(animFrame.current);
+    if (settleExtras.current !== null) {
+      cancelAnimationFrame(settleExtras.current);
+      settleExtras.current = null;
+    }
 
     // Allow programmatic moves while animating; lock to view-only in geo mode.
     editor.updateInstanceState({ isReadonly: false });
@@ -1612,10 +1623,23 @@ export default function TubeMap() {
         );
         editor.updateInstanceState({ isReadonly: geo });
         positionTrains();
-        recomputeLabelDeclutter(editor); // layout changed with the mode
-        // The two layouts span different extents — re-measure the camera
-        // constraints now that the morph has settled.
-        updateCameraConstraintsRef.current?.();
+        // The label declutter (greedy O(n²) over 505 labels) and the camera
+        // constraint re-measure (full page-bounds fold) ran here in the SAME
+        // frame as the settle redraw — a visible ~2x frame spike right at the
+        // morph's end. The settle pixels are already final (F3: the tween at
+        // frac 1/0 reproduces the rest geometry), labels cross-fade over
+        // 150ms and one frame of a stale camera clamp is unobservable, so
+        // both defer to the next frame. Cancelled at the top of applyMode
+        // and guarded on `animating` so a double-toggle mid-morph can't run
+        // stale settle work against the NEW tween.
+        settleExtras.current = requestAnimationFrame(() => {
+          settleExtras.current = null;
+          if (animating.current) return;
+          recomputeLabelDeclutter(editor); // layout changed with the mode
+          // The two layouts span different extents — re-measure the camera
+          // constraints now that the morph has settled.
+          updateCameraConstraintsRef.current?.();
+        });
       }
     };
     animFrame.current = requestAnimationFrame(tick);
