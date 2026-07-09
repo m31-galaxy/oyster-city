@@ -3,8 +3,16 @@ import {
   Rectangle2d,
   ShapeUtil,
   T,
+  useEditor,
+  useValue,
   type TLBaseShape,
 } from "tldraw";
+
+/** Below this zoom the 10-unit National Rail dash marks are ≤3.5 screen px —
+ * unreadable fuzz that still costs per-pixel pattern rasterisation across
+ * ~68 core paths on every zoom/pan repaint. The core renders solid white
+ * instead; the flip only happens on threshold crossings. */
+const DASH_LOD_ZOOM = 0.35;
 
 export interface TubeLineProps {
   w: number;
@@ -84,6 +92,15 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
 
   override component(shape: TubeLineShape) {
     const { w, h, color, d, core, dashed } = shape.props;
+    // Reactive LOD boolean — re-renders only when the threshold is crossed
+    // (the StationShapeUtil.showLabel pattern). Non-dashed shapes short-
+    // circuit before reading the zoom, so they never even subscribe to it.
+    const editor = useEditor();
+    const showDashes = useValue(
+      "dashes-visible",
+      () => dashed && editor.getZoomLevel() >= DASH_LOD_ZOOM,
+      [editor, dashed],
+    );
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.
@@ -109,7 +126,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
             strokeLinejoin="round"
             strokeLinecap="round"
           />
-          {core && dashed && (
+          {core && showDashes && (
             <path
               d={d}
               fill="none"
