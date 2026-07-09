@@ -32,6 +32,8 @@ import {
 import type { Prediction } from "@/lib/tfl/types";
 
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil, TrainShapeUtil];
+// Double-clicking empty canvas would drop a text shape on the map.
+const tldrawOptions = { createTextOnCanvasDoubleClick: false };
 const MARKER = 11;
 const ANIM_MS = 650;
 /** How often to refresh live train predictions (matches TfL's arrivals TTL). */
@@ -2029,7 +2031,12 @@ export default function TubeMap() {
           Geographic
         </button>
       </div>
-      <Tldraw shapeUtils={shapeUtils} hideUi onMount={handleMount} />
+      <Tldraw
+        shapeUtils={shapeUtils}
+        hideUi
+        options={tldrawOptions}
+        onMount={handleMount}
+      />
     </div>
   );
 }
