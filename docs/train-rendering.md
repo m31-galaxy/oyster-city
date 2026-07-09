@@ -252,6 +252,16 @@ Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 | `MIN_STEP_WINDOW_MS` | trains.ts | 15s | floor for a stitched step-0 window. |
 | `SEG_SPEED_MPS`, `MIN/MAX_SEG_SECONDS`, `LADDER_MAX_SECONDS` | trains.ts | 10, 25/240, 360 | run-time fallback + learning filter. |
 | `SHOWN_LINES` | TubeMap.tsx | `null` | `null` = whole network (~600 trains). |
+| `TWEEN_THIN_TOL_FINE/COARSE`, `TWEEN_COARSE_ZOOM` | TubeMap.tsx | 0.75 / 3 / 0.5 | tween-only line-geometry thinning; the settle pass always draws full resolution. |
+| `DASH_LOD_ZOOM` | TubeLineShapeUtil.tsx | 0.35 | National Rail dash marks render solid white below this zoom. |
+
+**Morph performance budgets** (2026-07-09 pass, ~750 live trains, sync-JS per
+frame): tween frame ≤15ms at z≥0.5 (viewport scoping bites), ≤25ms at fit zoom
+(whole network computed per frame); ONE batched `updateShapes` per frame plus
+the train pass's own; settle frame ≈ a normal tween frame (declutter + camera
+re-measure deferred one frame); fine train pass ≤1.2ms at z=2. The 42.6ms
+baseline breakdown and the step-by-step wins live in the commit messages
+(b514cbf, 4570e09, bdd17d2, 1638983, 9b4f5f7).
 
 ## 8. How to verify (preview gotchas)
 
@@ -263,12 +273,22 @@ timers hard. Techniques that work:
   `offset` in a synchronous loop calling `__trainTick()` — simulates minutes of
   motion deterministically (blend decay uses `performance.now`, so it stays
   frozen — corrections won't decay under virtual time).
-- **Mode-morph**: monkey-patch `requestAnimationFrame` to a capped
-  `queueMicrotask` shim before clicking the toggle (bounded — the train loop
-  reschedules forever), restore after.
+- **Mode-morph**: monkey-patch `requestAnimationFrame` to capture the callback
+  into a slot, click the toggle, wait ~100ms for React's effect to schedule
+  the first tick, then pump the slot in a synchronous loop passing timestamps
+  advancing +16.67ms — a deterministic ~40-frame tween immune to
+  background-tab timer throttling (setTimeout shims get clamped to 1s and the
+  morph silently runs only a few frames). The settle defers declutter +
+  camera re-measure via one more rAF — pump one extra callback.
 - **Attachment check**: parse each `tube-line`'s `d` (+ shape.x/y), measure
-  each train centre to the nearest same-colour polyline — ~0px in steady
-  state; up to ~40px transiently while a 2D-fallback blend decays.
+  each ON-SCREEN train centre (top-left + rotated (W/2, H/2) = (5, 3)) to the
+  nearest same-colour polyline — ≤0.05px settled after a fine pass; page-unit
+  slack up to the perceptual gate (0.5 screen px) after coarse passes; up to
+  ~150 units transiently while a 2D-fallback blend decays. Off-screen trains
+  are stale BY DESIGN (skipped by every gate) — never sample them. And parse
+  numbers with an exponent-aware regex: `pathFromPoints` can emit ~1e-16
+  relative coordinates, and splitting them shifts every following pair,
+  reporting phantom 30–50px detachments.
 - `preview_console_logs` can replay a stale error buffer; trust
   `npm run build` / `window.editor` presence.
 - The derivation is pure: replay recorded `Prediction[]` through
