@@ -797,11 +797,21 @@ export default function TubeMap() {
         offY: number;
         offStart: number;
         blendMs: number;
+        /** Memoised dwell departure heading + its cache key (see the heading
+         * probe block) — the 3-probe look-ahead is per-dwell, not per-frame. */
+        headKey?: string;
+        headRot?: number;
+        /** geomGenRef value at last placement — guards the dwell fast-path
+         * against line geometry moving under a stationary train. */
+        geomGen?: number;
       }
     >
   >(new Map());
   /** 0 = editable, 1 = geographic, in between while the morph tween runs. */
   const morphFracRef = useRef(0);
+  /** Bumped whenever line geometry moves under settled trains (drag redraws,
+   * morph settle) — invalidates memoised dwell headings. */
+  const geomGenRef = useRef(0);
 
   useEffect(() => setMounted(true), []);
 
@@ -1399,6 +1409,7 @@ export default function TubeMap() {
             }
           }
           if (acc.length) editor.updateShapes(acc);
+          geomGenRef.current++; // line geometry moved — dwell headings stale
           if (affected.size) positionTrains(affected);
           // Station moved -> label overlaps may change, and the camera-
           // constraint region moves with the content (getCurrentPageBounds is
@@ -1598,14 +1609,16 @@ export default function TubeMap() {
         },
         { ignoreShapeLock: true },
       );
+      // Re-pose the visible trains on the freshly drawn morph frame — the
+      // ambient ~10fps tick would let them visibly lag the 60fps line tween.
+      // The tween flavor early-skips off-screen trains and leaves
+      // create/delete to the ambient full pass (which keeps running).
+      positionTrains(undefined, false, true);
       {
         const p = debugPerfRef.current;
         const spent = performance.now() - tickStart;
         p.morphMs = p.morphMs ? p.morphMs * 0.9 + spent * 0.1 : spent;
       }
-      // Re-pose all trains on the freshly drawn morph frame — the ambient
-      // ~10fps tick would let them visibly lag the 60fps line tween.
-      positionTrains();
       if (t < 1) {
         animFrame.current = requestAnimationFrame(tick);
       } else {
@@ -1613,6 +1626,7 @@ export default function TubeMap() {
         animating.current = false;
         morphFracRef.current = geo ? 1 : 0;
         morphCentresRef.current = null; // settled — live centre reads resume
+        geomGenRef.current++; // new layout — dwell headings stale
         // Settle: geographic snaps lines onto the real OSM track curves;
         // editable settles onto octilinear connectors.
         recomputeAllLines(
@@ -1672,7 +1686,7 @@ export default function TubeMap() {
   // those), and bails entirely when zoomed out far enough that full-pass
   // steps are already sub-pixel.
   const positionTrains = useCallback(
-    (onlyBranches?: ReadonlySet<string>, fine = false) => {
+    (onlyBranches?: ReadonlySet<string>, fine = false, tween = false) => {
       const editor = editorRef.current;
       if (!editor) return;
       if (fine && editor.getZoomLevel() < 0.5) return;
@@ -1683,7 +1697,9 @@ export default function TubeMap() {
       const now = performance.now();
       const nowEpoch = Date.now();
       // Debug telemetry: EMA of pass cost, recorded at every exit below.
+      // Tween passes are counted inside the tick's morphMs instead.
       const recordPass = () => {
+        if (tween) return;
         const p = debugPerfRef.current;
         const spent = performance.now() - now;
         if (fine) p.fineMs = p.fineMs ? p.fineMs * 0.9 + spent * 0.1 : spent;
@@ -1717,12 +1733,28 @@ export default function TubeMap() {
       const minDelta = fine ? 0.08 / zoom : Math.max(0.2, 0.5 / zoom);
       const minRot = fine ? 0.004 : 0.02;
       const vp = editor.getViewportPageBounds();
-      const vpX0 = vp.x - 50;
-      const vpY0 = vp.y - 50;
-      const vpX1 = vp.x + vp.w + 50;
-      const vpY1 = vp.y + vp.h + 50;
+      // Tween passes use a proportional margin (the morph sweeps shapes fast,
+      // so a fixed 50-unit apron under-covers at speed); the ambient 10Hz
+      // full pass is the backstop that trues late sweep-ins within ≤100ms.
+      const apron = tween ? Math.max(vp.w, vp.h) * 0.25 : 50;
+      const vpX0 = vp.x - apron;
+      const vpY0 = vp.y - apron;
+      const vpX1 = vp.x + vp.w + apron;
+      const vpY1 = vp.y + vp.h + apron;
       const onScreen = (px: number, py: number) =>
         px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
+
+      // Station centres memoised for THIS pass (positions can't change inside
+      // a synchronous pass; every pass starts a fresh memo).
+      const centreCache = new Map<TLShapeId, Pt | null>();
+      const centreOf = (id: TLShapeId): Pt | null => {
+        let c = centreCache.get(id);
+        if (c === undefined) {
+          c = stationCentre(editor, id);
+          centreCache.set(id, c);
+        }
+        return c;
+      };
 
       // Page-space point + tangent for a pose, using the geometry that matches
       // how the line is currently drawn. Shared by the main placement and the
@@ -1738,10 +1770,12 @@ export default function TubeMap() {
         if (!idA || !idB) return null;
         // Mid-morph, centres come from the tween's own pose map (set for
         // exactly the animation's duration) so trains ride the SAME geometry
-        // the lines were drawn from this frame; settled passes read live.
-        const tween = morphCentresRef.current;
-        const cA = tween?.get(idA) ?? stationCentre(editor, idA);
-        const cB = tween?.get(idB) ?? stationCentre(editor, idB);
+        // the lines were drawn from this frame; settled passes read live —
+        // memoised per pass, since ~140 visible trains share a much smaller
+        // station set and each transform read costs more than the map hit.
+        const tweenMap = morphCentresRef.current;
+        const cA = tweenMap?.get(idA) ?? centreOf(idA);
+        const cB = tweenMap?.get(idB) ?? centreOf(idB);
         if (!cA || !cB) return null;
         const fFwd = pose.reversed ? 1 - pose.f : pose.f;
         const branchId = pose.branchShapeId as TLShapeId;
@@ -1797,9 +1831,11 @@ export default function TubeMap() {
         // doesn't pass the displayed pose (reroute / branch switch). Skipped
         // during the morph, where the whole line is already moving.
         let rs = render.get(key);
-        // Fine passes smooth what's already on screen; initialisation and
-        // newly-visible trains belong to the 10Hz full pass.
-        if (fine && (!rs || !onScreen(rs.x, rs.y))) continue;
+        // Fine and tween passes smooth what's already (near) on screen —
+        // BEFORE any pose computation, which is most of a pass's cost;
+        // initialisation and newly-visible trains belong to the 10Hz full
+        // pass.
+        if ((fine || tween) && (!rs || !onScreen(rs.x, rs.y))) continue;
         let capture2D = false;
         if (rs && rs.fetchMs !== rec.fetchMs) {
           rs.fetchMs = rec.fetchMs;
@@ -1877,6 +1913,31 @@ export default function TubeMap() {
         const pose = trainPose(rec, dispTime);
         if (!pose) continue;
         if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
+        // Dwell fast-path (fine passes): a stationary train whose corrections
+        // have decayed, heading has settled and line geometry hasn't moved
+        // renders exactly where it already is — skip the geometry eval, which
+        // is the bulk of per-train cost, for the ~half of the visible fleet
+        // dwelling at any moment. A dwelling pose sits pinned at f=0, so its
+        // position can't drift with display time; departure flips
+        // pose.moving, which lands in the full pipeline again.
+        if (
+          fine &&
+          !pose.moving &&
+          rs &&
+          rs.pose &&
+          !rs.pose.moving &&
+          rs.pose.branchShapeId === pose.branchShapeId &&
+          rs.pose.segIndex === pose.segIndex &&
+          rs.pose.reversed === pose.reversed &&
+          rs.geomGen === geomGenRef.current &&
+          ((now - rs.offStart) / rs.blendMs >= 1 ||
+            (rs.offX === 0 && rs.offY === 0)) &&
+          rs.headRot !== undefined &&
+          Math.abs(rs.rot - rs.headRot) < minRot
+        ) {
+          seen.add(key);
+          continue;
+        }
         const placed = placedFor(pose);
         if (!placed) continue;
         const tx = placed.point.x;
@@ -1920,6 +1981,7 @@ export default function TubeMap() {
         rs.x = dispX;
         rs.y = dispY;
         rs.pose = pose;
+        rs.geomGen = geomGenRef.current;
         // Heading: smooth the displayed rotation toward the target tangent
         // (shortest arc, tau ~120ms) so reversals and departures swing over
         // ~0.4s instead of snapping. A dwelling on-screen train aims at its
@@ -1927,14 +1989,25 @@ export default function TubeMap() {
         // platform before it moves.
         let targetRot = Math.atan2(placed.tangent.y, placed.tangent.x);
         if (settled && !pose.moving && onScreen(dispX, dispY)) {
-          for (const k of HEADING_PROBES) {
-            const fut = trainPose(rec, dispTime + k);
-            if (!fut) break;
-            if (fut.moving) {
-              const fp = placedFor(fut);
-              if (fp) targetRot = Math.atan2(fp.tangent.y, fp.tangent.x);
-              break;
+          // The probed departure tangent only changes when the record
+          // refreshes, the dwell step changes, or the line geometry moves —
+          // memoise on those (probing cost 3 trainPose+placedFor per train
+          // per frame, which dominated the fine pass at editing zooms).
+          const headKey = `${rec.fetchMs}:${pose.branchShapeId}:${pose.segIndex}:${pose.reversed}:${geomGenRef.current}`;
+          if (rs.headKey === headKey && rs.headRot !== undefined) {
+            targetRot = rs.headRot;
+          } else {
+            for (const k of HEADING_PROBES) {
+              const fut = trainPose(rec, dispTime + k);
+              if (!fut) break;
+              if (fut.moving) {
+                const fp = placedFor(fut);
+                if (fp) targetRot = Math.atan2(fp.tangent.y, fp.tangent.x);
+                break;
+              }
             }
+            rs.headKey = headKey;
+            rs.headRot = targetRot;
           }
         }
         let rot: number;
@@ -1956,7 +2029,8 @@ export default function TubeMap() {
         seen.add(key);
         const shapeId = shapes.get(key);
         if (!shapeId) {
-          if (onlyBranches) continue; // creation belongs to the full pass
+          // Creation belongs to the ambient full pass.
+          if (onlyBranches || tween) continue;
           const newId = createShapeId();
           shapes.set(key, newId);
           toCreate.push({
@@ -1988,7 +2062,7 @@ export default function TubeMap() {
         }
       }
       const toDelete: TLShapeId[] = [];
-      if (!onlyBranches && !fine) {
+      if (!onlyBranches && !fine && !tween) {
         for (const [key, shapeId] of shapes) {
           if (!seen.has(key)) {
             toDelete.push(shapeId);
@@ -2183,7 +2257,11 @@ export default function TubeMap() {
       if (now - lastFull >= TRAIN_TICK_MS) {
         lastFull = now;
         positionTrains();
-      } else {
+      } else if (!animating.current) {
+        // Mid-morph the tick runs its own per-frame tween pass — an ambient
+        // fine pass on the same frame would be pure duplicate work. The 10Hz
+        // full pass above stays on: it owns create/delete and trues trains
+        // that sweep on-screen past the tween pass's apron.
         positionTrains(undefined, true);
       }
     };
