@@ -64,9 +64,7 @@ const panelStyle: CSSProperties = {
 
 const buttonStyle: CSSProperties = {
   position: "absolute",
-  // Clear of tldraw's bottom-right watermark (96px wide + its margin),
-  // which the license requires to stay visible and unobscured.
-  right: 116,
+  right: 12,
   bottom: 12,
   zIndex: 40,
   padding: "4px 10px",
