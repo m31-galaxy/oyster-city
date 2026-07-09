@@ -1035,11 +1035,94 @@ export default function TubeMap() {
     }
     flushGroup();
 
-    editor.createShapes<TubeLineShape | StationShape>([
-      ...lineShapes,
-      ...stationShapes,
-    ]);
+    // The initial network build is not an undoable user action — without
+    // this, Cmd+Z on a fresh load would try to unwind the whole map.
+    editor.run(
+      () => {
+        editor.createShapes<TubeLineShape | StationShape>([
+          ...lineShapes,
+          ...stationShapes,
+        ]);
+      },
+      { history: "ignore" },
+    );
     recomputeLabelDeclutter(editor);
+
+    // Stations are draggable but otherwise immutable. hideUi keeps tldraw's
+    // keyboard shortcuts and clipboard events mounted, so delete / cut /
+    // paste / duplicate (and alt-drag cloning) all reach the editor — each
+    // is vetoed once at its deepest chokepoint rather than per entry point.
+    //
+    // Deleting (⌫, cut, the eraser tool): cancelled in the store, which
+    // covers every route including undo/redo diffs.
+    editor.sideEffects.registerBeforeDeleteHandler("shape", (shape) =>
+      shape.type === "station" ? false : undefined,
+    );
+    // Any other change to a station may only MOVE it: x/y (and rotation,
+    // which onRotate pins to 0) pass through, everything else — props, lock,
+    // opacity, z-order, meta — is pinned. A reparent (grouping) is vetoed
+    // outright: its x/y are parent-local, so letting them through would
+    // teleport the marker.
+    editor.sideEffects.registerBeforeChangeHandler("shape", (prev, next) => {
+      if (next.type !== "station") return next;
+      if (
+        prev.props === next.props &&
+        prev.parentId === next.parentId &&
+        prev.isLocked === next.isLocked &&
+        prev.opacity === next.opacity &&
+        prev.index === next.index &&
+        prev.meta === next.meta
+      ) {
+        return next; // pure move — the hot path (drags, the mode morph)
+      }
+      if (prev.type !== "station" || prev.parentId !== next.parentId) {
+        return prev;
+      }
+      return {
+        ...next,
+        props: prev.props,
+        isLocked: prev.isLocked,
+        opacity: prev.opacity,
+        index: prev.index,
+        meta: prev.meta,
+      };
+    });
+    // Creating station copies: duplicate (Cmd+D) and alt-drag cloning ask
+    // canCreateShapes first and bail cleanly when refused (alt-drag falls
+    // back to a plain move); paste funnels through putContentOntoCurrentPage,
+    // where stations are stripped from the content. Grouping would strand an
+    // empty group shape (its reparent is vetoed above), so refuse it too.
+    // Trains and lines are unaffected — every check is station-specific.
+    const isStation = (s: TLShapeId | { type: string }) =>
+      (typeof s === "string" ? editor.getShape(s)?.type : s.type) ===
+      "station";
+    const origCanCreate = editor.canCreateShapes.bind(editor);
+    editor.canCreateShapes = (shapes) =>
+      origCanCreate(shapes) && !shapes.some(isStation);
+    const stnEditor = editor as unknown as {
+      putContentOntoCurrentPage(
+        content: { shapes: { type: string }[] },
+        options?: object,
+      ): Editor;
+      groupShapes(
+        shapes: (TLShapeId | { type: string })[],
+        opts?: object,
+      ): Editor;
+    };
+    const origPutContent = stnEditor.putContentOntoCurrentPage.bind(editor);
+    stnEditor.putContentOntoCurrentPage = (content, options) => {
+      const shapes = content.shapes.filter((s) => s.type !== "station");
+      if (shapes.length === 0) return editor;
+      return origPutContent(
+        shapes.length === content.shapes.length
+          ? content
+          : { ...content, shapes },
+        options,
+      );
+    };
+    const origGroup = stnEditor.groupShapes.bind(editor);
+    stnEditor.groupShapes = (shapes, opts) =>
+      shapes.some(isStation) ? editor : origGroup(shapes, opts);
 
     // Selection-gesture modifiers: rotation snaps to 45° increments by
     // default and resizing keeps the aspect ratio by default; holding Shift
@@ -1764,7 +1847,10 @@ export default function TubeMap() {
       if (!toCreate.length && !toUpdate.length && !toDelete.length) return;
 
       // Trains are programmatic; geo mode's readonly instance state blocks all
-      // create/update, so lift it just for this synchronous batch, then restore.
+      // create/update, so lift it just for this synchronous batch, then
+      // restore. History is skipped too: an undo that removed a train shape
+      // would hide that train for good — its key still maps to the dead id,
+      // so the create branch never runs again.
       const readonly = editor.getInstanceState().isReadonly;
       if (readonly) editor.updateInstanceState({ isReadonly: false });
       try {
@@ -1774,7 +1860,7 @@ export default function TubeMap() {
             if (toUpdate.length) editor.updateShapes(toUpdate);
             if (toDelete.length) editor.deleteShapes(toDelete);
           },
-          { ignoreShapeLock: true },
+          { ignoreShapeLock: true, history: "ignore" },
         );
       } finally {
         if (readonly) editor.updateInstanceState({ isReadonly: true });
