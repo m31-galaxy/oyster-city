@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
+import Script from "next/script";
 import "./globals.css";
 
 // Johnston-style display face (freeware — see app/fonts/LICENSE.txt).
@@ -24,6 +25,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={tubeFont.variable}>
       <body>{children}</body>
+      <Script src="https://scripts.simpleanalyticscdn.com/latest.js" />
     </html>
   );
 }
