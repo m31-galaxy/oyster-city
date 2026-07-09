@@ -25,7 +25,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={tubeFont.variable}>
       <body>{children}</body>
-      <Script src="https://sa-api.oyster.city/latest.js" />
+      <Script src="https://sa-api.oyster.city/latest.js" data-collect-dnt="true" />
     </html>
   );
 }
