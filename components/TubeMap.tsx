@@ -597,12 +597,55 @@ function straightAt(cA: Pt, cB: Pt, f: number): { point: Pt; tangent: Pt } {
   };
 }
 
+/** A line-shape update built without writing, so callers can batch every
+ * line (and everything else in the frame) into ONE updateShapes call —
+ * per-shape updateShape calls were pure call overhead at 365/frame during
+ * the mode morph (~14.5ms of a 39ms frame). */
+type ShapePartial = {
+  id: TLShapeId;
+  type: "tube-line" | "station";
+  x: number;
+  y: number;
+  props?: { w: number; h: number; d: string };
+};
+
+/** Push casing (+ core-twin mirror) partials for an already-computed path. */
+function pushLinePartials(
+  acc: ShapePartial[],
+  lineId: TLShapeId,
+  path: ReturnType<typeof pathFromPoints>,
+  coreId?: TLShapeId,
+) {
+  acc.push({
+    id: lineId,
+    type: "tube-line",
+    x: path.x,
+    y: path.y,
+    props: { w: path.w, h: path.h, d: path.d },
+  });
+  // A hollow fragment's white core rides along as a twin shape: mirror the
+  // computed path instead of recomputing it.
+  if (coreId) {
+    acc.push({
+      id: coreId,
+      type: "tube-line",
+      x: path.x,
+      y: path.y,
+      props: { w: path.w, h: path.h, d: path.d },
+    });
+  }
+}
+
 /**
- * Redraw one line. With `curve` (the projected OSM track) it follows the real
- * geography; otherwise it draws through its stations' current centres — bent
- * octilinearly when `octi` (the editable layout), or straight.
+ * Build (not write) one line's redraw partials. With `curve` (the projected
+ * OSM track) it follows the real geography; otherwise it draws through its
+ * stations' current centres — bent octilinearly when `octi` (the editable
+ * layout), or straight. Reads live shape state, so it serves the SETTLED
+ * regimes only (drags, mode settle); the morph tick blends per-segment from
+ * its own tween-pose map instead.
  */
-function recomputeLine(
+function buildLinePartials(
+  acc: ShapePartial[],
   editor: Editor,
   line: TubeLineShape,
   curve: Pt[] | null,
@@ -619,31 +662,14 @@ function recomputeLine(
     pts = octi ? octilinearPoints(centres) : centres;
   }
   if (pts.length < 2) return;
-  const path = pathFromPoints(pts);
-  editor.updateShape<TubeLineShape>({
-    id: line.id,
-    type: "tube-line",
-    x: path.x,
-    y: path.y,
-    props: { w: path.w, h: path.h, d: path.d },
-  });
-  // A hollow fragment's white core rides along as a twin shape: mirror the
-  // computed path instead of recomputing it.
-  if (coreId) {
-    editor.updateShape<TubeLineShape>({
-      id: coreId,
-      type: "tube-line",
-      x: path.x,
-      y: path.y,
-      props: { w: path.w, h: path.h, d: path.d },
-    });
-  }
+  pushLinePartials(acc, line.id, pathFromPoints(pts), coreId);
 }
 
 /**
- * Redraw every line. Pass `lineGeo` to draw OSM curves where available; lines
- * without a curve fall back to `octi` octilinear (editable) or straight chords.
- * Core twins are never recomputed directly — they mirror their casing.
+ * Redraw every line in one batched write. Pass `lineGeo` to draw OSM curves
+ * where available; lines without a curve fall back to `octi` octilinear
+ * (editable) or straight chords. Core twins are never recomputed directly —
+ * they mirror their casing.
  */
 function recomputeAllLines(
   editor: Editor,
@@ -651,19 +677,23 @@ function recomputeAllLines(
   octi: boolean,
   coreIdFor: ReadonlyMap<TLShapeId, TLShapeId>,
 ) {
+  const acc: ShapePartial[] = [];
+  for (const shape of editor.getCurrentPageShapes()) {
+    if (shape.type === "tube-line" && !shape.props.core) {
+      buildLinePartials(
+        acc,
+        editor,
+        shape,
+        lineGeo?.get(shape.id) ?? null,
+        octi,
+        coreIdFor.get(shape.id),
+      );
+    }
+  }
+  if (!acc.length) return;
   editor.run(
     () => {
-      for (const shape of editor.getCurrentPageShapes()) {
-        if (shape.type === "tube-line" && !shape.props.core) {
-          recomputeLine(
-            editor,
-            shape,
-            lineGeo?.get(shape.id) ?? null,
-            octi,
-            coreIdFor.get(shape.id),
-          );
-        }
-      }
+      editor.updateShapes(acc);
     },
     { ignoreShapeLock: true },
   );
@@ -698,6 +728,13 @@ export default function TubeMap() {
   /** Re-measure the camera-constraint region from current content bounds. */
   const updateCameraConstraintsRef = useRef<(() => void) | null>(null);
 
+  /** Station centres for the CURRENT morph frame, maintained in plain JS by
+   * the tween (null while settled). One source of truth: the tick's line
+   * geometry, its station writes, and the trains' placedFor all read THIS —
+   * mixed sources would detach trains from lines, and reading shapes back
+   * mid-frame sees stale values once the frame's writes are batched. */
+  const morphCentresRef = useRef<Map<TLShapeId, Pt> | null>(null);
+
   // Debug-panel telemetry (written by the poll loop / positioning passes,
   // read at 1Hz while the panel is open — see collectDebugStats).
   const debugPollRef = useRef({
@@ -711,6 +748,7 @@ export default function TubeMap() {
   const debugPerfRef = useRef({
     fullMs: 0,
     fineMs: 0,
+    morphMs: 0,
     frames: 0,
     prevFrames: 0,
     prevAt: 0,
@@ -1340,12 +1378,14 @@ export default function TubeMap() {
       editor.run(
         () => {
           const affected = new Set<string>();
+          const acc: ShapePartial[] = [];
           for (const shape of editor.getCurrentPageShapes()) {
             if (shape.type !== "tube-line" || shape.props.core) continue;
             const ids = shape.props.stationIds as TLShapeId[];
             // Dragging only happens in editable mode → octilinear connectors.
             if (ids.includes(next.id)) {
-              recomputeLine(
+              buildLinePartials(
+                acc,
                 editor,
                 shape,
                 null,
@@ -1355,6 +1395,7 @@ export default function TubeMap() {
               affected.add(shape.id);
             }
           }
+          if (acc.length) editor.updateShapes(acc);
           if (affected.size) positionTrains(affected);
           // Station moved -> label overlaps may change. Throttled (this fires
           // per pointer move) with a trailing debounce so the drag's FINAL
@@ -1445,80 +1486,112 @@ export default function TubeMap() {
       return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
     });
 
+    // Tween-pose map: every station's centre, updated in plain JS per frame
+    // (only movingIds entries ever change). The line loop reads it instead of
+    // stationCentre() — those read-backs were ~4,000 getShapePageTransform
+    // calls per morph frame — and it's what makes batching the frame's writes
+    // possible at all: lines drawn AFTER batched station writes would
+    // otherwise see the previous frame's centres.
+    const centres = new Map<TLShapeId, Pt>();
+    for (const id of ids) {
+      const c = stationCentre(editor, id);
+      if (c) centres.set(id, c);
+    }
+    // A station's top-left delta equals its centre delta (fixed marker size),
+    // so per frame each moving centre is startCentre + (target - start) * e —
+    // the same interpolant as the shape write below.
+    const startCentres = new Map<TLShapeId, Pt>();
+    for (const id of movingIds) {
+      const c = centres.get(id);
+      if (c) startCentres.set(id, { x: c.x, y: c.y });
+    }
+
     animating.current = true;
     let startTs: number | null = null;
+
+    // Tween frames only: round path points to 2 decimals (≤0.014px error,
+    // invisible) — full-precision floats tripled the d string length, and the
+    // string build + browser path parse are per-frame costs. The settle pass
+    // does NOT round, keeping settled geometry byte-identical to before.
+    const r2 = (v: number) => Math.round(v * 100) / 100;
 
     const tick = (now: number) => {
       if (startTs === null) startTs = now;
       const t = Math.min(1, (now - startTs) / ANIM_MS);
       const e = easeInOutCubic(t);
+      const tickStart = performance.now();
+      // ONE batched write for the whole frame — stations, casings and core
+      // twins together. 365 per-shape updateShape calls cost ~14.5ms/frame in
+      // call overhead alone.
+      const partials: ShapePartial[] = [];
+      for (const id of movingIds) {
+        const s = starts.get(id)!;
+        const g = targets.get(id)!;
+        partials.push({
+          id,
+          type: "station",
+          x: s.x + (g.x - s.x) * e,
+          y: s.y + (g.y - s.y) * e,
+        });
+        const c0 = startCentres.get(id);
+        const c = centres.get(id);
+        if (c0 && c) {
+          c.x = c0.x + (g.x - s.x) * e;
+          c.y = c0.y + (g.y - s.y) * e;
+        }
+      }
+      // Draw each line by blending every station-pair segment between its
+      // octilinear editable shape (morphFrac 0) and its OSM curve
+      // (morphFrac 1), anchored to the two CURRENT station centres. Because
+      // every segment's endpoints sit exactly on a station centre, the
+      // stations never detach from the line during the tween.
+      const morphFrac = geo ? e : 1 - e;
+      morphFracRef.current = morphFrac; // trains follow the same blend
+      morphCentresRef.current = centres; // ...and read the same centres
+      for (const lm of lineMorph) {
+        const lmCentres: Pt[] = [];
+        for (const id of lm.stationIds) {
+          const c = centres.get(id);
+          if (c) lmCentres.push(c);
+        }
+        if (lmCentres.length < 2) continue;
+        let pts: Pt[];
+        if (lmCentres.length === lm.stationIds.length) {
+          pts = [];
+          for (let i = 0; i < lmCentres.length - 1; i++) {
+            const segPts = morphSegmentPoints(
+              lmCentres[i],
+              lmCentres[i + 1],
+              lm.segMorph[i] ?? null,
+              morphFrac,
+            );
+            for (let k = 0; k < segPts.length; k++) {
+              // Drop each segment's first point — it is the previous
+              // segment's shared station endpoint.
+              if (i > 0 && k === 0) continue;
+              const p = segPts[k];
+              p.x = r2(p.x);
+              p.y = r2(p.y);
+              pts.push(p);
+            }
+          }
+        } else {
+          // Some stations missing → octilinear through what we have.
+          pts = octilinearPoints(lmCentres);
+        }
+        pushLinePartials(partials, lm.id, pathFromPoints(pts), lm.coreId);
+      }
       editor.run(
         () => {
-          for (const id of movingIds) {
-            const s = starts.get(id)!;
-            const g = targets.get(id)!;
-            editor.updateShape({
-              id,
-              type: "station",
-              x: s.x + (g.x - s.x) * e,
-              y: s.y + (g.y - s.y) * e,
-            });
-          }
-          // Draw each line by blending every station-pair segment between its
-          // octilinear editable shape (morphFrac 0) and its OSM curve
-          // (morphFrac 1), anchored to the two CURRENT station centres. Because
-          // every segment's endpoints sit exactly on a station centre, the
-          // stations never detach from the line during the tween.
-          const morphFrac = geo ? e : 1 - e;
-          morphFracRef.current = morphFrac; // trains follow the same blend
-          for (const lm of lineMorph) {
-            const centres = lm.stationIds
-              .map((id) => stationCentre(editor, id))
-              .filter((c): c is Pt => !!c);
-            if (centres.length < 2) continue;
-            let pts: Pt[];
-            if (centres.length === lm.stationIds.length) {
-              pts = [];
-              for (let i = 0; i < centres.length - 1; i++) {
-                const segPts = morphSegmentPoints(
-                  centres[i],
-                  centres[i + 1],
-                  lm.segMorph[i] ?? null,
-                  morphFrac,
-                );
-                for (let k = 0; k < segPts.length; k++) {
-                  // Drop each segment's first point — it is the previous
-                  // segment's shared station endpoint.
-                  if (i > 0 && k === 0) continue;
-                  pts.push(segPts[k]);
-                }
-              }
-            } else {
-              // Some stations missing → octilinear through what we have.
-              pts = octilinearPoints(centres);
-            }
-            const path = pathFromPoints(pts);
-            editor.updateShape<TubeLineShape>({
-              id: lm.id,
-              type: "tube-line",
-              x: path.x,
-              y: path.y,
-              props: { w: path.w, h: path.h, d: path.d },
-            });
-            // Mirror the frame's path to the white-core twin (no recompute).
-            if (lm.coreId) {
-              editor.updateShape<TubeLineShape>({
-                id: lm.coreId,
-                type: "tube-line",
-                x: path.x,
-                y: path.y,
-                props: { w: path.w, h: path.h, d: path.d },
-              });
-            }
-          }
+          editor.updateShapes(partials);
         },
         { ignoreShapeLock: true },
       );
+      {
+        const p = debugPerfRef.current;
+        const spent = performance.now() - tickStart;
+        p.morphMs = p.morphMs ? p.morphMs * 0.9 + spent * 0.1 : spent;
+      }
       // Re-pose all trains on the freshly drawn morph frame — the ambient
       // ~10fps tick would let them visibly lag the 60fps line tween.
       positionTrains();
@@ -1528,6 +1601,7 @@ export default function TubeMap() {
         animFrame.current = null;
         animating.current = false;
         morphFracRef.current = geo ? 1 : 0;
+        morphCentresRef.current = null; // settled — live centre reads resume
         // Settle: geographic snaps lines onto the real OSM track curves;
         // editable settles onto octilinear connectors.
         recomputeAllLines(
@@ -1638,8 +1712,12 @@ export default function TubeMap() {
         const idA = shapeIdForRef.current.get(netIds[i]);
         const idB = shapeIdForRef.current.get(netIds[i + 1]);
         if (!idA || !idB) return null;
-        const cA = stationCentre(editor, idA);
-        const cB = stationCentre(editor, idB);
+        // Mid-morph, centres come from the tween's own pose map (set for
+        // exactly the animation's duration) so trains ride the SAME geometry
+        // the lines were drawn from this frame; settled passes read live.
+        const tween = morphCentresRef.current;
+        const cA = tween?.get(idA) ?? stationCentre(editor, idA);
+        const cB = tween?.get(idB) ?? stationCentre(editor, idB);
         if (!cA || !cB) return null;
         const fFwd = pose.reversed ? 1 - pose.f : pose.f;
         const branchId = pose.branchShapeId as TLShapeId;
@@ -2195,7 +2273,12 @@ export default function TubeMap() {
         labelsHiddenInter: hidden.interOnly.size,
       },
       lines: { casings, cores },
-      perf: { fps, fullMs: perf.fullMs, fineMs: perf.fineMs },
+      perf: {
+        fps,
+        fullMs: perf.fullMs,
+        fineMs: perf.fineMs,
+        morphMs: perf.morphMs,
+      },
       camera: {
         zoom: editor.getZoomLevel(),
         mode: geoMode ? "geographic" : "editable",

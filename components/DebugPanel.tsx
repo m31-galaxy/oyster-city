@@ -39,7 +39,7 @@ export interface DebugStats {
     labelsHiddenInter: number;
   };
   lines: { casings: number; cores: number };
-  perf: { fps: number; fullMs: number; fineMs: number };
+  perf: { fps: number; fullMs: number; fineMs: number; morphMs: number };
   camera: { zoom: number; mode: string; morph: number };
 }
 
@@ -178,7 +178,8 @@ export default function DebugPanel({
               <div>
                 fps {stats.perf.fps.toFixed(0)} · full pass{" "}
                 {stats.perf.fullMs.toFixed(2)}ms · fine{" "}
-                {stats.perf.fineMs.toFixed(2)}ms
+                {stats.perf.fineMs.toFixed(2)}ms · morph{" "}
+                {stats.perf.morphMs.toFixed(1)}ms
               </div>
               <div>
                 zoom {stats.camera.zoom.toFixed(2)} · {stats.camera.mode}
