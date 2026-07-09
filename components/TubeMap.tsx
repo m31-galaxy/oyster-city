@@ -487,10 +487,75 @@ function morphPointAt(
   return { point, tangent: { x: fwd.x - back.x, y: fwd.y - back.y } };
 }
 
-/** Decompose each per-pair segment into a SegProfile (along/perp/arc). */
-function buildSegProfiles(segs: (Pt[] | null)[]): (SegProfile | null)[] {
-  return segs.map((seg) => {
-    if (!seg || seg.length < 2) return null;
+/** Tween-frame geometry tolerances (page units): mid-morph the drawn lines
+ * may deviate this far from the full-resolution curve, transiently, for the
+ * animation's 650ms — the settle pass always draws full resolution. Two
+ * precomputed levels, picked per morph by the zoom at its start: the FINE
+ * level (~1.5 screen px at z=2) when zoomed in, the COARSE level when the
+ * whole network is in view (3 units ≈ 0.3 screen px at fit zoom — invisible,
+ * and it's the fit-zoom case where every line must be computed per frame). */
+const TWEEN_THIN_TOL_FINE = 0.75;
+const TWEEN_THIN_TOL_COARSE = 3;
+/** Below this zoom a morph uses the coarse thinning level. */
+const TWEEN_COARSE_ZOOM = 0.5;
+
+/** Douglas–Peucker point selection (indices, endpoints always kept). */
+function thinIndices(seg: Pt[], tol: number): number[] {
+  const keep = new Uint8Array(seg.length);
+  keep[0] = 1;
+  keep[seg.length - 1] = 1;
+  const stack: [number, number][] = [[0, seg.length - 1]];
+  while (stack.length) {
+    const [i0, i1] = stack.pop()!;
+    if (i1 - i0 < 2) continue;
+    const a = seg[i0];
+    const b = seg[i1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const L2 = dx * dx + dy * dy || 1;
+    let worst = -1;
+    let worstD = tol;
+    for (let k = i0 + 1; k < i1; k++) {
+      const p = seg[k];
+      const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / L2;
+      const px = a.x + t * dx;
+      const py = a.y + t * dy;
+      const d = Math.hypot(p.x - px, p.y - py);
+      if (d > worstD) {
+        worstD = d;
+        worst = k;
+      }
+    }
+    if (worst >= 0) {
+      keep[worst] = 1;
+      stack.push([i0, worst], [worst, i1]);
+    }
+  }
+  const out: number[] = [];
+  for (let i = 0; i < seg.length; i++) if (keep[i]) out.push(i);
+  return out;
+}
+
+/** Decompose each per-pair segment into SegProfiles (along/perp/arc): `full`
+ * resolution for the settle evaluators and the trains' morphPointAt, plus
+ * two Douglas–Peucker-thinned variants consumed ONLY by tween frames — the
+ * morph blended ~45k full-resolution points per frame network-wide, which
+ * was the dominant morph cost after write batching. */
+function buildSegProfiles(segs: (Pt[] | null)[]): {
+  full: (SegProfile | null)[];
+  coarse: (SegProfile | null)[];
+  coarser: (SegProfile | null)[];
+} {
+  const full: (SegProfile | null)[] = [];
+  const coarse: (SegProfile | null)[] = [];
+  const coarser: (SegProfile | null)[] = [];
+  for (const seg of segs) {
+    if (!seg || seg.length < 2) {
+      full.push(null);
+      coarse.push(null);
+      coarser.push(null);
+      continue;
+    }
     const a = seg[0];
     const b = seg[seg.length - 1];
     const cx = b.x - a.x;
@@ -513,8 +578,19 @@ function buildSegProfiles(segs: (Pt[] | null)[]): (SegProfile | null)[] {
     }
     const total = cum || 1;
     for (let k = 0; k < arc.length; k++) arc[k] /= total;
-    return { along, perp, arc };
-  });
+    full.push({ along, perp, arc });
+    const pick = (tol: number): SegProfile => {
+      const kept = thinIndices(seg, tol);
+      return {
+        along: kept.map((i) => along[i]),
+        perp: kept.map((i) => perp[i]),
+        arc: kept.map((i) => arc[i]),
+      };
+    };
+    coarse.push(pick(TWEEN_THIN_TOL_FINE));
+    coarser.push(pick(TWEEN_THIN_TOL_COARSE));
+  }
+  return { full, coarse, coarser };
 }
 
 /** Point + forward tangent at arc-length fraction `f` along a page-space polyline. */
@@ -762,6 +838,15 @@ export default function TubeMap() {
   const branchesForLineRef = useRef<Map<string, BranchInfo[]>>(new Map());
   const branchStationIdsRef = useRef<Map<string, string[]>>(new Map());
   const segProfilesRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(
+    new Map(),
+  );
+  /** Douglas–Peucker-thinned twins of segProfilesRef, used ONLY by morph
+   * tween frames (settle + trains stay full-resolution). Two levels; the
+   * morph picks by its starting zoom. */
+  const segProfilesCoarseRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(
+    new Map(),
+  );
+  const segProfilesCoarserRef = useRef<Map<TLShapeId, (SegProfile | null)[]>>(
     new Map(),
   );
   const naptanToHubRef = useRef<Record<string, string>>({});
@@ -1060,7 +1145,10 @@ export default function TubeMap() {
           seg ? seg.map(([x, y]) => ({ x, y })) : null,
         );
         lineSegGeo.current.set(lineId, segs);
-        segProfilesRef.current.set(lineId, buildSegProfiles(segs));
+        const profiles = buildSegProfiles(segs);
+        segProfilesRef.current.set(lineId, profiles.full);
+        segProfilesCoarseRef.current.set(lineId, profiles.coarse);
+        segProfilesCoarserRef.current.set(lineId, profiles.coarser);
       } else if (
         line.geoSegments.length &&
         process.env.NODE_ENV !== "production"
@@ -1497,7 +1585,24 @@ export default function TubeMap() {
         id: s.id,
         coreId: coreIdForRef.current.get(s.id),
         stationIds: s.props.stationIds as TLShapeId[],
-        segMorph: segProfilesRef.current.get(s.id) ?? [],
+        // Tween frames blend THINNED profiles (trains and the settle pass
+        // stay full-resolution). Zoomed out, the whole network is in view
+        // and must be computed every frame — but a 3-unit deviation is only
+        // ~0.3 screen px there, so the coarser level carries the load;
+        // zoomed in, detail matters but S5's viewport scoping below means
+        // only the visible few lines are computed at all.
+        segMorph:
+          (editor.getZoomLevel() < TWEEN_COARSE_ZOOM
+            ? segProfilesCoarserRef.current.get(s.id)
+            : segProfilesCoarseRef.current.get(s.id)) ?? [],
+        // Conservative bbox for every mid-tween frame of this line: each
+        // blended point is a lerp of octilinear and curve components, both
+        // bounded by (start-path bbox ∪ end-path bbox) expanded by the
+        // profile's max perpendicular excursion — cheap to test against the
+        // live viewport each frame, so off-screen lines skip geometry AND
+        // writes entirely (positions are absolute; the settle pass trues
+        // everything network-wide).
+        bbox: null as null | { x0: number; y0: number; x1: number; y1: number },
       }));
 
     // Only animate stations that actually move (none, in the common no-edit
@@ -1528,6 +1633,64 @@ export default function TubeMap() {
       if (c) startCentres.set(id, { x: c.x, y: c.y });
     }
 
+    // Per-line tween bbox (S5): every blended point is a lerp of an
+    // octilinear component (contained in its endpoints' AABB — the elbow and
+    // its fillet never leave the rectangle) and a curve component (chord
+    // point + perp excursion), with endpoints travelling start→target. So
+    // AABB(all start ∪ target centres) grown by max(|perp|·chord) bounds
+    // every frame of the tween.
+    for (const lm of lineMorph) {
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      let ok = true;
+      const centrePts: Pt[] = [];
+      for (const id of lm.stationIds) {
+        const c = centres.get(id);
+        if (!c) {
+          ok = false;
+          break;
+        }
+        centrePts.push(c);
+        const s = starts.get(id);
+        const g = targets.get(id);
+        const tx = s && g ? c.x + (g.x - s.x) : c.x;
+        const ty = s && g ? c.y + (g.y - s.y) : c.y;
+        if (c.x < x0) x0 = c.x;
+        if (c.x > x1) x1 = c.x;
+        if (c.y < y0) y0 = c.y;
+        if (c.y > y1) y1 = c.y;
+        if (tx < x0) x0 = tx;
+        if (tx > x1) x1 = tx;
+        if (ty < y0) y0 = ty;
+        if (ty > y1) y1 = ty;
+      }
+      if (!ok) continue; // missing centre — never skip this line
+      let margin = 20; // fillet arcs + rounding slack
+      for (let i = 0; i < centrePts.length - 1; i++) {
+        const prof = lm.segMorph[i];
+        if (!prof) continue;
+        let maxPerp = 0;
+        for (const p of prof.perp) {
+          const a = Math.abs(p);
+          if (a > maxPerp) maxPerp = a;
+        }
+        const chord = Math.hypot(
+          centrePts[i + 1].x - centrePts[i].x,
+          centrePts[i + 1].y - centrePts[i].y,
+        );
+        const exc = maxPerp * chord * 1.1; // stations drift the chord a bit
+        if (exc > margin) margin = exc;
+      }
+      lm.bbox = {
+        x0: x0 - margin,
+        y0: y0 - margin,
+        x1: x1 + margin,
+        y1: y1 + margin,
+      };
+    }
+
     animating.current = true;
     let startTs: number | null = null;
 
@@ -1542,6 +1705,17 @@ export default function TubeMap() {
       const t = Math.min(1, (now - startTs) / ANIM_MS);
       const e = easeInOutCubic(t);
       const tickStart = performance.now();
+      // Viewport gate (S5): tween frames only compute and write shapes whose
+      // tween bbox can intersect the (expanded) viewport — off-screen work is
+      // invisible and the settle pass trues the whole network. The FINAL
+      // frame writes everything so no shape is left short of its target.
+      const finalFrame = t >= 1;
+      const vp = editor.getViewportPageBounds();
+      const vpApron = Math.max(vp.w, vp.h) * 0.25;
+      const vx0 = vp.x - vpApron;
+      const vy0 = vp.y - vpApron;
+      const vx1 = vp.x + vp.w + vpApron;
+      const vy1 = vp.y + vp.h + vpApron;
       // ONE batched write for the whole frame — stations, casings and core
       // twins together. 365 per-shape updateShape calls cost ~14.5ms/frame in
       // call overhead alone.
@@ -1549,18 +1723,29 @@ export default function TubeMap() {
       for (const id of movingIds) {
         const s = starts.get(id)!;
         const g = targets.get(id)!;
-        partials.push({
-          id,
-          type: "station",
-          x: s.x + (g.x - s.x) * e,
-          y: s.y + (g.y - s.y) * e,
-        });
+        // The centres map must track EVERY moving station each frame (lines
+        // and trains read it) — only the shape WRITE is viewport-gated.
         const c0 = startCentres.get(id);
         const c = centres.get(id);
         if (c0 && c) {
           c.x = c0.x + (g.x - s.x) * e;
           c.y = c0.y + (g.y - s.y) * e;
         }
+        if (!finalFrame && c0) {
+          // Whole travel segment (start→target centre) off the expanded
+          // viewport → the write is invisible this frame.
+          const lox = Math.min(c0.x, c0.x + (g.x - s.x));
+          const hix = Math.max(c0.x, c0.x + (g.x - s.x));
+          const loy = Math.min(c0.y, c0.y + (g.y - s.y));
+          const hiy = Math.max(c0.y, c0.y + (g.y - s.y));
+          if (hix < vx0 || lox > vx1 || hiy < vy0 || loy > vy1) continue;
+        }
+        partials.push({
+          id,
+          type: "station",
+          x: s.x + (g.x - s.x) * e,
+          y: s.y + (g.y - s.y) * e,
+        });
       }
       // Draw each line by blending every station-pair segment between its
       // octilinear editable shape (morphFrac 0) and its OSM curve
@@ -1571,6 +1756,19 @@ export default function TubeMap() {
       morphFracRef.current = morphFrac; // trains follow the same blend
       morphCentresRef.current = centres; // ...and read the same centres
       for (const lm of lineMorph) {
+        // The settle branch below redraws every line at full resolution in
+        // this very callback — a coarse final-frame pass would be duplicate.
+        if (finalFrame) break;
+        if (
+          !finalFrame &&
+          lm.bbox &&
+          (lm.bbox.x1 < vx0 ||
+            lm.bbox.x0 > vx1 ||
+            lm.bbox.y1 < vy0 ||
+            lm.bbox.y0 > vy1)
+        ) {
+          continue; // whole tween stays off-screen — settle trues it
+        }
         const lmCentres: Pt[] = [];
         for (const id of lm.stationIds) {
           const c = centres.get(id);
