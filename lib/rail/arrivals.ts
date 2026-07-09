@@ -186,24 +186,34 @@ function predictionsForLine(
   return out;
 }
 
+/** Which upstream produced the rail predictions (surfaced for debugging). */
+export type RailSource = "fixture" | "darwin" | "disabled";
+
 /**
  * Live arrivals for every configured National Rail line, in TfL Prediction
  * shape. Sources, in order: RAIL_FIXTURE=1 (synthetic moving services, for
  * development without credentials), RAIL_LDB_TOKEN (Darwin LDBWS), else [].
  * Board failures degrade per-board — one down station doesn't sink the poll.
  */
-export async function getRailArrivals(): Promise<Prediction[]> {
+export async function getRailArrivals(): Promise<{
+  source: RailSource;
+  predictions: Prediction[];
+}> {
   const nowMs = Date.now();
   if (process.env.RAIL_FIXTURE === "1") {
-    return RAIL_LINES.flatMap((line) =>
-      predictionsForLine(line, fixtureBoards(line, nowMs), nowMs),
-    );
+    return {
+      source: "fixture",
+      predictions: RAIL_LINES.flatMap((line) =>
+        predictionsForLine(line, fixtureBoards(line, nowMs), nowMs),
+      ),
+    };
   }
-  if (!process.env.RAIL_LDB_TOKEN) return [];
+  if (!process.env.RAIL_LDB_TOKEN)
+    return { source: "disabled", predictions: [] };
 
   const out: Prediction[] = [];
   for (const line of RAIL_LINES) {
-    const settled = await Promise.allSettled(
+    const settled: PromiseSettledResult<LdbBoard>[] = await Promise.allSettled(
       line.boardCrs.map((crs) => fetchBoard(crs)),
     );
     const boards: LdbBoard[] = [];
@@ -216,5 +226,5 @@ export async function getRailArrivals(): Promise<Prediction[]> {
     }
     out.push(...predictionsForLine(line, boards, nowMs));
   }
-  return out;
+  return { source: "darwin", predictions: out };
 }

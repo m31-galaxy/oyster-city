@@ -15,6 +15,7 @@ import {
   TrainShapeUtil,
   type TrainShape,
 } from "@/components/shapes/TrainShapeUtil";
+import DebugPanel, { type DebugStats } from "@/components/DebugPanel";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
 import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
@@ -696,6 +697,24 @@ export default function TubeMap() {
 
   /** Re-measure the camera-constraint region from current content bounds. */
   const updateCameraConstraintsRef = useRef<(() => void) | null>(null);
+
+  // Debug-panel telemetry (written by the poll loop / positioning passes,
+  // read at 1Hz while the panel is open — see collectDebugStats).
+  const debugPollRef = useRef({
+    lastPollMs: 0,
+    tflOk: false,
+    tflPreds: 0,
+    railSource: "off",
+    railStatus: "off",
+    railPreds: 0,
+  });
+  const debugPerfRef = useRef({
+    fullMs: 0,
+    fineMs: 0,
+    frames: 0,
+    prevFrames: 0,
+    prevAt: 0,
+  });
 
   // Live-train state (populated in handleMount, driven by the poll + rAF loops).
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
@@ -1565,6 +1584,13 @@ export default function TubeMap() {
       if (store.size === 0 && shapes.size === 0) return;
       const now = performance.now();
       const nowEpoch = Date.now();
+      // Debug telemetry: EMA of pass cost, recorded at every exit below.
+      const recordPass = () => {
+        const p = debugPerfRef.current;
+        const spent = performance.now() - now;
+        if (fine) p.fineMs = p.fineMs ? p.fineMs * 0.9 + spent * 0.1 : spent;
+        else p.fullMs = p.fullMs ? p.fullMs * 0.9 + spent * 0.1 : spent;
+      };
       // Absence detection: if positioning passes stopped for a while (hidden
       // tab, sleep), drop all per-train blend/heading state — the next pass
       // places everything at its true current position before the user sees a
@@ -1869,7 +1895,10 @@ export default function TubeMap() {
           }
         }
       }
-      if (!toCreate.length && !toUpdate.length && !toDelete.length) return;
+      if (!toCreate.length && !toUpdate.length && !toDelete.length) {
+        recordPass();
+        return;
+      }
 
       // Trains are programmatic; geo mode's readonly instance state blocks all
       // create/update, so lift it just for this synchronous batch, then
@@ -1890,6 +1919,7 @@ export default function TubeMap() {
       } finally {
         if (readonly) editor.updateInstanceState({ isReadonly: true });
       }
+      recordPass();
     },
     [],
   );
@@ -1930,16 +1960,25 @@ export default function TubeMap() {
               )
             : Promise.resolve(null),
         ]);
+        const dbg = debugPollRef.current;
+        dbg.tflOk = res.ok;
         if (!res.ok) return; // keep the old store — trajectories cover the gap
         let preds = (await res.json()) as Prediction[];
+        dbg.tflPreds = preds.length;
         // A rail-side failure shouldn't sink the TfL lines; NR records are
         // carried over from the previous store below so their trains keep
         // walking their trajectories instead of vanishing for a poll.
         const railOk = railRes !== null && railRes.ok;
-        if (railOk)
-          preds = preds.concat((await railRes.json()) as Prediction[]);
+        dbg.railStatus = hasRail ? (railOk ? "ok" : "FAILED") : "off";
+        if (railOk) {
+          const railPreds = (await railRes.json()) as Prediction[];
+          dbg.railSource = railRes.headers.get("x-rail-source") ?? "?";
+          dbg.railPreds = railPreds.length;
+          preds = preds.concat(railPreds);
+        }
         if (cancelled || signal.aborted) return;
         const fetchMs = Date.now();
+        dbg.lastPollMs = fetchMs;
         const byLine = new Map<string, Prediction[]>();
         for (const p of preds) {
           const list = byLine.get(p.lineId);
@@ -2037,6 +2076,7 @@ export default function TubeMap() {
     let lastFull = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
+      debugPerfRef.current.frames++;
       const now = performance.now();
       if (now - lastFull >= TRAIN_TICK_MS) {
         lastFull = now;
@@ -2053,6 +2093,116 @@ export default function TubeMap() {
       animating.current = false;
     };
   }, [mounted, positionTrains]);
+
+  // Debug-panel snapshot: cheap reads over the live refs, taken at 1Hz while
+  // the panel is open (DebugPanel drives the interval).
+  const collectDebugStats = useCallback((): DebugStats | null => {
+    const editor = editorRef.current;
+    if (!editor) return null;
+    const nowEpoch = Date.now();
+    const nowPerf = performance.now();
+    const store = trainStore.current;
+    const render = trainRender.current;
+    const dbgPoll = debugPollRef.current;
+    const perf = debugPerfRef.current;
+
+    const vp = editor.getViewportPageBounds();
+    const onScreen = (x: number, y: number) =>
+      x >= vp.x - 50 &&
+      x <= vp.x + vp.w + 50 &&
+      y >= vp.y - 50 &&
+      y <= vp.y + vp.h + 50;
+
+    let trainsOnScreen = 0;
+    let offSum = 0;
+    let offMax = 0;
+    let glides = 0;
+    let glideMax = 0;
+    for (const rs of render.values()) {
+      if (onScreen(rs.x, rs.y)) trainsOnScreen++;
+      const off = Math.abs(rs.springO);
+      offSum += off;
+      if (off > offMax) offMax = off;
+      const dt = (nowPerf - rs.offStart) / rs.blendMs;
+      if (dt < 1 && (rs.offX !== 0 || rs.offY !== 0)) {
+        glides++;
+        const g = Math.hypot(rs.offX, rs.offY);
+        if (g > glideMax) glideMax = g;
+      }
+    }
+
+    const byLineMap = new Map<string, number>();
+    for (const rec of store.values())
+      byLineMap.set(rec.lineId, (byLineMap.get(rec.lineId) ?? 0) + 1);
+    const byLine = [...byLineMap.entries()].sort((a, b) => b[1] - a[1]);
+
+    let stationsTotal = 0;
+    let casings = 0;
+    let cores = 0;
+    for (const s of editor.getCurrentPageShapes()) {
+      if (s.type === "station") stationsTotal++;
+      else if (s.type === "tube-line") {
+        if ((s as TubeLineShape).props.core) cores++;
+        else casings++;
+      }
+    }
+    let stationsCulled = 0;
+    let trainsCulled = 0;
+    for (const id of editor.getCulledShapes()) {
+      const t = editor.getShape(id)?.type;
+      if (t === "station") stationsCulled++;
+      else if (t === "train") trainsCulled++;
+    }
+
+    const hidden = hiddenLabels.get();
+
+    // FPS from the rAF frame counter, measured since the previous snapshot.
+    const dtS = perf.prevAt ? (nowPerf - perf.prevAt) / 1000 : 0;
+    const fps = dtS > 0 ? (perf.frames - perf.prevFrames) / dtS : 0;
+    perf.prevFrames = perf.frames;
+    perf.prevAt = nowPerf;
+
+    return {
+      poll: {
+        agoS: dbgPoll.lastPollMs
+          ? (nowEpoch - dbgPoll.lastPollMs) / 1000
+          : null,
+        everyS: TRAIN_POLL_MS / 1000,
+        tflOk: dbgPoll.tflOk,
+        tflPreds: dbgPoll.tflPreds,
+        railSource: dbgPoll.railSource,
+        railStatus: dbgPoll.railStatus,
+        railPreds: dbgPoll.railPreds,
+      },
+      trains: {
+        records: store.size,
+        shapes: trainShapes.current.size,
+        onScreen: trainsOnScreen,
+        culled: trainsCulled,
+        byLine,
+      },
+      drift: {
+        meanOffMs: render.size ? offSum / render.size : 0,
+        maxOffMs: offMax,
+        glides,
+        maxGlidePx: glideMax,
+        resyncActive: nowEpoch < resyncUntilRef.current,
+      },
+      stations: {
+        total: stationsTotal,
+        culled: stationsCulled,
+        labelsHiddenAll: hidden.all.size,
+        labelsHiddenInter: hidden.interOnly.size,
+      },
+      lines: { casings, cores },
+      perf: { fps, fullMs: perf.fullMs, fineMs: perf.fineMs },
+      camera: {
+        zoom: editor.getZoomLevel(),
+        mode: geoMode ? "geographic" : "editable",
+        morph: morphFracRef.current,
+      },
+    };
+  }, [geoMode]);
 
   if (!mounted) return null;
 
@@ -2076,6 +2226,7 @@ export default function TubeMap() {
           Geographic
         </button>
       </div>
+      <DebugPanel collect={collectDebugStats} />
       <Tldraw
         shapeUtils={shapeUtils}
         hideUi
