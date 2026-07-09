@@ -220,11 +220,15 @@ Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 ## 6. Lifecycle
 
 - **Poll `useEffect`** (`[mounted]`): waits (200ms retries) for the editor +
-  branch registry, then a 30s `setInterval`. ONE fetch for all line ids
-  (comma path — including `thameslink`, which TfL's Arrivals API returns zero
-  predictions for (national-rail predictions aren't served), so the line
-  draws with no trains and costs nothing extra: the comma request tolerates
-  it). On any failure the previous store is **kept** — trajectories
+  branch registry, then a 30s `setInterval`. ONE fetch for all TfL line ids
+  (comma path) plus, in parallel, `/api/rail/arrivals` for National Rail
+  lines (TfL serves no national-rail predictions): a Darwin LDBWS adapter
+  (`lib/rail/`) polls a dozen Thameslink station boards server-side and
+  re-emits the same `Prediction[]` shape, keyed by Darwin serviceID — a
+  genuinely unique per-train id, so the vehicleId-collision class can't
+  occur on NR lines. A rail-side failure carries the previous NR records
+  forward (trajectories keep walking) without sinking the TfL lines. On a
+  TfL failure the previous store is **kept** — trajectories
   cover the gap and trains glide on (previously, failed lines had their trains
   deleted and re-created).
 - **rAF `useEffect`**: single self-scheduling loop, throttled to

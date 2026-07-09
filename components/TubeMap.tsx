@@ -18,6 +18,7 @@ import {
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
 import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
+import { NR_LINE_IDS } from "@/lib/rail/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
 import {
   deriveTrains,
@@ -1096,8 +1097,7 @@ export default function TubeMap() {
     // empty group shape (its reparent is vetoed above), so refuse it too.
     // Trains and lines are unaffected — every check is station-specific.
     const isStation = (s: TLShapeId | { type: string }) =>
-      (typeof s === "string" ? editor.getShape(s)?.type : s.type) ===
-      "station";
+      (typeof s === "string" ? editor.getShape(s)?.type : s.type) === "station";
     const origCanCreate = editor.canCreateShapes.bind(editor);
     editor.canCreateShapes = (shapes) =>
       origCanCreate(shapes) && !shapes.some(isStation);
@@ -1909,18 +1909,35 @@ export default function TubeMap() {
       ac?.abort();
       ac = new AbortController();
       const signal = ac.signal;
-      // ONE request for every line: /Line/{ids}/Arrivals accepts a comma list.
-      // Per-line requests burst 20 upstream fetches per poll, which exceeds
-      // TfL's anonymous rate budget (~12/min measured) and got whole lines
-      // 429-dropped. `no-store` skips the browser HTTP cache — one less layer
-      // of staleness on the ladder.
+      // ONE request for every TfL line: /Line/{ids}/Arrivals accepts a comma
+      // list. Per-line requests burst 20 upstream fetches per poll, which
+      // exceeds TfL's anonymous rate budget (~12/min measured) and got whole
+      // lines 429-dropped. National Rail lines (Thameslink) aren't served by
+      // TfL at all — they come from the Darwin-backed /api/rail proxy in the
+      // same Prediction shape, fetched in parallel and merged. `no-store`
+      // skips the browser HTTP cache — one less layer of staleness.
+      const tflIds = lineIds.filter((id) => !NR_LINE_IDS.has(id));
+      const hasRail = lineIds.some((id) => NR_LINE_IDS.has(id));
       try {
-        const res = await fetch(`/api/tfl/Line/${lineIds.join(",")}/Arrivals`, {
-          signal,
-          cache: "no-store",
-        });
+        const [res, railRes] = await Promise.all([
+          fetch(`/api/tfl/Line/${tflIds.join(",")}/Arrivals`, {
+            signal,
+            cache: "no-store",
+          }),
+          hasRail
+            ? fetch(`/api/rail/arrivals`, { signal, cache: "no-store" }).catch(
+                () => null,
+              )
+            : Promise.resolve(null),
+        ]);
         if (!res.ok) return; // keep the old store — trajectories cover the gap
-        const preds = (await res.json()) as Prediction[];
+        let preds = (await res.json()) as Prediction[];
+        // A rail-side failure shouldn't sink the TfL lines; NR records are
+        // carried over from the previous store below so their trains keep
+        // walking their trajectories instead of vanishing for a poll.
+        const railOk = railRes !== null && railRes.ok;
+        if (railOk)
+          preds = preds.concat((await railRes.json()) as Prediction[]);
         if (cancelled || signal.aborted) return;
         const fetchMs = Date.now();
         const byLine = new Map<string, Prediction[]>();
@@ -1930,6 +1947,11 @@ export default function TubeMap() {
           else byLine.set(p.lineId, [p]);
         }
         const next = new Map<string, TrainRecord>();
+        if (hasRail && !railOk) {
+          for (const [key, rec] of trainStore.current) {
+            if (NR_LINE_IDS.has(rec.lineId)) next.set(key, rec);
+          }
+        }
         for (const [lineId, linePreds] of byLine) {
           const branches = branchesForLineRef.current.get(lineId);
           if (!branches) continue;
