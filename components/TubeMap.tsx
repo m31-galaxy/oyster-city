@@ -1193,13 +1193,36 @@ export default function TubeMap() {
     const camEditor = editor as unknown as {
       getConstrainedCamera(
         point: { x: number; y: number; z?: number },
-        opts?: object,
+        opts?: { force?: boolean; reset?: boolean },
       ): { x: number; y: number; z: number };
     };
     const origConstrainCam = camEditor.getConstrainedCamera.bind(editor);
     camEditor.getConstrainedCamera = (point, opts) => {
+      let { x, y, z } = point;
+      // Zoom stops are applied HERE, before the region shift. When the
+      // requested z is past a zoom limit, tldraw's stop IGNORES the passed
+      // point and re-derives x/y from the live camera — a page-space value,
+      // so the -camRegion unshift below would subtract an offset that was
+      // never added, walking the camera by -camRegion on every blocked
+      // wheel tick (the map crept diagonally when zooming past min/max).
+      // Pre-stopped the same way upstream does it — z halts, the viewport
+      // centre stays put — the original only ever sees in-range z and maps
+      // point -> point, which the shift/unshift conjugates exactly.
+      if (!opts?.force && z !== undefined) {
+        const cam = editor.getCamera();
+        const steps = editor.getCameraOptions().zoomSteps;
+        const base = editor.getBaseZoom();
+        const minZ = steps[0] * base;
+        const maxZ = steps[steps.length - 1] * base;
+        if (z < minZ || z > maxZ) {
+          const vsb = editor.getViewportScreenBounds();
+          z = Math.min(Math.max(z, minZ), maxZ);
+          x = cam.x + vsb.w / 2 / z - vsb.w / 2 / cam.z;
+          y = cam.y + vsb.h / 2 / z - vsb.h / 2 / cam.z;
+        }
+      }
       const local = origConstrainCam(
-        { ...point, x: point.x + camRegion.x, y: point.y + camRegion.y },
+        { ...point, x: x + camRegion.x, y: y + camRegion.y, z },
         opts,
       );
       return { ...local, x: local.x - camRegion.x, y: local.y - camRegion.y };
