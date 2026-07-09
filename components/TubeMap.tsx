@@ -691,6 +691,9 @@ export default function TubeMap() {
   /** Hollow casing shape id -> its white-core twin (mirrors the casing's path). */
   const coreIdForRef = useRef<Map<TLShapeId, TLShapeId>>(new Map());
 
+  /** Re-measure the camera-constraint region from current content bounds. */
+  const updateCameraConstraintsRef = useRef<(() => void) | null>(null);
+
   // Live-train state (populated in handleMount, driven by the poll + rAF loops).
   const shapeIdForRef = useRef<Map<string, TLShapeId>>(new Map());
   const branchesForLineRef = useRef<Map<string, BranchInfo[]>>(new Map());
@@ -1090,26 +1093,59 @@ export default function TubeMap() {
     // down otherwise).
     editor.user.updateUserPreferences({ isSnapMode: true });
 
-    // Camera constraints: the viewport can never lose the map. With
-    // 'outside', the network bounds must always stay touching the viewport
-    // inset by the padding — so at least ~130 screen px of map remains
-    // visible however far you pan or zoom. The bounds sit exactly on the
-    // network (the projection starts at 0,0): tldraw's 'outside' clamp
-    // ignores bounds.x/y (it anchors the region at the origin), so any
-    // margin baked into the bounds would just let the map escape by that
-    // much on one side and over-restrict the other. Edge-scrolling while
-    // dragging a selection pans through this same constrained camera, so it
-    // keeps working, just not past the limit.
-    editor.setCameraOptions({
-      constraints: {
-        bounds: { x: 0, y: 0, w: net.bounds.w, h: net.bounds.h },
-        padding: { x: 128, y: 128 },
-        origin: { x: 0.5, y: 0.5 },
-        initialZoom: "fit-max",
-        baseZoom: "default",
-        behavior: "outside",
-      },
-    });
+    // Camera constraints: the viewport can never lose the map — at least
+    // ~130 screen px of it stays visible however far you pan or zoom
+    // ('outside' behaviour + padding). The constrained region is the LIVE
+    // content bounds, re-measured whenever a station moves, so dragging a
+    // node outward grows the roaming range with it (edge-scrolling a
+    // selection to the viewport edge keeps panning as the frontier recedes)
+    // instead of dead-ending at a fixed border. tldraw's 'outside' clamp
+    // drops bounds.x/y — the region is effectively anchored at the page
+    // origin — so the true origin lives in camRegion and the clamp is
+    // conjugated through it: shift into region-local space, clamp, shift
+    // back. (Translation-invariant, so the zoom handling is unaffected.)
+    const camRegion = { x: 0, y: 0 };
+    const camEditor = editor as unknown as {
+      getConstrainedCamera(
+        point: { x: number; y: number; z?: number },
+        opts?: object,
+      ): { x: number; y: number; z: number };
+    };
+    const origConstrainCam = camEditor.getConstrainedCamera.bind(editor);
+    camEditor.getConstrainedCamera = (point, opts) => {
+      const local = origConstrainCam(
+        { ...point, x: point.x + camRegion.x, y: point.y + camRegion.y },
+        opts,
+      );
+      return { ...local, x: local.x - camRegion.x, y: local.y - camRegion.y };
+    };
+    const updateCameraConstraints = () => {
+      const b = editor.getCurrentPageBounds();
+      if (!b || b.w < 1 || b.h < 1) return;
+      const prev = editor.getCameraOptions().constraints;
+      if (
+        prev &&
+        Math.abs(camRegion.x - b.x) < 1 &&
+        Math.abs(camRegion.y - b.y) < 1 &&
+        Math.abs(prev.bounds.w - b.w) < 1 &&
+        Math.abs(prev.bounds.h - b.h) < 1
+      ) {
+        return; // unchanged — skip the options churn
+      }
+      camRegion.x = b.x;
+      camRegion.y = b.y;
+      editor.setCameraOptions({
+        constraints: {
+          bounds: { x: 0, y: 0, w: b.w, h: b.h },
+          padding: { x: 128, y: 128 },
+          origin: { x: 0.5, y: 0.5 },
+          initialZoom: "fit-max",
+          baseZoom: "default",
+          behavior: "outside",
+        },
+      });
+    };
+    updateCameraConstraintsRef.current = updateCameraConstraints;
 
     // Multi-selection drags: tldraw snaps the selection BOX — point snaps use
     // its corners+centre and gap snaps its borders — rather than the shapes
@@ -1212,6 +1248,10 @@ export default function TubeMap() {
         },
         { ignoreShapeLock: true },
       );
+      // A station moved — the camera-constraint region moves with it (no-op
+      // when the content bounds are unchanged). AFTER the line redraw above,
+      // so an inward move sees the shrunk lines too, not their stale extent.
+      updateCameraConstraints();
     });
 
     const fit = () => {
@@ -1220,6 +1260,8 @@ export default function TubeMap() {
         requestAnimationFrame(fit);
         return;
       }
+      // Shapes exist by now — take the first constraint measurement.
+      updateCameraConstraints();
       editor.zoomToFit();
       // A phone fits the whole network into a sliver — start closer in,
       // centred on the same spot, and let the user pan out for the edges.
@@ -1370,6 +1412,9 @@ export default function TubeMap() {
         editor.updateInstanceState({ isReadonly: geo });
         positionTrains();
         recomputeLabelDeclutter(editor); // layout changed with the mode
+        // The two layouts span different extents — re-measure the camera
+        // constraints now that the morph has settled.
+        updateCameraConstraintsRef.current?.();
       }
     };
     animFrame.current = requestAnimationFrame(tick);
