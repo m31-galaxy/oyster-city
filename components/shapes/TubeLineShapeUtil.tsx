@@ -8,6 +8,7 @@ import {
   type TLBaseShape,
 } from "tldraw";
 import { closedLines, dimmedColour } from "@/lib/tube/status";
+import { blueprintOn } from "@/lib/tube/blueprint";
 
 /** Below this zoom the 10-unit National Rail dash marks are ≤3.5 screen px —
  * unreadable fuzz that still costs per-pixel pattern rasterisation across
@@ -115,6 +116,14 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       [lineId],
     );
     const color = dimmed ? dimmedColour(lineColor) : lineColor;
+    // Blueprint mode (edit): white drafting ink around the line — a wide
+    // translucent glow under a crisp outline. Plain strokes, deliberately
+    // NOT a drop-shadow filter: filters re-rasterize per repaint and would
+    // tax pans and drag redraws. The paths stay mounted and fade via CSS
+    // opacity (zero-opacity paint is skipped), so the flip is smooth both
+    // ways. Casings only — a hollow line's core twin rides its casing.
+    const blueprint = useValue("line-blueprint", () => blueprintOn.get(), []);
+    const outlineClass = blueprint ? "bp-outline bp-outline--on" : "bp-outline";
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.
@@ -132,6 +141,28 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
           height={Math.max(1, h)}
           style={{ overflow: "visible", display: "block" }}
         >
+          {!core && (
+            <>
+              <path
+                className={outlineClass}
+                d={d}
+                fill="none"
+                stroke="rgba(219, 234, 254, 0.22)"
+                strokeWidth={14}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+              <path
+                className={outlineClass}
+                d={d}
+                fill="none"
+                stroke="rgba(234, 242, 255, 0.9)"
+                strokeWidth={9}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+            </>
+          )}
           <path
             d={d}
             fill="none"

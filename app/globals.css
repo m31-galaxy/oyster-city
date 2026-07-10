@@ -198,6 +198,19 @@ textarea {
   transition: none;
 }
 
+/* White drafting ink around the tube lines in blueprint (edit) mode: a wide
+   translucent glow under a crisp outline, rendered as plain strokes beneath
+   each casing (TubeLineShapeUtil). Always mounted, faded with the mode —
+   zero-opacity paths cost nothing to paint. */
+.bp-outline {
+  opacity: 0;
+  transition: opacity 400ms ease;
+}
+
+.bp-outline--on {
+  opacity: 1;
+}
+
 /* The staggered draw-in: each grid line sweeps along its own length
    (dash-offset from full length to zero), with per-line delays set inline
    (verticals cascade left-to-right, horizontals top-to-bottom). `backwards`

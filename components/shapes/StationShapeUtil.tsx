@@ -190,6 +190,17 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       : dimmed
         ? dimmedColour(INK, LABEL_DIM_MIX)
         : INK;
+    // Blueprint mode: white drafting ink around the marker — a crisp ring
+    // plus a soft halo (box-shadow, no filters), faded in and out with the
+    // mode so the flip stays smooth.
+    const markerGlow: CSSProperties = {
+      boxShadow: blueprint
+        ? interchange
+          ? "0 0 0 1.5px rgba(234, 242, 255, 0.65), 0 0 8px 2px rgba(219, 234, 254, 0.4)"
+          : "0 0 0 1.5px rgba(234, 242, 255, 0.9), 0 0 7px 1px rgba(219, 234, 254, 0.45)"
+        : "none",
+      transition: "box-shadow 400ms ease",
+    };
     const marker: CSSProperties = interchange
       ? {
           width: MARKER,
@@ -198,6 +209,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           background: "#ffffff",
           border: `2.5px solid ${ringInk}`,
           boxSizing: "border-box",
+          ...markerGlow,
         }
       : {
           width: DOT,
@@ -205,6 +217,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           margin: (MARKER - DOT) / 2,
           borderRadius: "50%",
           background: dimmed ? dimmedColour(color) : color,
+          ...markerGlow,
         };
 
     return (
