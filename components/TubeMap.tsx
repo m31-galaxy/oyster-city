@@ -1633,6 +1633,13 @@ export default function TubeMap() {
       if (ed.__oysterBuilt) return;
       ed.__oysterBuilt = true;
 
+      // Scroll wheel zooms rather than pans (tldraw's default is pan). This
+      // merges with the constraints set later in updateCameraConstraints, so
+      // it holds across every mode. wheelBehavior only applies while the user
+      // preference inputMode is null (the default) — we hide tldraw's UI, so
+      // it can never be toggled to "trackpad"/"mouse" and override this.
+      editor.setCameraOptions({ wheelBehavior: "zoom" });
+
       const net = getTubeNetwork();
       naptanToHubRef.current = net.naptanToHub;
       stationPosRef.current = new Map(
@@ -3067,7 +3074,14 @@ export default function TubeMap() {
   if (!mounted) return null;
 
   return (
-    <div style={{ position: "absolute", inset: 0 }}>
+    // .bp-mode drives ALL blueprint shape styling (line outlines, marker
+    // glow, label ink) via CSS descendant rules — one style pass on toggle,
+    // zero shape re-renders (a React commit across ~750 shapes read as a
+    // screen-wide flicker at high zoom).
+    <div
+      style={{ position: "absolute", inset: 0 }}
+      className={editMode && !geoMode ? "bp-mode" : undefined}
+    >
       <div className="mode-controls">
         <div className="mode-toggle" role="group" aria-label="Map layout mode">
           <button

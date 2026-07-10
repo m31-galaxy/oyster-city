@@ -194,17 +194,62 @@ textarea {
   transition: none;
 }
 
-/* White drafting ink around the tube lines in blueprint (edit) mode: a wide
-   translucent glow under a crisp outline, rendered as plain strokes beneath
-   each casing (TubeLineShapeUtil). Always mounted, faded with the mode —
-   zero-opacity paths cost nothing to paint. */
+/* Blueprint styling for the map's shapes hangs off .bp-mode (set on the map
+   root while octolinear edit mode is in effect) rather than per-component
+   state: toggling edit restyles everything in ONE style pass instead of
+   re-rendering ~230 line casings + 505 stations — that synchronous commit,
+   re-rasterized at zoomed scale, read as a screen-wide flicker. */
+
+/* White drafting ink around the tube lines: a wide translucent glow under a
+   crisp opaque outline (opaque so overlapping outlines don't alpha-stack
+   into seams), rendered as plain strokes beneath each casing
+   (TubeLineShapeUtil). Always mounted, faded with the mode — zero-opacity
+   paths cost nothing to paint. */
 .bp-outline {
   opacity: 0;
   transition: opacity 400ms ease;
 }
 
-.bp-outline--on {
+.bp-mode .bp-outline {
   opacity: 1;
+}
+
+/* Station markers: crisp white ring + soft halo in blueprint mode. */
+.stn-marker {
+  transition: box-shadow 400ms ease;
+}
+
+.bp-mode .stn-marker--dot {
+  box-shadow:
+    0 0 0 1.5px rgba(234, 242, 255, 0.9),
+    0 0 7px 1px rgba(219, 234, 254, 0.45);
+}
+
+.bp-mode .stn-marker--ring {
+  box-shadow:
+    0 0 0 1.5px rgba(234, 242, 255, 0.65),
+    0 0 8px 2px rgba(219, 234, 254, 0.4);
+}
+
+/* Station-label ink. Dimmed (closed-station) ink is a gentler grey than the
+   lines' — #6C6C6C is ~4.8:1 against the paper (WCAG AA for the 9px labels)
+   where the lines' grey is ~2.6:1. On the blueprint the ink flips to
+   whitish-blue: near-black sinks into the deep blue paper. The colour
+   transition lives on the span (labelFade). */
+.stn-label {
+  color: #111111;
+}
+
+.stn-label--dim {
+  color: #6c6c6c;
+}
+
+.bp-mode .stn-label {
+  color: #eaf2ff;
+}
+
+.bp-mode .stn-label--dim {
+  color: rgba(219, 234, 254, 0.55);
 }
 
 /* The staggered draw-in: each grid line sweeps along its own length

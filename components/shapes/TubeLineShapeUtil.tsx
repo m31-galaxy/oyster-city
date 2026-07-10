@@ -8,7 +8,6 @@ import {
   type TLBaseShape,
 } from "tldraw";
 import { closedLines, dimmedColour } from "@/lib/tube/status";
-import { blueprintOn } from "@/lib/tube/blueprint";
 
 /** Below this zoom the 10-unit National Rail dash marks are ≤3.5 screen px —
  * unreadable fuzz that still costs per-pixel pattern rasterisation across
@@ -117,13 +116,14 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     );
     const color = dimmed ? dimmedColour(lineColor) : lineColor;
     // Blueprint mode (edit): white drafting ink around the line — a wide
-    // translucent glow under a crisp outline. Plain strokes, deliberately
-    // NOT a drop-shadow filter: filters re-rasterize per repaint and would
-    // tax pans and drag redraws. The paths stay mounted and fade via CSS
-    // opacity (zero-opacity paint is skipped), so the flip is smooth both
-    // ways. Casings only — a hollow line's core twin rides its casing.
-    const blueprint = useValue("line-blueprint", () => blueprintOn.get(), []);
-    const outlineClass = blueprint ? "bp-outline bp-outline--on" : "bp-outline";
+    // translucent glow under a crisp OPAQUE outline. Plain strokes,
+    // deliberately NOT a drop-shadow filter: filters re-rasterize per
+    // repaint and would tax pans and drag redraws. The paths stay mounted
+    // and fade via CSS opacity, keyed off the map root's .bp-mode class —
+    // NOT component state, so toggling edit mode restyles every line in
+    // one style pass instead of re-rendering ~230 casings (that commit
+    // burst read as a screen-wide flicker at high zoom). Casings only —
+    // a hollow line's core twin rides its casing.
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.
@@ -144,7 +144,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
           {!core && (
             <>
               <path
-                className={outlineClass}
+                className="bp-outline"
                 d={d}
                 fill="none"
                 stroke="rgba(219, 234, 254, 0.22)"
@@ -153,10 +153,10 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
                 strokeLinecap="round"
               />
               <path
-                className={outlineClass}
+                className="bp-outline"
                 d={d}
                 fill="none"
-                stroke="rgba(234, 242, 255, 0.9)"
+                stroke="#eaf2ff"
                 strokeWidth={9}
                 strokeLinejoin="round"
                 strokeLinecap="round"

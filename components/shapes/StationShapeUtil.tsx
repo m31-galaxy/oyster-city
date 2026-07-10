@@ -10,7 +10,6 @@ import {
 } from "tldraw";
 import { hiddenLabels } from "@/lib/tube/labels";
 import { closedStations, dimmedColour } from "@/lib/tube/status";
-import { blueprintOn } from "@/lib/tube/blueprint";
 
 export interface StationProps {
   w: number;
@@ -36,12 +35,10 @@ const MARKER = 11; // interchange ring diameter (px)
 const DOT = 7; // single-line tick diameter (px)
 /** Below this zoom only interchanges are labelled; at/above it, every station. */
 const LABEL_ZOOM = 0.7;
-/** Ring/label ink; dims with the rest of the marker when the station closes. */
+/** Ring ink; dims with the rest of the marker when the station closes.
+ * Label ink lives in CSS (.stn-label and friends in globals.css) so the
+ * blueprint flip restyles labels without re-rendering them. */
 const INK = "#111111";
-/** Label-ink dim mix: gentler than the geometry's default so 9px closed-
- * station names stay legible — #6C6C6C is ~4.8:1 against the canvas
- * background (WCAG AA for small text), where the lines' grey is ~2.6:1. */
-const LABEL_DIM_MIX = 0.4;
 
 export class StationShapeUtil extends ShapeUtil<StationShape> {
   static override type = "station" as const;
@@ -172,35 +169,12 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       () => closedStations.get().has(shape.props.stationId),
       [shape.props.stationId],
     );
-    // The ring dims into the same family as the lines; the label dims LESS
-    // (LABEL_DIM_MIX) so the name stays readable. On the blueprint backdrop
-    // (edit mode) label ink flips to whitish-blue — drafting annotations —
-    // since near-black ink sinks into the deep blue paper. The rings keep
-    // their dark ink: white-filled circles read fine on blue.
-    const blueprint = useValue(
-      "station-blueprint",
-      () => blueprintOn.get(),
-      [],
-    );
+    // The ring dims into the same family as the lines; the label dims less
+    // so the name stays readable (see .stn-label--dim). Blueprint styling —
+    // marker glow, whitish label ink — is applied by CSS descendant rules
+    // under the map root's .bp-mode class rather than component state, so
+    // flipping edit mode never re-renders the 505 stations.
     const ringInk = dimmed ? dimmedColour(INK) : INK;
-    const labelInk = blueprint
-      ? dimmed
-        ? "rgba(219, 234, 254, 0.55)"
-        : "#eaf2ff"
-      : dimmed
-        ? dimmedColour(INK, LABEL_DIM_MIX)
-        : INK;
-    // Blueprint mode: white drafting ink around the marker — a crisp ring
-    // plus a soft halo (box-shadow, no filters), faded in and out with the
-    // mode so the flip stays smooth.
-    const markerGlow: CSSProperties = {
-      boxShadow: blueprint
-        ? interchange
-          ? "0 0 0 1.5px rgba(234, 242, 255, 0.65), 0 0 8px 2px rgba(219, 234, 254, 0.4)"
-          : "0 0 0 1.5px rgba(234, 242, 255, 0.9), 0 0 7px 1px rgba(219, 234, 254, 0.45)"
-        : "none",
-      transition: "box-shadow 400ms ease",
-    };
     const marker: CSSProperties = interchange
       ? {
           width: MARKER,
@@ -209,7 +183,6 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           background: "#ffffff",
           border: `2.5px solid ${ringInk}`,
           boxSizing: "border-box",
-          ...markerGlow,
         }
       : {
           width: DOT,
@@ -217,7 +190,6 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           margin: (MARKER - DOT) / 2,
           borderRadius: "50%",
           background: dimmed ? dimmedColour(color) : color,
-          ...markerGlow,
         };
 
     return (
@@ -225,17 +197,21 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       // geometry, so the marker is purely visual and never blocks a drag.
       <HTMLContainer style={{ pointerEvents: "none" }}>
         <div style={{ position: "relative", width: w, height: h }}>
-          <div style={marker} />
+          <div
+            className={
+              interchange
+                ? "stn-marker stn-marker--ring"
+                : "stn-marker stn-marker--dot"
+            }
+            style={marker}
+          />
           {/* Progressive labels: interchanges always, others on zoom-in. The
               selected station's name also shows in the sidebar. */}
           {name && (
             <div style={labelAnchorStyle()}>
               <span
-                style={{
-                  ...labelStyle(labelPos),
-                  ...labelFade(showLabel),
-                  color: labelInk,
-                }}
+                className={dimmed ? "stn-label stn-label--dim" : "stn-label"}
+                style={{ ...labelStyle(labelPos), ...labelFade(showLabel) }}
               >
                 {name}
               </span>
@@ -308,7 +284,8 @@ function labelAnchorStyle(): CSSProperties {
 }
 
 /** Place the label N/S/E/W of the marker centre per the labelPos hint.
- * Ink colour is supplied by the caller (it dims when the station closes). */
+ * Ink colour comes from CSS (.stn-label) so mode flips restyle, not
+ * re-render. */
 function labelStyle(pos: string): CSSProperties {
   const offset = MARKER / 2 + 3; // marker radius + gap, measured from the centre
   const style: CSSProperties = {
