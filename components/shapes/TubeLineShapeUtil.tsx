@@ -120,10 +120,9 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     // re-rasterize per repaint) and no translucent halo twin (a second
     // 14px blended stroke per casing measurably slowed zoom re-rasters —
     // tile flicker). The path stays mounted; visibility is the map root's
-    // .bp-mode class (one style pass, zero re-renders) flipped in a single
-    // repaint with no transition — see .bp-outline in globals.css for the
-    // white-on-white choreography that keeps the flip invisible. Casings
-    // only — a hollow line's core twin rides its casing.
+    // .bp-mode class (one style pass, zero re-renders) flipped instantly —
+    // no transition, so the toggle costs exactly one repaint. Casings only
+    // — a hollow line's core twin rides its casing.
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.

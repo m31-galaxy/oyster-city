@@ -150,9 +150,9 @@ textarea {
 /* ---------- Blueprint edit-mode backdrop ---------- */
 
 /* Replaces tldraw's Background: the plain paper always, with the blueprint
-   stack above it fading in over it. The grid and vignette run on their own
-   slightly-later clocks so the reveal reads in layers: paper turns blue,
-   the vignette settles, the drafting grid draws in. */
+   stack above it while edit mode is on. The flip is INSTANT by design — no
+   fades or staged reveals: every animated variant repainted large areas
+   over multiple frames and read as flicker on real hardware. */
 .map-underlay {
   position: absolute;
   inset: 0;
@@ -170,16 +170,10 @@ textarea {
     #123468 100%
   );
   opacity: 0;
-  /* Collapse (unchecking) runs a touch faster than the reveal. The fade is
-     the ONLY thing that animates over the whole viewport, so keep it on the
-     compositor. */
-  will-change: opacity;
-  transition: opacity 450ms ease;
 }
 
 .blueprint--on {
   opacity: 1;
-  transition: opacity 600ms ease;
 }
 
 /* Oversized 2x so the compositor bridge (transform during camera motion —
@@ -192,14 +186,6 @@ textarea {
   width: 200%;
   height: 200%;
   will-change: transform;
-  opacity: 0;
-  transition: opacity 250ms ease;
-}
-
-.blueprint--on .blueprint-grid {
-  /* No container fade on entry — the lines stage their own draw-in. */
-  opacity: 1;
-  transition: none;
 }
 
 /* Blueprint styling for the map's shapes hangs off .bp-mode (set on the map
@@ -210,12 +196,8 @@ textarea {
 
 /* White drafting ink around the tube lines: one crisp opaque outline stroke
    beneath each casing (TubeLineShapeUtil) — opaque so overlaps don't
-   alpha-stack into seams, single so zoom re-rasters stay cheap.
-   Deliberately NO transition: fading would repaint ~230 large line svgs
-   every frame for its duration — the screen-wide flicker at high zoom.
-   Instead the ink flips in ONE repaint, timed by TubeMap's bpStyled state
-   to land while the paper is light (white on white is invisible), and the
-   composited paper fade does the revealing. */
+   alpha-stack into seams, single so zoom re-rasters stay cheap. No
+   transition: the ink flips in one repaint with the mode. */
 .bp-outline {
   opacity: 0;
 }
@@ -227,9 +209,6 @@ textarea {
 /* Station markers: a crisp white ring in blueprint mode. No blur term —
    soft shadows on hundreds of markers made zoom re-rasters measurably
    heavier, and the ringed look holds up without it. */
-.stn-marker {
-  transition: box-shadow 400ms ease;
-}
 
 .bp-mode .stn-marker--dot {
   box-shadow: 0 0 0 1.5px rgba(234, 242, 255, 0.95);
@@ -242,8 +221,7 @@ textarea {
 /* Station-label ink. Dimmed (closed-station) ink is a gentler grey than the
    lines' — #6C6C6C is ~4.8:1 against the paper (WCAG AA for the 9px labels)
    where the lines' grey is ~2.6:1. On the blueprint the ink flips to
-   whitish-blue: near-black sinks into the deep blue paper. The colour
-   transition lives on the span (labelFade). */
+   whitish-blue: near-black sinks into the deep blue paper. */
 .stn-label {
   color: #111111;
 }
@@ -260,25 +238,6 @@ textarea {
   color: rgba(219, 234, 254, 0.55);
 }
 
-/* The staggered draw-in: each grid line sweeps along its own length
-   (dash-offset from full length to zero), with per-line delays set inline
-   (verticals cascade left-to-right, horizontals top-to-bottom). `backwards`
-   keeps a line invisible until its turn. --len is the unitless line length,
-   set inline alongside the delay. */
-.bp-draw-line {
-  stroke-dashoffset: 0;
-  animation: bp-grid-draw 450ms cubic-bezier(0.33, 0, 0.2, 1) backwards;
-}
-
-@keyframes bp-grid-draw {
-  from {
-    stroke-dashoffset: calc(var(--len) * 1px);
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-
 .blueprint-vignette {
   position: absolute;
   inset: 0;
@@ -288,27 +247,6 @@ textarea {
     rgba(5, 17, 45, 0.5) 82%,
     rgba(3, 11, 32, 0.75) 100%
   );
-  opacity: 0;
-  transition: opacity 300ms ease;
-}
-
-.blueprint--on .blueprint-vignette {
-  opacity: 1;
-  transition: opacity 900ms ease 150ms;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .blueprint,
-  .blueprint-grid,
-  .blueprint-vignette {
-    transition-duration: 1ms !important;
-    transition-delay: 0ms !important;
-  }
-
-  .bp-draw-line {
-    animation-duration: 1ms !important;
-    animation-delay: 0ms !important;
-  }
 }
 
 /* The octolinear-only edit-mode checkbox, pill-styled to match the toggle. */

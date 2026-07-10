@@ -231,13 +231,13 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
 }
 
 /** Cross-fade for label show/hide. `visibility` flips after the fade ends so
- * a hidden label neither paints nor lingers as an invisible box. Ink-colour
- * changes (the blueprint flip, closed-line dimming) fade too. */
+ * a hidden label neither paints nor lingers as an invisible box. (Ink-colour
+ * changes — the blueprint flip, dimming — are deliberately instant.) */
 function labelFade(show: boolean): CSSProperties {
   return {
     opacity: show ? 1 : 0,
     visibility: show ? "visible" : "hidden",
-    transition: "opacity 150ms ease, visibility 150ms, color 400ms ease",
+    transition: "opacity 150ms ease, visibility 150ms",
   };
 }
 

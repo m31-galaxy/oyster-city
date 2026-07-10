@@ -72,61 +72,34 @@ const tldrawOptions = {
 // ---------- Blueprint edit-mode backdrop ----------
 // Edit mode dresses the canvas as a blueprint: blue paper, a deep-blue
 // vignette, and a whitish-blue drafting grid that pans and zooms with the
-// camera. It renders as the tldraw Background component — always mounted,
-// so CSS can animate the reveal (a fade, with the grid and vignette on
-// staggered clocks) — and applyEditMode drives it through the blueprintOn
-// atom (lib/tube/blueprint.ts, shared with the station labels' ink flip).
+// camera. It renders as the tldraw Background component and applyEditMode
+// drives it through the blueprintOn atom (lib/tube/blueprint.ts, shared
+// with the station labels' ink flip). The flip is INSTANT by design — no
+// fades, wipes, or draw-in theatre: every animated variant repainted large
+// areas over multiple frames and read as flicker on real hardware.
 
 /** Minor drafting-grid cell in map units; majors every 5th line. */
 const BLUEPRINT_GRID = 40;
 /** Grid stroke colours (majors solid, minors additionally faded by zoom). */
 const GRID_MINOR_INK = "rgba(219, 234, 254, 0.16)";
 const GRID_MAJOR_INK = "rgba(219, 234, 254, 0.3)";
-/** The staggered draw-in: each line sweeps along its length in DRAW_MS,
- * lines start left-to-right / top-to-bottom a few ms apart (budgeted so the
- * whole cascade fits STAGGER_BUDGET_MS regardless of line count), and after
- * everything has landed the per-line elements swap for two pattern-filled
- * rects that pan and zoom for free. */
-const GRID_DRAW_BASE_MS = 250; // let the fade land before inking starts
-const GRID_DRAW_MS = 450;
-const GRID_STAGGER_BUDGET_MS = 550;
-const GRID_DRAW_TOTAL_MS =
-  GRID_DRAW_BASE_MS + GRID_STAGGER_BUDGET_MS + GRID_DRAW_MS + 150;
-/** Above this many lines (deep zoom-out), skip the theatre — pattern only. */
-const GRID_DRAW_MAX_LINES = 400;
 
 const mod = (v: number, m: number) => ((v % m) + m) % m;
 
 function BlueprintBackground() {
   const editor = useEditor();
   const active = useValue("blueprint-active", () => blueprintOn.get(), []);
-  // The grid outlives the checkbox: it draws itself in line-by-line on
-  // enable, and on disable stays mounted through the collapse so it rides
-  // the fade out instead of vanishing a frame early.
-  const [gridMounted, setGridMounted] = useState(false);
-  const [drawing, setDrawing] = useState(false);
-  useEffect(() => {
-    if (active) {
-      setGridMounted(true);
-      setDrawing(true);
-      const t = setTimeout(() => setDrawing(false), GRID_DRAW_TOTAL_MS);
-      return () => clearTimeout(t);
-    }
-    setDrawing(false);
-    const t = setTimeout(() => setGridMounted(false), 600);
-    return () => clearTimeout(t);
-  }, [active]);
-  // The camera is only READ while the grid is up, so panning and zooming
-  // re-render this component only in (and just after) edit mode.
+  // The camera is only READ while the blueprint is up, so panning and
+  // zooming re-render this component only in edit mode.
   const cam = useValue(
     "blueprint-camera",
-    () => (gridMounted ? editor.getCamera() : null),
-    [editor, gridMounted],
+    () => (blueprintOn.get() ? editor.getCamera() : null),
+    [editor],
   );
   const vsb = useValue(
     "blueprint-viewport",
-    () => (gridMounted ? editor.getViewportScreenBounds() : null),
-    [editor, gridMounted],
+    () => (blueprintOn.get() ? editor.getViewportScreenBounds() : null),
+    [editor],
   );
   // The svg CONTENT renders for a RESTING camera (2x-oversized so there is
   // spare grid around the viewport) and live camera motion is bridged by a
@@ -188,126 +161,52 @@ function BlueprintBackground() {
 
   let grid: ReactNode = null;
   if (restCam && vsb) {
-    // Everything below draws into the OVERSIZED box (2w x 2h).
-    const w = vsb.w * 2;
-    const h = vsb.h * 2;
-    const minors = minorOpacity >= 0.05;
-    const step = minors ? cell : major;
-    const stepX = minors ? ox : mox;
-    const stepY = minors ? oy : moy;
-    const vTotal = Math.ceil((w - stepX) / step) + 1;
-    const hTotal = Math.ceil((h - stepY) / step) + 1;
-    if (drawing && vTotal + hTotal <= GRID_DRAW_MAX_LINES) {
-      // Draw-in phase: real per-line elements. Verticals ink top-to-bottom
-      // and start left-to-right; horizontals ink left-to-right and start
-      // top-to-bottom (delays scale to the line count so the cascade always
-      // fits the budget). Keys are positional indices, so panning mid-draw
-      // moves lines without restarting their animations. Geometry, stroke,
-      // and opacity match the pattern fill exactly — the swap is invisible.
-      const isMajor = (v: number, mo: number) => {
-        const m = mod(v - mo, major);
-        return m < 0.5 || major - m < 0.5;
-      };
-      const stagger = (n: number) =>
-        Math.min(28, GRID_STAGGER_BUDGET_MS / Math.max(1, n));
-      const vStag = stagger(vTotal);
-      const hStag = stagger(hTotal);
-      const lines: ReactNode[] = [];
-      for (let i = 0, x = stepX; x <= w; x += step, i++) {
-        const mj = !minors || isMajor(x, mox);
-        lines.push(
-          <line
-            key={`v${i}`}
-            className="bp-draw-line"
-            x1={x}
-            y1={0}
-            x2={x}
-            y2={h}
-            stroke={mj ? GRID_MAJOR_INK : GRID_MINOR_INK}
-            strokeOpacity={mj ? 1 : minorOpacity}
-            strokeWidth={1}
-            strokeDasharray={h}
-            style={
-              {
-                "--len": h,
-                animationDelay: `${GRID_DRAW_BASE_MS + Math.round(i * vStag)}ms`,
-              } as CSSProperties
-            }
-          />,
-        );
-      }
-      for (let i = 0, y = stepY; y <= h; y += step, i++) {
-        const mj = !minors || isMajor(y, moy);
-        lines.push(
-          <line
-            key={`h${i}`}
-            className="bp-draw-line"
-            x1={0}
-            y1={y}
-            x2={w}
-            y2={y}
-            stroke={mj ? GRID_MAJOR_INK : GRID_MINOR_INK}
-            strokeOpacity={mj ? 1 : minorOpacity}
-            strokeWidth={1}
-            strokeDasharray={w}
-            style={
-              {
-                "--len": w,
-                animationDelay: `${GRID_DRAW_BASE_MS + Math.round(i * hStag)}ms`,
-              } as CSSProperties
-            }
-          />,
-        );
-      }
-      grid = lines;
-    } else {
-      // Steady state (and the ride-out): two pattern fills, camera-synced.
-      grid = (
-        <>
-          <defs>
-            <pattern
-              id="bp-minor"
-              width={cell}
-              height={cell}
-              x={ox}
-              y={oy}
-              patternUnits="userSpaceOnUse"
-            >
-              <path
-                d={`M ${cell} 0 H 0 V ${cell}`}
-                fill="none"
-                stroke={GRID_MINOR_INK}
-                strokeWidth="1"
-              />
-            </pattern>
-            <pattern
-              id="bp-major"
-              width={major}
-              height={major}
-              x={mox}
-              y={moy}
-              patternUnits="userSpaceOnUse"
-            >
-              <path
-                d={`M ${major} 0 H 0 V ${major}`}
-                fill="none"
-                stroke={GRID_MAJOR_INK}
-                strokeWidth="1"
-              />
-            </pattern>
-          </defs>
-          {minorOpacity > 0 && (
-            <rect
-              width="100%"
-              height="100%"
-              fill="url(#bp-minor)"
-              opacity={minorOpacity}
+    // Two pattern fills, camera-synced through the rest-camera bridge.
+    grid = (
+      <>
+        <defs>
+          <pattern
+            id="bp-minor"
+            width={cell}
+            height={cell}
+            x={ox}
+            y={oy}
+            patternUnits="userSpaceOnUse"
+          >
+            <path
+              d={`M ${cell} 0 H 0 V ${cell}`}
+              fill="none"
+              stroke={GRID_MINOR_INK}
+              strokeWidth="1"
             />
-          )}
-          <rect width="100%" height="100%" fill="url(#bp-major)" />
-        </>
-      );
-    }
+          </pattern>
+          <pattern
+            id="bp-major"
+            width={major}
+            height={major}
+            x={mox}
+            y={moy}
+            patternUnits="userSpaceOnUse"
+          >
+            <path
+              d={`M ${major} 0 H 0 V ${major}`}
+              fill="none"
+              stroke={GRID_MAJOR_INK}
+              strokeWidth="1"
+            />
+          </pattern>
+        </defs>
+        {minorOpacity > 0 && (
+          <rect
+            width="100%"
+            height="100%"
+            fill="url(#bp-minor)"
+            opacity={minorOpacity}
+          />
+        )}
+        <rect width="100%" height="100%" fill="url(#bp-major)" />
+      </>
+    );
   }
 
   return (
@@ -1103,20 +1002,6 @@ export default function TubeMap() {
   const editActiveRef = useRef(false);
   // Selection parked while editing is off, restored on the next enable.
   const savedSelectionRef = useRef<TLShapeId[]>([]);
-  // Drives the root .bp-mode class (the shapes' white blueprint ink). The
-  // ink has NO per-element transitions — fading ~230 huge line svgs
-  // repainted every frame for 400ms at zoomed scale — so it flips in one
-  // repaint, choreographed to be invisible: white ink lands while the paper
-  // is still light (white-on-white), and the composited paper fade reveals
-  // it; on the way out the ink outlives the paper fade and drops once the
-  // paper is light again. Geo trips snap it off instead (see
-  // applyEditMode) so a morph never paints outline-laden frames.
-  const [bpStyled, setBpStyled] = useState(false);
-  const bpOffTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Bumped at every morph settle so the edit effect re-runs: resuming edit
-  // after a geo trip waits for the settle rather than fading the blueprint
-  // in over the morph's per-frame shape writes.
-  const [settleTick, setSettleTick] = useState(0);
 
   const editorRef = useRef<Editor | null>(null);
   const geoPos = useRef<Map<TLShapeId, Pose>>(new Map());
@@ -1668,41 +1553,22 @@ export default function TubeMap() {
   // view-only store — with the outgoing selection parked for next time.
   // The select-tool veto in handleMount reads editActiveRef, so while off
   // even the V hotkey can't bring drags back.
-  const applyEditMode = useCallback(
-    (editor: Editor, active: boolean, instantOff = false) => {
-      editActiveRef.current = active;
-      blueprintOn.set(active); // the backdrop fade starts with the flip
-      if (bpOffTimer.current !== null) {
-        clearTimeout(bpOffTimer.current);
-        bpOffTimer.current = null;
-      }
-      if (active) {
-        // Ink lands NOW, in one repaint — invisible against the still-light
-        // paper; the paper's composited fade-in is what reveals it.
-        setBpStyled(true);
-        editor.updateInstanceState({ isReadonly: false });
-        editor.setCurrentTool("select");
-        const ids = savedSelectionRef.current.filter((id) =>
-          editor.getShape(id),
-        );
-        savedSelectionRef.current = [];
-        if (ids.length) editor.select(...ids);
-      } else {
-        // The ink outlives the paper fade (450ms) and drops once the paper
-        // is light again — white-on-white, so the flip is invisible. Geo
-        // trips snap it off instead: the morph starts in the same frame,
-        // and its motion masks the pop far better than 450ms of
-        // outline-laden morph frames would look.
-        if (instantOff) setBpStyled(false);
-        else bpOffTimer.current = setTimeout(() => setBpStyled(false), 500);
-        savedSelectionRef.current = [...editor.getSelectedShapeIds()];
-        editor.selectNone();
-        editor.setCurrentTool("hand");
-        editor.updateInstanceState({ isReadonly: true });
-      }
-    },
-    [],
-  );
+  const applyEditMode = useCallback((editor: Editor, active: boolean) => {
+    editActiveRef.current = active;
+    blueprintOn.set(active); // the backdrop flips with it, instantly
+    if (active) {
+      editor.updateInstanceState({ isReadonly: false });
+      editor.setCurrentTool("select");
+      const ids = savedSelectionRef.current.filter((id) => editor.getShape(id));
+      savedSelectionRef.current = [];
+      if (ids.length) editor.select(...ids);
+    } else {
+      savedSelectionRef.current = [...editor.getSelectedShapeIds()];
+      editor.selectNone();
+      editor.setCurrentTool("hand");
+      editor.updateInstanceState({ isReadonly: true });
+    }
+  }, []);
 
   const handleMount = useCallback(
     (editor: Editor) => {
@@ -2769,10 +2635,6 @@ export default function TubeMap() {
             isReadonly: geo || !editActiveRef.current,
           });
           positionTrains();
-          // Let the edit effect re-run: a deferred edit resume (geo ->
-          // octolinear with the checkbox remembered on) engages here, so
-          // the blueprint stages in AFTER the motion stops.
-          setSettleTick((t) => t + 1);
           // The label declutter (greedy O(n²) over 505 labels) and the camera
           // constraint re-measure (full page-bounds fold) ran here in the SAME
           // frame as the settle redraw — a visible ~2x frame spike right at the
@@ -2797,34 +2659,23 @@ export default function TubeMap() {
     [positionTrains],
   );
 
-  // Animate only on a real mode change — skip the initial mount (and React
-  // strict-mode's double-invoke), which would otherwise run a no-op
-  // animation. (Declared above the edit effect, which reads it to detect a
-  // pending morph.)
-  const lastMode = useRef(false);
-
   // Keep the editor's edit state in step with the checkbox AND the layout
   // mode: geographic suspends editing (auto-disable) without touching the
   // checkbox state, so returning to octolinear resumes it. Declared BEFORE
   // the morph effect below — on the same geoMode flip, editActiveRef must
   // be current by the time the morph's settle picks its readonly value.
-  //
-  // Morph awareness: lastMode still holding the OLD geoMode here means the
-  // morph effect below is about to run — in that case a resume is DEFERRED
-  // (morphPending keeps `active` false) and engages on the settleTick bump
-  // instead, so blueprint work never runs concurrently with the morph's
-  // per-frame shape writes. A geo-bound suspend, by contrast, applies
-  // immediately (selection must park before the morph) and snaps the ink
-  // off (instantOff) for the same reason.
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor) return;
-    const morphPending = lastMode.current !== geoMode;
-    const active = editMode && !geoMode && !morphPending;
+    const active = editMode && !geoMode;
     if (active === editActiveRef.current) return;
-    applyEditMode(editor, active, geoMode || morphPending);
-  }, [geoMode, editMode, settleTick, applyEditMode]);
+    applyEditMode(editor, active);
+  }, [geoMode, editMode, applyEditMode]);
 
+  // Animate only on a real mode change — skip the initial mount (and React
+  // strict-mode's double-invoke), which would otherwise run a no-op
+  // animation.
+  const lastMode = useRef(false);
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || lastMode.current === geoMode) return;
@@ -3202,12 +3053,11 @@ export default function TubeMap() {
 
   return (
     // .bp-mode drives ALL blueprint shape styling (line outlines, marker
-    // glow, label ink) via CSS descendant rules — one style pass on toggle,
-    // zero shape re-renders. bpStyled (not the raw editMode) times the flip
-    // so it always lands white-on-white; see its declaration.
+    // rings, label ink) via CSS descendant rules — one style pass on
+    // toggle, zero shape re-renders, no transitions: the flip is instant.
     <div
       style={{ position: "absolute", inset: 0 }}
-      className={bpStyled ? "bp-mode" : undefined}
+      className={editMode && !geoMode ? "bp-mode" : undefined}
     >
       <div className="mode-controls">
         <div className="mode-toggle" role="group" aria-label="Map layout mode">
