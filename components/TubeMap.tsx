@@ -1633,12 +1633,46 @@ export default function TubeMap() {
       if (ed.__oysterBuilt) return;
       ed.__oysterBuilt = true;
 
-      // Scroll wheel zooms rather than pans (tldraw's default is pan). This
-      // merges with the constraints set later in updateCameraConstraints, so
-      // it holds across every mode. wheelBehavior only applies while the user
-      // preference inputMode is null (the default) — we hide tldraw's UI, so
-      // it can never be toggled to "trackpad"/"mouse" and override this.
-      editor.setCameraOptions({ wheelBehavior: "zoom" });
+      // Mouse wheel zooms, but a trackpad two-finger scroll still pans. tldraw
+      // keys this off the `inputMode` user preference: "mouse" forces the wheel
+      // to zoom, "trackpad" forces it to pan (and a trackpad pinch, which the OS
+      // sends as a ctrl+wheel event, flips back to zoom on its own). So detect
+      // the device per wheel event and set the preference. The listener is on
+      // the container in the CAPTURE phase, ahead of tldraw's own bubble-phase
+      // handler on the canvas, so the mode it sets takes effect on that very
+      // same event rather than the next one.
+      const classifyWheel = (e: WheelEvent): "mouse" | "trackpad" | null => {
+        // Pinch-zoom arrives as ctrl+wheel from a trackpad, but a mouse user
+        // holding ctrl lands here too — ambiguous, so don't reclassify; leaving
+        // the mode untouched lets tldraw's own ctrl-flip do the right thing.
+        if (e.ctrlKey) return null;
+        // Line/page-granularity deltas only ever come from a real mouse wheel.
+        if (e.deltaMode !== 0) return "mouse";
+        // Chrome/Safari still expose legacy wheelDeltaY: a notched mouse wheel
+        // is always a multiple of 120 with no horizontal component, whereas a
+        // trackpad scrolls in fractional steps and can carry a deltaX.
+        const wd = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY;
+        if (typeof wd === "number" && wd !== 0) {
+          return Math.abs(wd) % 120 === 0 && e.deltaX === 0
+            ? "mouse"
+            : "trackpad";
+        }
+        // Firefox pixel-mode fallback (no wheelDeltaY): a horizontal or
+        // fractional delta means a trackpad; a clean vertical step, a mouse.
+        return e.deltaX !== 0 || !Number.isInteger(e.deltaY)
+          ? "trackpad"
+          : "mouse";
+      };
+      editor.getContainer().addEventListener(
+        "wheel",
+        (e) => {
+          const mode = classifyWheel(e);
+          if (mode && mode !== editor.user.getUserPreferences().inputMode) {
+            editor.user.updateUserPreferences({ inputMode: mode });
+          }
+        },
+        { capture: true, passive: true },
+      );
 
       const net = getTubeNetwork();
       naptanToHubRef.current = net.naptanToHub;
