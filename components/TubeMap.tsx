@@ -1368,971 +1368,992 @@ export default function TubeMap() {
     [],
   );
 
-  const handleMount = useCallback((editor: Editor) => {
-    if (process.env.NODE_ENV !== "production") {
-      (window as unknown as { editor?: Editor }).editor = editor;
-    }
-
-    // Build once per editor (guards React strict-mode double-invoke).
-    const ed = editor as Editor & { __oysterBuilt?: boolean };
-    if (ed.__oysterBuilt) return;
-    ed.__oysterBuilt = true;
-
-    const net = getTubeNetwork();
-    naptanToHubRef.current = net.naptanToHub;
-    stationPosRef.current = new Map(
-      net.stations.map((s) => [s.id, [s.lon, s.lat]]),
-    );
-    const lines = SHOWN_LINES
-      ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
-      : net.lines;
-
-    const lineCount = new Map<string, number>();
-    const colourFor = new Map<string, string>();
-    // Station -> serving lines: lib/tube/status derives the closed-station
-    // set from this (a station dims only when every one of its lines is
-    // closed).
-    const stationLines = new Map<string, string[]>();
-    for (const line of lines) {
-      for (const sid of line.stationIds) {
-        lineCount.set(sid, (lineCount.get(sid) ?? 0) + 1);
-        if (!colourFor.has(sid)) colourFor.set(sid, line.color);
-        const served = stationLines.get(sid);
-        if (!served) stationLines.set(sid, [line.id]);
-        else if (!served.includes(line.id)) served.push(line.id);
+  const handleMount = useCallback(
+    (editor: Editor) => {
+      if (process.env.NODE_ENV !== "production") {
+        (window as unknown as { editor?: Editor }).editor = editor;
       }
-    }
-    setStationTopology(stationLines);
-    const stations = net.stations.filter((s) => lineCount.has(s.id));
-    const centreFor = new Map<string, Pt>(
-      stations.map((s) => [s.id, { x: s.cx, y: s.cy }]),
-    );
-    const shapeIdFor = new Map<string, TLShapeId>(
-      stations.map((s) => [s.id, createShapeId()]),
-    );
-    shapeIdForRef.current = shapeIdFor;
-    // Station shape id -> initial centre point, for fork/crossing detection
-    // while grouping the line shapes below.
-    const editorStationCentres = new Map<TLShapeId, Pt>(
-      stations.map((s) => [shapeIdFor.get(s.id)!, { x: s.cx, y: s.cy }]),
-    );
 
-    const stationShapes = stations.map((s) => {
-      const id = shapeIdFor.get(s.id)!;
-      const pos = { x: s.cx - MARKER / 2, y: s.cy - MARKER / 2 };
-      // Both layouts start at the geographic position.
-      geoPos.current.set(id, { ...pos });
-      customPos.current.set(id, { ...pos });
-      return {
-        id,
-        type: "station" as const,
-        x: pos.x,
-        y: pos.y,
-        props: {
-          w: MARKER,
-          h: MARKER,
-          name: s.name,
-          stationId: s.id,
-          interchange: (lineCount.get(s.id) ?? 0) > 1,
-          labelPos: s.labelPos,
-          color: colourFor.get(s.id) ?? s.color,
-        },
-      };
-    });
+      // Build once per editor (guards React strict-mode double-invoke).
+      const ed = editor as Editor & { __oysterBuilt?: boolean };
+      if (ed.__oysterBuilt) return;
+      ed.__oysterBuilt = true;
 
-    // One casing shape per fragment, plus a white-core twin for hollow lines.
-    // Twins are appended after ALL of their line's casings so every core sits
-    // above every casing of the same line — at forks, one fragment's colour
-    // stroke can then never truncate another fragment's white channel. Cross-
-    // line z-order is unchanged (later lines still occlude earlier ones).
-    type TubeLineInit = {
-      id: TLShapeId;
-      type: "tube-line";
-      x: number;
-      y: number;
-      isLocked: boolean;
-      props: TubeLineShape["props"];
-    };
-    const lineShapes: TubeLineInit[] = [];
-    // The current line's fragments, accumulated until the line id changes:
-    // casing init + optional core init + station set + drawn polyline (for
-    // fork/crossing detection).
-    let group: {
-      casing: TubeLineInit;
-      core: TubeLineInit | null;
-      stations: Set<TLShapeId>;
-      poly: Pt[];
-    }[] = [];
-    let prevLineId: string | null = null;
-    const segsCross = (a: Pt, b: Pt, c: Pt, d: Pt) => {
-      const d1 = (d.x - c.x) * (a.y - c.y) - (d.y - c.y) * (a.x - c.x);
-      const d2 = (d.x - c.x) * (b.y - c.y) - (d.y - c.y) * (b.x - c.x);
-      const d3 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-      const d4 = (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
-      return d1 * d2 < 0 && d3 * d4 < 0;
-    };
-    // Emit a line's fragments with cores interleaved so channels merge ONLY
-    // between fragments that fork from a shared station: each core is placed
-    // right after the last casing among itself and its fork partners. Fork
-    // partners' casings land before the core (no channel cut-off at the
-    // junction); unrelated later casings land after it, so a same-line
-    // CROSSING occludes like two distinct lines instead of reading as a
-    // four-way junction. A pair that shares a station but ALSO crosses
-    // elsewhere (the DLR delta's bypass) is demoted to strict layering: the
-    // shared station still merges via the other fragments converging there,
-    // while the mid-route crossing occludes.
-    const flushGroup = () => {
-      const partners = (
-        g: (typeof group)[number],
-        h: (typeof group)[number],
-      ) => {
-        let shared: Pt[] | null = null;
-        for (const s of h.stations) {
-          if (g.stations.has(s)) {
-            const st = editorStationCentres.get(s);
-            if (st) (shared ??= []).push(st);
-          }
-        }
-        if (!shared) return false;
-        // Crossing away from every shared station -> not fork partners.
-        for (let i = 1; i < g.poly.length; i++) {
-          for (let j = 1; j < h.poly.length; j++) {
-            if (!segsCross(g.poly[i - 1], g.poly[i], h.poly[j - 1], h.poly[j]))
-              continue;
-            const mid = {
-              x: (g.poly[i - 1].x + g.poly[i].x) / 2,
-              y: (g.poly[i - 1].y + g.poly[i].y) / 2,
-            };
-            if (shared.every((s) => Math.hypot(s.x - mid.x, s.y - mid.y) > 25))
-              return false;
-          }
-        }
-        return true;
-      };
-      const n = group.length;
-      const partner: boolean[][] = Array.from({ length: n }, () =>
-        Array(n).fill(false),
+      const net = getTubeNetwork();
+      naptanToHubRef.current = net.naptanToHub;
+      stationPosRef.current = new Map(
+        net.stations.map((s) => [s.id, [s.lon, s.lat]]),
       );
-      const demotedPairs: [number, number][] = [];
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          const shares = [...group[j].stations].some((s) =>
-            group[i].stations.has(s),
-          );
-          if (!shares) continue;
-          if (partners(group[i], group[j])) {
-            partner[i][j] = partner[j][i] = true;
-          } else {
-            demotedPairs.push([i, j]);
-          }
+      const lines = SHOWN_LINES
+        ? net.lines.filter((l) => SHOWN_LINES.includes(l.id))
+        : net.lines;
+
+      const lineCount = new Map<string, number>();
+      const colourFor = new Map<string, string>();
+      // Station -> serving lines: lib/tube/status derives the closed-station
+      // set from this (a station dims only when every one of its lines is
+      // closed).
+      const stationLines = new Map<string, string[]>();
+      for (const line of lines) {
+        for (const sid of line.stationIds) {
+          lineCount.set(sid, (lineCount.get(sid) ?? 0) + 1);
+          if (!colourFor.has(sid)) colourFor.set(sid, line.color);
+          const served = stationLines.get(sid);
+          if (!served) stationLines.set(sid, [line.id]);
+          else if (!served.includes(line.id)) served.push(line.id);
         }
       }
-      // A crossing pair is violated when a fork link stretches a core's
-      // window past the crossing counterpart's casing. The emission ORDER is
-      // itself a degree of freedom: first try relocating the offending fork
-      // partner's casing to just before the counterpart — that satisfies the
-      // layering while keeping the junction merge. (Thameslink's King's
-      // Cross: the main fragment crosses London Bridge–Peckham Rye away from
-      // their shared station, and its Finsbury Park fork partner was emitted
-      // after that counterpart; moving the partner earlier keeps both the
-      // crossing occlusion and the King's Cross channel merge.) Only when a
-      // move repeats — a genuine cycle, like the DLR delta's two crossings
-      // chained through fork links — is the fork link dropped as before: the
-      // sacrificed merge sits within a few px of the shared station, hidden
-      // by the station marker, while the crossing is out in the open. Every
-      // round either performs a never-tried move or removes a link, so this
-      // terminates.
-      const ord = group.map((_, i) => i); // emission slots -> fragment index
-      const slotOf: number[] = new Array(n).fill(0);
-      const tried = new Set<string>();
-      let coreSlot: number[] = [];
-      for (let guard = 0; guard <= n * n + demotedPairs.length * n; guard++) {
-        ord.forEach((f, s) => (slotOf[f] = s));
-        coreSlot = group.map((_, j) => {
-          let last = slotOf[j];
-          for (let k = 0; k < n; k++)
-            if (partner[j][k]) last = Math.max(last, slotOf[k]);
-          return last;
-        });
-        // With a's casing emitted before b's, the crossing pair is strictly
-        // layered iff a's core also lands before b's casing.
-        let va = -1;
-        let vb = -1;
-        for (const [i, j] of demotedPairs) {
-          const [a, b] = slotOf[i] < slotOf[j] ? [i, j] : [j, i];
-          if (coreSlot[a] >= slotOf[b]) {
-            va = a;
-            vb = b;
-            break;
-          }
-        }
-        if (va < 0) break;
-        // The fork partner holding a's core at/after b's casing.
-        let off = -1;
-        for (let k = 0; k < n; k++)
-          if (partner[va][k] && slotOf[k] >= slotOf[vb])
-            if (off < 0 || slotOf[k] > slotOf[off]) off = k;
-        if (off < 0) break;
-        const moveKey = `${off}->${vb}`;
-        if (!tried.has(moveKey)) {
-          tried.add(moveKey);
-          ord.splice(slotOf[off], 1);
-          ord.splice(ord.indexOf(vb), 0, off);
-        } else {
-          partner[va][off] = partner[off][va] = false;
-        }
-      }
-      for (const f of ord) {
-        lineShapes.push(group[f].casing);
-        group.forEach((h, j) => {
-          if (h.core && coreSlot[j] === slotOf[f]) lineShapes.push(h.core);
-        });
-      }
-      group = [];
-    };
-    for (const line of lines) {
-      if (line.id !== prevLineId) {
-        flushGroup();
-        prevLineId = line.id;
-      }
-      const lineId = createShapeId();
-      const ids = line.stationIds
-        .map((sid) => shapeIdFor.get(sid))
-        .filter((id): id is TLShapeId => !!id);
-      const centres = line.stationIds
-        .map((sid) => centreFor.get(sid))
-        .filter((c): c is Pt => !!c);
-      // Mount starts in editable mode → octilinear connectors.
-      const poly = octilinearPoints(centres);
-      const path = pathFromPoints(poly);
-      // Stash the projected OSM track curve (settle) + per-pair segments (morph).
-      if (line.geoPoints.length >= 2) {
-        lineGeo.current.set(
-          lineId,
-          line.geoPoints.map(([x, y]) => ({ x, y })),
-        );
-      }
-      // Gate both maps on the same alignment check: the geo train path reads
-      // lineSegGeo by pair index and the morph path reads segProfilesRef, so a
-      // count mismatch must disable both together (else they'd draw different
-      // geometry). All current lines satisfy this; warn if a rebuild breaks it.
-      if (line.geoSegments.length === line.stationIds.length - 1) {
-        const segs = line.geoSegments.map((seg) =>
-          seg ? seg.map(([x, y]) => ({ x, y })) : null,
-        );
-        lineSegGeo.current.set(lineId, segs);
-        const profiles = buildSegProfiles(segs);
-        segProfilesRef.current.set(lineId, profiles.full);
-        segProfilesCoarseRef.current.set(lineId, profiles.coarse);
-        segProfilesCoarserRef.current.set(lineId, profiles.coarser);
-      } else if (
-        line.geoSegments.length &&
-        process.env.NODE_ENV !== "production"
-      ) {
-        console.warn(
-          `[tube] ${line.id}: geoSegments ${line.geoSegments.length} != stationIds-1 ${line.stationIds.length - 1}; ignoring geometry`,
-        );
-      }
-      // Register this branch so live trains can resolve onto its segments.
-      branchStationIdsRef.current.set(lineId, line.stationIds);
-      const branches = branchesForLineRef.current.get(line.id);
-      const branch = makeBranch(lineId, line.stationIds);
-      if (branches) branches.push(branch);
-      else branchesForLineRef.current.set(line.id, [branch]);
-      lineColorRef.current.set(line.id, line.color);
-      const hollow = isHollowLine(line.id);
-      const casing: TubeLineInit = {
-        id: lineId,
-        type: "tube-line" as const,
-        x: path.x,
-        y: path.y,
-        isLocked: true,
-        props: {
-          w: path.w,
-          h: path.h,
-          color: line.color,
-          d: path.d,
-          hollow,
-          core: false,
-          dashed: isNationalRailLine(line.id),
-          lineId: line.id,
-          stationIds: ids,
-        },
+      setStationTopology(stationLines);
+      const stations = net.stations.filter((s) => lineCount.has(s.id));
+      const centreFor = new Map<string, Pt>(
+        stations.map((s) => [s.id, { x: s.cx, y: s.cy }]),
+      );
+      const shapeIdFor = new Map<string, TLShapeId>(
+        stations.map((s) => [s.id, createShapeId()]),
+      );
+      shapeIdForRef.current = shapeIdFor;
+      // Station shape id -> initial centre point, for fork/crossing detection
+      // while grouping the line shapes below.
+      const editorStationCentres = new Map<TLShapeId, Pt>(
+        stations.map((s) => [shapeIdFor.get(s.id)!, { x: s.cx, y: s.cy }]),
+      );
+
+      const stationShapes = stations.map((s) => {
+        const id = shapeIdFor.get(s.id)!;
+        const pos = { x: s.cx - MARKER / 2, y: s.cy - MARKER / 2 };
+        // Both layouts start at the geographic position.
+        geoPos.current.set(id, { ...pos });
+        customPos.current.set(id, { ...pos });
+        return {
+          id,
+          type: "station" as const,
+          x: pos.x,
+          y: pos.y,
+          props: {
+            w: MARKER,
+            h: MARKER,
+            name: s.name,
+            stationId: s.id,
+            interchange: (lineCount.get(s.id) ?? 0) > 1,
+            labelPos: s.labelPos,
+            color: colourFor.get(s.id) ?? s.color,
+          },
+        };
+      });
+
+      // One casing shape per fragment, plus a white-core twin for hollow lines.
+      // Twins are appended after ALL of their line's casings so every core sits
+      // above every casing of the same line — at forks, one fragment's colour
+      // stroke can then never truncate another fragment's white channel. Cross-
+      // line z-order is unchanged (later lines still occlude earlier ones).
+      type TubeLineInit = {
+        id: TLShapeId;
+        type: "tube-line";
+        x: number;
+        y: number;
+        isLocked: boolean;
+        props: TubeLineShape["props"];
       };
-      let core: TubeLineInit | null = null;
-      if (hollow) {
-        const coreId = createShapeId();
-        coreIdForRef.current.set(lineId, coreId);
-        core = {
-          ...casing,
-          id: coreId,
-          props: { ...casing.props, core: true },
+      const lineShapes: TubeLineInit[] = [];
+      // The current line's fragments, accumulated until the line id changes:
+      // casing init + optional core init + station set + drawn polyline (for
+      // fork/crossing detection).
+      let group: {
+        casing: TubeLineInit;
+        core: TubeLineInit | null;
+        stations: Set<TLShapeId>;
+        poly: Pt[];
+      }[] = [];
+      let prevLineId: string | null = null;
+      const segsCross = (a: Pt, b: Pt, c: Pt, d: Pt) => {
+        const d1 = (d.x - c.x) * (a.y - c.y) - (d.y - c.y) * (a.x - c.x);
+        const d2 = (d.x - c.x) * (b.y - c.y) - (d.y - c.y) * (b.x - c.x);
+        const d3 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        const d4 = (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
+        return d1 * d2 < 0 && d3 * d4 < 0;
+      };
+      // Emit a line's fragments with cores interleaved so channels merge ONLY
+      // between fragments that fork from a shared station: each core is placed
+      // right after the last casing among itself and its fork partners. Fork
+      // partners' casings land before the core (no channel cut-off at the
+      // junction); unrelated later casings land after it, so a same-line
+      // CROSSING occludes like two distinct lines instead of reading as a
+      // four-way junction. A pair that shares a station but ALSO crosses
+      // elsewhere (the DLR delta's bypass) is demoted to strict layering: the
+      // shared station still merges via the other fragments converging there,
+      // while the mid-route crossing occludes.
+      const flushGroup = () => {
+        const partners = (
+          g: (typeof group)[number],
+          h: (typeof group)[number],
+        ) => {
+          let shared: Pt[] | null = null;
+          for (const s of h.stations) {
+            if (g.stations.has(s)) {
+              const st = editorStationCentres.get(s);
+              if (st) (shared ??= []).push(st);
+            }
+          }
+          if (!shared) return false;
+          // Crossing away from every shared station -> not fork partners.
+          for (let i = 1; i < g.poly.length; i++) {
+            for (let j = 1; j < h.poly.length; j++) {
+              if (
+                !segsCross(g.poly[i - 1], g.poly[i], h.poly[j - 1], h.poly[j])
+              )
+                continue;
+              const mid = {
+                x: (g.poly[i - 1].x + g.poly[i].x) / 2,
+                y: (g.poly[i - 1].y + g.poly[i].y) / 2,
+              };
+              if (
+                shared.every((s) => Math.hypot(s.x - mid.x, s.y - mid.y) > 25)
+              )
+                return false;
+            }
+          }
+          return true;
+        };
+        const n = group.length;
+        const partner: boolean[][] = Array.from({ length: n }, () =>
+          Array(n).fill(false),
+        );
+        const demotedPairs: [number, number][] = [];
+        for (let i = 0; i < n; i++) {
+          for (let j = i + 1; j < n; j++) {
+            const shares = [...group[j].stations].some((s) =>
+              group[i].stations.has(s),
+            );
+            if (!shares) continue;
+            if (partners(group[i], group[j])) {
+              partner[i][j] = partner[j][i] = true;
+            } else {
+              demotedPairs.push([i, j]);
+            }
+          }
+        }
+        // A crossing pair is violated when a fork link stretches a core's
+        // window past the crossing counterpart's casing. The emission ORDER is
+        // itself a degree of freedom: first try relocating the offending fork
+        // partner's casing to just before the counterpart — that satisfies the
+        // layering while keeping the junction merge. (Thameslink's King's
+        // Cross: the main fragment crosses London Bridge–Peckham Rye away from
+        // their shared station, and its Finsbury Park fork partner was emitted
+        // after that counterpart; moving the partner earlier keeps both the
+        // crossing occlusion and the King's Cross channel merge.) Only when a
+        // move repeats — a genuine cycle, like the DLR delta's two crossings
+        // chained through fork links — is the fork link dropped as before: the
+        // sacrificed merge sits within a few px of the shared station, hidden
+        // by the station marker, while the crossing is out in the open. Every
+        // round either performs a never-tried move or removes a link, so this
+        // terminates.
+        const ord = group.map((_, i) => i); // emission slots -> fragment index
+        const slotOf: number[] = new Array(n).fill(0);
+        const tried = new Set<string>();
+        let coreSlot: number[] = [];
+        for (let guard = 0; guard <= n * n + demotedPairs.length * n; guard++) {
+          ord.forEach((f, s) => (slotOf[f] = s));
+          coreSlot = group.map((_, j) => {
+            let last = slotOf[j];
+            for (let k = 0; k < n; k++)
+              if (partner[j][k]) last = Math.max(last, slotOf[k]);
+            return last;
+          });
+          // With a's casing emitted before b's, the crossing pair is strictly
+          // layered iff a's core also lands before b's casing.
+          let va = -1;
+          let vb = -1;
+          for (const [i, j] of demotedPairs) {
+            const [a, b] = slotOf[i] < slotOf[j] ? [i, j] : [j, i];
+            if (coreSlot[a] >= slotOf[b]) {
+              va = a;
+              vb = b;
+              break;
+            }
+          }
+          if (va < 0) break;
+          // The fork partner holding a's core at/after b's casing.
+          let off = -1;
+          for (let k = 0; k < n; k++)
+            if (partner[va][k] && slotOf[k] >= slotOf[vb])
+              if (off < 0 || slotOf[k] > slotOf[off]) off = k;
+          if (off < 0) break;
+          const moveKey = `${off}->${vb}`;
+          if (!tried.has(moveKey)) {
+            tried.add(moveKey);
+            ord.splice(slotOf[off], 1);
+            ord.splice(ord.indexOf(vb), 0, off);
+          } else {
+            partner[va][off] = partner[off][va] = false;
+          }
+        }
+        for (const f of ord) {
+          lineShapes.push(group[f].casing);
+          group.forEach((h, j) => {
+            if (h.core && coreSlot[j] === slotOf[f]) lineShapes.push(h.core);
+          });
+        }
+        group = [];
+      };
+      for (const line of lines) {
+        if (line.id !== prevLineId) {
+          flushGroup();
+          prevLineId = line.id;
+        }
+        const lineId = createShapeId();
+        const ids = line.stationIds
+          .map((sid) => shapeIdFor.get(sid))
+          .filter((id): id is TLShapeId => !!id);
+        const centres = line.stationIds
+          .map((sid) => centreFor.get(sid))
+          .filter((c): c is Pt => !!c);
+        // Mount starts in editable mode → octilinear connectors.
+        const poly = octilinearPoints(centres);
+        const path = pathFromPoints(poly);
+        // Stash the projected OSM track curve (settle) + per-pair segments (morph).
+        if (line.geoPoints.length >= 2) {
+          lineGeo.current.set(
+            lineId,
+            line.geoPoints.map(([x, y]) => ({ x, y })),
+          );
+        }
+        // Gate both maps on the same alignment check: the geo train path reads
+        // lineSegGeo by pair index and the morph path reads segProfilesRef, so a
+        // count mismatch must disable both together (else they'd draw different
+        // geometry). All current lines satisfy this; warn if a rebuild breaks it.
+        if (line.geoSegments.length === line.stationIds.length - 1) {
+          const segs = line.geoSegments.map((seg) =>
+            seg ? seg.map(([x, y]) => ({ x, y })) : null,
+          );
+          lineSegGeo.current.set(lineId, segs);
+          const profiles = buildSegProfiles(segs);
+          segProfilesRef.current.set(lineId, profiles.full);
+          segProfilesCoarseRef.current.set(lineId, profiles.coarse);
+          segProfilesCoarserRef.current.set(lineId, profiles.coarser);
+        } else if (
+          line.geoSegments.length &&
+          process.env.NODE_ENV !== "production"
+        ) {
+          console.warn(
+            `[tube] ${line.id}: geoSegments ${line.geoSegments.length} != stationIds-1 ${line.stationIds.length - 1}; ignoring geometry`,
+          );
+        }
+        // Register this branch so live trains can resolve onto its segments.
+        branchStationIdsRef.current.set(lineId, line.stationIds);
+        const branches = branchesForLineRef.current.get(line.id);
+        const branch = makeBranch(lineId, line.stationIds);
+        if (branches) branches.push(branch);
+        else branchesForLineRef.current.set(line.id, [branch]);
+        lineColorRef.current.set(line.id, line.color);
+        const hollow = isHollowLine(line.id);
+        const casing: TubeLineInit = {
+          id: lineId,
+          type: "tube-line" as const,
+          x: path.x,
+          y: path.y,
+          isLocked: true,
+          props: {
+            w: path.w,
+            h: path.h,
+            color: line.color,
+            d: path.d,
+            hollow,
+            core: false,
+            dashed: isNationalRailLine(line.id),
+            lineId: line.id,
+            stationIds: ids,
+          },
+        };
+        let core: TubeLineInit | null = null;
+        if (hollow) {
+          const coreId = createShapeId();
+          coreIdForRef.current.set(lineId, coreId);
+          core = {
+            ...casing,
+            id: coreId,
+            props: { ...casing.props, core: true },
+          };
+        }
+        group.push({ casing, core, stations: new Set(ids), poly });
+      }
+      flushGroup();
+
+      // The initial network build is not an undoable user action — without
+      // this, Cmd+Z on a fresh load would try to unwind the whole map.
+      editor.run(
+        () => {
+          editor.createShapes<TubeLineShape | StationShape>([
+            ...lineShapes,
+            ...stationShapes,
+          ]);
+        },
+        { history: "ignore" },
+      );
+      recomputeLabelDeclutter(editor);
+
+      // Stations are draggable but otherwise immutable. hideUi keeps tldraw's
+      // keyboard shortcuts and clipboard events mounted, so delete / cut /
+      // paste / duplicate (and alt-drag cloning) all reach the editor — each
+      // is vetoed once at its deepest chokepoint rather than per entry point.
+      //
+      // Deleting (⌫, cut, the eraser tool): cancelled in the store, which
+      // covers every route including undo/redo diffs.
+      editor.sideEffects.registerBeforeDeleteHandler("shape", (shape) =>
+        shape.type === "station" ? false : undefined,
+      );
+      // Any other change to a station may only MOVE it: x/y (and rotation,
+      // which onRotate pins to 0) pass through, everything else — props, lock,
+      // opacity, z-order, meta — is pinned. A reparent (grouping) is vetoed
+      // outright: its x/y are parent-local, so letting them through would
+      // teleport the marker.
+      editor.sideEffects.registerBeforeChangeHandler("shape", (prev, next) => {
+        if (next.type !== "station") return next;
+        if (
+          prev.props === next.props &&
+          prev.parentId === next.parentId &&
+          prev.isLocked === next.isLocked &&
+          prev.opacity === next.opacity &&
+          prev.index === next.index &&
+          prev.meta === next.meta
+        ) {
+          return next; // pure move — the hot path (drags, the mode morph)
+        }
+        if (prev.type !== "station" || prev.parentId !== next.parentId) {
+          return prev;
+        }
+        return {
+          ...next,
+          props: prev.props,
+          isLocked: prev.isLocked,
+          opacity: prev.opacity,
+          index: prev.index,
+          meta: prev.meta,
+        };
+      });
+      // Creating station copies: duplicate (Cmd+D) and alt-drag cloning ask
+      // canCreateShapes first and bail cleanly when refused (alt-drag falls
+      // back to a plain move); paste funnels through putContentOntoCurrentPage,
+      // where stations are stripped from the content. Grouping would strand an
+      // empty group shape (its reparent is vetoed above), so refuse it too.
+      // Trains and lines are unaffected — every check is station-specific.
+      const isStation = (s: TLShapeId | { type: string }) =>
+        (typeof s === "string" ? editor.getShape(s)?.type : s.type) ===
+        "station";
+      const origCanCreate = editor.canCreateShapes.bind(editor);
+      editor.canCreateShapes = (shapes) =>
+        origCanCreate(shapes) && !shapes.some(isStation);
+      const stnEditor = editor as unknown as {
+        putContentOntoCurrentPage(
+          content: { shapes: { type: string }[] },
+          options?: object,
+        ): Editor;
+        groupShapes(
+          shapes: (TLShapeId | { type: string })[],
+          opts?: object,
+        ): Editor;
+      };
+      const origPutContent = stnEditor.putContentOntoCurrentPage.bind(editor);
+      stnEditor.putContentOntoCurrentPage = (content, options) => {
+        const shapes = content.shapes.filter((s) => s.type !== "station");
+        if (shapes.length === 0) return editor;
+        return origPutContent(
+          shapes.length === content.shapes.length
+            ? content
+            : { ...content, shapes },
+          options,
+        );
+      };
+      const origGroup = stnEditor.groupShapes.bind(editor);
+      stnEditor.groupShapes = (shapes, opts) =>
+        shapes.some(isStation) ? editor : origGroup(shapes, opts);
+
+      // Selection-gesture modifiers: rotation snaps to 45° increments by
+      // default and resizing keeps the aspect ratio by default; holding Shift
+      // inverts either (freeform rotate / free-stretch resize). tldraw
+      // hard-codes the opposite convention (shift = snap to 15° / lock aspect)
+      // with no public hook, so two narrow patches:
+      //  - the select tool's Rotating state gets its angle computation replaced
+      //    (same contract as the original — see Rotating.ts — minus its 15°
+      //    shift-snap, plus a 45° default snap);
+      //  - inputs.getShiftKey() reports inverted while the resize session is
+      //    active, feeding its `shiftKey || !canShapesDeform` aspect-lock. The
+      //    only other getShiftKey consumer during a resize is the shift-release
+      //    grace-timeout in Editor.dispatch, where a stale read is harmless.
+      const rotating = editor.getStateDescendant(
+        "select.rotating",
+      ) as unknown as
+        | {
+            snapshot: {
+              initialCursorAngle: number;
+              initialShapesRotation: number;
+              initialPageCenter: { angle(p: unknown): number };
+            };
+            _getRotationFromPointerPosition(opts: {
+              snapToNearestDegree: boolean;
+            }): number;
+          }
+        | undefined;
+      if (rotating) {
+        const SEG = Math.PI / 4;
+        rotating._getRotationFromPointerPosition = function () {
+          const {
+            initialCursorAngle,
+            initialShapesRotation,
+            initialPageCenter,
+          } = this.snapshot;
+          const delta =
+            initialPageCenter.angle(editor.inputs.getCurrentPagePoint()) -
+            initialCursorAngle;
+          let rot = initialShapesRotation + delta;
+          if (!editor.inputs.getShiftKey()) rot = Math.round(rot / SEG) * SEG;
+          return rot - initialShapesRotation;
         };
       }
-      group.push({ casing, core, stations: new Set(ids), poly });
-    }
-    flushGroup();
+      const inputs = editor.inputs as unknown as { getShiftKey(): boolean };
+      const realGetShiftKey = inputs.getShiftKey.bind(editor.inputs);
+      inputs.getShiftKey = () =>
+        editor.isIn("select.resizing") ? !realGetShiftKey() : realGetShiftKey();
 
-    // The initial network build is not an undoable user action — without
-    // this, Cmd+Z on a fresh load would try to unwind the whole map.
-    editor.run(
-      () => {
-        editor.createShapes<TubeLineShape | StationShape>([
-          ...lineShapes,
-          ...stationShapes,
-        ]);
-      },
-      { history: "ignore" },
-    );
-    recomputeLabelDeclutter(editor);
+      // Snapping: a dragged station snaps when its centre comes IN LINE with
+      // another station's centre (stations expose only their centre as snap
+      // geometry — StationShapeUtil) or at equal SPACING between stations (gap
+      // snapping; markers share one size, so equal bound gaps = equal centre
+      // spacing). Lines and trains opt out entirely (canSnap false), so both
+      // kinds of snap only ever reference stations. Snap mode is ON by default
+      // (hold Cmd/Ctrl to drag free — tldraw only snaps while the modifier is
+      // down otherwise).
+      editor.user.updateUserPreferences({ isSnapMode: true });
 
-    // Stations are draggable but otherwise immutable. hideUi keeps tldraw's
-    // keyboard shortcuts and clipboard events mounted, so delete / cut /
-    // paste / duplicate (and alt-drag cloning) all reach the editor — each
-    // is vetoed once at its deepest chokepoint rather than per entry point.
-    //
-    // Deleting (⌫, cut, the eraser tool): cancelled in the store, which
-    // covers every route including undo/redo diffs.
-    editor.sideEffects.registerBeforeDeleteHandler("shape", (shape) =>
-      shape.type === "station" ? false : undefined,
-    );
-    // Any other change to a station may only MOVE it: x/y (and rotation,
-    // which onRotate pins to 0) pass through, everything else — props, lock,
-    // opacity, z-order, meta — is pinned. A reparent (grouping) is vetoed
-    // outright: its x/y are parent-local, so letting them through would
-    // teleport the marker.
-    editor.sideEffects.registerBeforeChangeHandler("shape", (prev, next) => {
-      if (next.type !== "station") return next;
-      if (
-        prev.props === next.props &&
-        prev.parentId === next.parentId &&
-        prev.isLocked === next.isLocked &&
-        prev.opacity === next.opacity &&
-        prev.index === next.index &&
-        prev.meta === next.meta
-      ) {
-        return next; // pure move — the hot path (drags, the mode morph)
-      }
-      if (prev.type !== "station" || prev.parentId !== next.parentId) {
-        return prev;
-      }
-      return {
-        ...next,
-        props: prev.props,
-        isLocked: prev.isLocked,
-        opacity: prev.opacity,
-        index: prev.index,
-        meta: prev.meta,
+      // Camera constraints: the viewport can never lose the map — at least
+      // ~130 screen px of it stays visible however far you pan or zoom
+      // ('outside' behaviour + padding). The constrained region is the LIVE
+      // content bounds, re-measured whenever a station moves, so dragging a
+      // node outward grows the roaming range with it (edge-scrolling a
+      // selection to the viewport edge keeps panning as the frontier recedes)
+      // instead of dead-ending at a fixed border. tldraw's 'outside' clamp
+      // drops bounds.x/y — the region is effectively anchored at the page
+      // origin — so the true origin lives in camRegion and the clamp is
+      // conjugated through it: shift into region-local space, clamp, shift
+      // back. (Translation-invariant, so the zoom handling is unaffected.)
+      const camRegion = { x: 0, y: 0 };
+      const camEditor = editor as unknown as {
+        getConstrainedCamera(
+          point: { x: number; y: number; z?: number },
+          opts?: { force?: boolean; reset?: boolean },
+        ): { x: number; y: number; z: number };
       };
-    });
-    // Creating station copies: duplicate (Cmd+D) and alt-drag cloning ask
-    // canCreateShapes first and bail cleanly when refused (alt-drag falls
-    // back to a plain move); paste funnels through putContentOntoCurrentPage,
-    // where stations are stripped from the content. Grouping would strand an
-    // empty group shape (its reparent is vetoed above), so refuse it too.
-    // Trains and lines are unaffected — every check is station-specific.
-    const isStation = (s: TLShapeId | { type: string }) =>
-      (typeof s === "string" ? editor.getShape(s)?.type : s.type) === "station";
-    const origCanCreate = editor.canCreateShapes.bind(editor);
-    editor.canCreateShapes = (shapes) =>
-      origCanCreate(shapes) && !shapes.some(isStation);
-    const stnEditor = editor as unknown as {
-      putContentOntoCurrentPage(
-        content: { shapes: { type: string }[] },
-        options?: object,
-      ): Editor;
-      groupShapes(
-        shapes: (TLShapeId | { type: string })[],
-        opts?: object,
-      ): Editor;
-    };
-    const origPutContent = stnEditor.putContentOntoCurrentPage.bind(editor);
-    stnEditor.putContentOntoCurrentPage = (content, options) => {
-      const shapes = content.shapes.filter((s) => s.type !== "station");
-      if (shapes.length === 0) return editor;
-      return origPutContent(
-        shapes.length === content.shapes.length
-          ? content
-          : { ...content, shapes },
-        options,
-      );
-    };
-    const origGroup = stnEditor.groupShapes.bind(editor);
-    stnEditor.groupShapes = (shapes, opts) =>
-      shapes.some(isStation) ? editor : origGroup(shapes, opts);
-
-    // Selection-gesture modifiers: rotation snaps to 45° increments by
-    // default and resizing keeps the aspect ratio by default; holding Shift
-    // inverts either (freeform rotate / free-stretch resize). tldraw
-    // hard-codes the opposite convention (shift = snap to 15° / lock aspect)
-    // with no public hook, so two narrow patches:
-    //  - the select tool's Rotating state gets its angle computation replaced
-    //    (same contract as the original — see Rotating.ts — minus its 15°
-    //    shift-snap, plus a 45° default snap);
-    //  - inputs.getShiftKey() reports inverted while the resize session is
-    //    active, feeding its `shiftKey || !canShapesDeform` aspect-lock. The
-    //    only other getShiftKey consumer during a resize is the shift-release
-    //    grace-timeout in Editor.dispatch, where a stale read is harmless.
-    const rotating = editor.getStateDescendant("select.rotating") as unknown as
-      | {
-          snapshot: {
-            initialCursorAngle: number;
-            initialShapesRotation: number;
-            initialPageCenter: { angle(p: unknown): number };
-          };
-          _getRotationFromPointerPosition(opts: {
-            snapToNearestDegree: boolean;
-          }): number;
-        }
-      | undefined;
-    if (rotating) {
-      const SEG = Math.PI / 4;
-      rotating._getRotationFromPointerPosition = function () {
-        const { initialCursorAngle, initialShapesRotation, initialPageCenter } =
-          this.snapshot;
-        const delta =
-          initialPageCenter.angle(editor.inputs.getCurrentPagePoint()) -
-          initialCursorAngle;
-        let rot = initialShapesRotation + delta;
-        if (!editor.inputs.getShiftKey()) rot = Math.round(rot / SEG) * SEG;
-        return rot - initialShapesRotation;
-      };
-    }
-    const inputs = editor.inputs as unknown as { getShiftKey(): boolean };
-    const realGetShiftKey = inputs.getShiftKey.bind(editor.inputs);
-    inputs.getShiftKey = () =>
-      editor.isIn("select.resizing") ? !realGetShiftKey() : realGetShiftKey();
-
-    // Snapping: a dragged station snaps when its centre comes IN LINE with
-    // another station's centre (stations expose only their centre as snap
-    // geometry — StationShapeUtil) or at equal SPACING between stations (gap
-    // snapping; markers share one size, so equal bound gaps = equal centre
-    // spacing). Lines and trains opt out entirely (canSnap false), so both
-    // kinds of snap only ever reference stations. Snap mode is ON by default
-    // (hold Cmd/Ctrl to drag free — tldraw only snaps while the modifier is
-    // down otherwise).
-    editor.user.updateUserPreferences({ isSnapMode: true });
-
-    // Camera constraints: the viewport can never lose the map — at least
-    // ~130 screen px of it stays visible however far you pan or zoom
-    // ('outside' behaviour + padding). The constrained region is the LIVE
-    // content bounds, re-measured whenever a station moves, so dragging a
-    // node outward grows the roaming range with it (edge-scrolling a
-    // selection to the viewport edge keeps panning as the frontier recedes)
-    // instead of dead-ending at a fixed border. tldraw's 'outside' clamp
-    // drops bounds.x/y — the region is effectively anchored at the page
-    // origin — so the true origin lives in camRegion and the clamp is
-    // conjugated through it: shift into region-local space, clamp, shift
-    // back. (Translation-invariant, so the zoom handling is unaffected.)
-    const camRegion = { x: 0, y: 0 };
-    const camEditor = editor as unknown as {
-      getConstrainedCamera(
-        point: { x: number; y: number; z?: number },
-        opts?: { force?: boolean; reset?: boolean },
-      ): { x: number; y: number; z: number };
-    };
-    const origConstrainCam = camEditor.getConstrainedCamera.bind(editor);
-    camEditor.getConstrainedCamera = (point, opts) => {
-      let { x, y, z } = point;
-      // Zoom stops are applied HERE, before the region shift. When the
-      // requested z is past a zoom limit, tldraw's stop IGNORES the passed
-      // point and re-derives x/y from the live camera — a page-space value,
-      // so the -camRegion unshift below would subtract an offset that was
-      // never added, walking the camera by -camRegion on every blocked
-      // wheel tick (the map crept diagonally when zooming past min/max).
-      // Pre-stopped the same way upstream does it — z halts, the viewport
-      // centre stays put — the original only ever sees in-range z and maps
-      // point -> point, which the shift/unshift conjugates exactly.
-      if (!opts?.force && z !== undefined) {
-        const cam = editor.getCamera();
-        const steps = editor.getCameraOptions().zoomSteps;
-        const base = editor.getBaseZoom();
-        const minZ = steps[0] * base;
-        const maxZ = steps[steps.length - 1] * base;
-        if (z < minZ || z > maxZ) {
-          const vsb = editor.getViewportScreenBounds();
-          z = Math.min(Math.max(z, minZ), maxZ);
-          x = cam.x + vsb.w / 2 / z - vsb.w / 2 / cam.z;
-          y = cam.y + vsb.h / 2 / z - vsb.h / 2 / cam.z;
-        }
-      }
-      const local = origConstrainCam(
-        { ...point, x: x + camRegion.x, y: y + camRegion.y, z },
-        opts,
-      );
-      return { ...local, x: local.x - camRegion.x, y: local.y - camRegion.y };
-    };
-    const updateCameraConstraints = () => {
-      const b = editor.getCurrentPageBounds();
-      if (!b || b.w < 1 || b.h < 1) return;
-      const prev = editor.getCameraOptions().constraints;
-      if (
-        prev &&
-        Math.abs(camRegion.x - b.x) < 1 &&
-        Math.abs(camRegion.y - b.y) < 1 &&
-        Math.abs(prev.bounds.w - b.w) < 1 &&
-        Math.abs(prev.bounds.h - b.h) < 1
-      ) {
-        return; // unchanged — skip the options churn
-      }
-      camRegion.x = b.x;
-      camRegion.y = b.y;
-      editor.setCameraOptions({
-        constraints: {
-          bounds: { x: 0, y: 0, w: b.w, h: b.h },
-          padding: { x: 128, y: 128 },
-          origin: { x: 0.5, y: 0.5 },
-          initialZoom: "fit-max",
-          baseZoom: "default",
-          behavior: "outside",
-        },
-      });
-    };
-    updateCameraConstraintsRef.current = updateCameraConstraints;
-
-    // Multi-selection drags: tldraw snaps the selection BOX — point snaps use
-    // its corners+centre and gap snaps its borders — rather than the shapes
-    // inside it. No hook exists, so wrap snapTranslateShapes: substitute the
-    // selected stations' initial marker centres as the dragged snap points
-    // (every member then snaps in line against the stations outside the
-    // selection, like a lone drag), and suppress gap snapping for the call —
-    // its box-border semantics is exactly the reported confusion, and
-    // equal-spacing against a whole moving group has no member-wise meaning.
-    // Mixed/single selections keep the default behaviour.
-    {
-      const sb = editor.snaps.shapeBounds;
-      const origSnapTranslate = sb.snapTranslateShapes.bind(sb);
-      type TranslateArgs = Parameters<typeof sb.snapTranslateShapes>[0];
-      const gapless = sb as unknown as {
-        getVisibleGaps?: () => { horizontal: never[]; vertical: never[] };
-      };
-      sb.snapTranslateShapes = (args: TranslateArgs) => {
-        const translating = editor.getStateDescendant(
-          "select.translating",
-        ) as unknown as
-          | {
-              snapshot?: {
-                shapeSnapshots?: {
-                  shape: { type: string; props: { w: number; h: number } };
-                  pagePoint: { x: number; y: number };
-                }[];
-              };
-            }
-          | undefined;
-        const snaps = translating?.snapshot?.shapeSnapshots;
-        if (
-          !snaps ||
-          snaps.length < 2 ||
-          !snaps.every((s) => s.shape.type === "station")
-        ) {
-          return origSnapTranslate(args);
-        }
-        gapless.getVisibleGaps = () => ({ horizontal: [], vertical: [] });
-        try {
-          return origSnapTranslate({
-            ...args,
-            initialSelectionSnapPoints: snaps.map((s, i) => ({
-              id: `selection:${i}`,
-              x: s.pagePoint.x + s.shape.props.w / 2,
-              y: s.pagePoint.y + s.shape.props.h / 2,
-            })),
-          });
-        } finally {
-          // Remove the instance shadow so the prototype's computed gap
-          // discovery resumes for single-station drags.
-          delete gapless.getVisibleGaps;
-        }
-      };
-    }
-
-    // Reactive lines: when a station is dragged, redraw the lines through it —
-    // and re-pose the trains on those lines in the SAME batch, so they stay
-    // glued to the moving geometry instead of catching up at the ambient tick.
-    // Skipped while animating — the tween redraws lines (and trains) itself.
-    editor.sideEffects.registerAfterChangeHandler("shape", (prev, next) => {
-      if (animating.current) return;
-      if (next.type !== "station") return;
-      if (prev.x === next.x && prev.y === next.y) return;
-      editor.run(
-        () => {
-          const affected = new Set<string>();
-          const acc: ShapePartial[] = [];
-          for (const shape of editor.getCurrentPageShapes()) {
-            if (shape.type !== "tube-line" || shape.props.core) continue;
-            const ids = shape.props.stationIds as TLShapeId[];
-            // Dragging only happens in editable mode → octilinear connectors.
-            if (ids.includes(next.id)) {
-              buildLinePartials(
-                acc,
-                editor,
-                shape,
-                null,
-                true,
-                coreIdForRef.current.get(shape.id),
-              );
-              affected.add(shape.id);
-            }
+      const origConstrainCam = camEditor.getConstrainedCamera.bind(editor);
+      camEditor.getConstrainedCamera = (point, opts) => {
+        let { x, y, z } = point;
+        // Zoom stops are applied HERE, before the region shift. When the
+        // requested z is past a zoom limit, tldraw's stop IGNORES the passed
+        // point and re-derives x/y from the live camera — a page-space value,
+        // so the -camRegion unshift below would subtract an offset that was
+        // never added, walking the camera by -camRegion on every blocked
+        // wheel tick (the map crept diagonally when zooming past min/max).
+        // Pre-stopped the same way upstream does it — z halts, the viewport
+        // centre stays put — the original only ever sees in-range z and maps
+        // point -> point, which the shift/unshift conjugates exactly.
+        if (!opts?.force && z !== undefined) {
+          const cam = editor.getCamera();
+          const steps = editor.getCameraOptions().zoomSteps;
+          const base = editor.getBaseZoom();
+          const minZ = steps[0] * base;
+          const maxZ = steps[steps.length - 1] * base;
+          if (z < minZ || z > maxZ) {
+            const vsb = editor.getViewportScreenBounds();
+            z = Math.min(Math.max(z, minZ), maxZ);
+            x = cam.x + vsb.w / 2 / z - vsb.w / 2 / cam.z;
+            y = cam.y + vsb.h / 2 / z - vsb.h / 2 / cam.z;
           }
-          if (acc.length) editor.updateShapes(acc);
-          geomGenRef.current++; // line geometry moved — dwell headings stale
-          if (affected.size) positionTrains(affected);
-          // Station moved -> label overlaps may change, and the camera-
-          // constraint region moves with the content (getCurrentPageBounds is
-          // invalidated by EVERY shape change — trains tick at 10Hz — so each
-          // call re-folds ~1,500 shape bounds; per pointer-move was pure
-          // waste). Both are throttled together (leading edge keeps the
-          // edge-scroll frontier growing mid-drag) with a trailing debounce
-          // so the drag's FINAL position always gets a recompute. They run
-          // AFTER the line redraw above, so an inward move sees the shrunk
-          // lines too, not their stale extent.
-          const t = performance.now();
-          if (t - lastDeclutter.current > 150) {
-            lastDeclutter.current = t;
-            recomputeLabelDeclutter(editor);
-            updateCameraConstraints();
-          } else {
-            if (declutterTimer.current !== null)
-              clearTimeout(declutterTimer.current);
-            declutterTimer.current = setTimeout(() => {
-              declutterTimer.current = null;
-              lastDeclutter.current = performance.now();
+        }
+        const local = origConstrainCam(
+          { ...point, x: x + camRegion.x, y: y + camRegion.y, z },
+          opts,
+        );
+        return { ...local, x: local.x - camRegion.x, y: local.y - camRegion.y };
+      };
+      const updateCameraConstraints = () => {
+        const b = editor.getCurrentPageBounds();
+        if (!b || b.w < 1 || b.h < 1) return;
+        const prev = editor.getCameraOptions().constraints;
+        if (
+          prev &&
+          Math.abs(camRegion.x - b.x) < 1 &&
+          Math.abs(camRegion.y - b.y) < 1 &&
+          Math.abs(prev.bounds.w - b.w) < 1 &&
+          Math.abs(prev.bounds.h - b.h) < 1
+        ) {
+          return; // unchanged — skip the options churn
+        }
+        camRegion.x = b.x;
+        camRegion.y = b.y;
+        editor.setCameraOptions({
+          constraints: {
+            bounds: { x: 0, y: 0, w: b.w, h: b.h },
+            padding: { x: 128, y: 128 },
+            origin: { x: 0.5, y: 0.5 },
+            initialZoom: "fit-max",
+            baseZoom: "default",
+            behavior: "outside",
+          },
+        });
+      };
+      updateCameraConstraintsRef.current = updateCameraConstraints;
+
+      // Multi-selection drags: tldraw snaps the selection BOX — point snaps use
+      // its corners+centre and gap snaps its borders — rather than the shapes
+      // inside it. No hook exists, so wrap snapTranslateShapes: substitute the
+      // selected stations' initial marker centres as the dragged snap points
+      // (every member then snaps in line against the stations outside the
+      // selection, like a lone drag), and suppress gap snapping for the call —
+      // its box-border semantics is exactly the reported confusion, and
+      // equal-spacing against a whole moving group has no member-wise meaning.
+      // Mixed/single selections keep the default behaviour.
+      {
+        const sb = editor.snaps.shapeBounds;
+        const origSnapTranslate = sb.snapTranslateShapes.bind(sb);
+        type TranslateArgs = Parameters<typeof sb.snapTranslateShapes>[0];
+        const gapless = sb as unknown as {
+          getVisibleGaps?: () => { horizontal: never[]; vertical: never[] };
+        };
+        sb.snapTranslateShapes = (args: TranslateArgs) => {
+          const translating = editor.getStateDescendant(
+            "select.translating",
+          ) as unknown as
+            | {
+                snapshot?: {
+                  shapeSnapshots?: {
+                    shape: { type: string; props: { w: number; h: number } };
+                    pagePoint: { x: number; y: number };
+                  }[];
+                };
+              }
+            | undefined;
+          const snaps = translating?.snapshot?.shapeSnapshots;
+          if (
+            !snaps ||
+            snaps.length < 2 ||
+            !snaps.every((s) => s.shape.type === "station")
+          ) {
+            return origSnapTranslate(args);
+          }
+          gapless.getVisibleGaps = () => ({ horizontal: [], vertical: [] });
+          try {
+            return origSnapTranslate({
+              ...args,
+              initialSelectionSnapPoints: snaps.map((s, i) => ({
+                id: `selection:${i}`,
+                x: s.pagePoint.x + s.shape.props.w / 2,
+                y: s.pagePoint.y + s.shape.props.h / 2,
+              })),
+            });
+          } finally {
+            // Remove the instance shadow so the prototype's computed gap
+            // discovery resumes for single-station drags.
+            delete gapless.getVisibleGaps;
+          }
+        };
+      }
+
+      // Reactive lines: when a station is dragged, redraw the lines through it —
+      // and re-pose the trains on those lines in the SAME batch, so they stay
+      // glued to the moving geometry instead of catching up at the ambient tick.
+      // Skipped while animating — the tween redraws lines (and trains) itself.
+      editor.sideEffects.registerAfterChangeHandler("shape", (prev, next) => {
+        if (animating.current) return;
+        if (next.type !== "station") return;
+        if (prev.x === next.x && prev.y === next.y) return;
+        editor.run(
+          () => {
+            const affected = new Set<string>();
+            const acc: ShapePartial[] = [];
+            for (const shape of editor.getCurrentPageShapes()) {
+              if (shape.type !== "tube-line" || shape.props.core) continue;
+              const ids = shape.props.stationIds as TLShapeId[];
+              // Dragging only happens in editable mode → octilinear connectors.
+              if (ids.includes(next.id)) {
+                buildLinePartials(
+                  acc,
+                  editor,
+                  shape,
+                  null,
+                  true,
+                  coreIdForRef.current.get(shape.id),
+                );
+                affected.add(shape.id);
+              }
+            }
+            if (acc.length) editor.updateShapes(acc);
+            geomGenRef.current++; // line geometry moved — dwell headings stale
+            if (affected.size) positionTrains(affected);
+            // Station moved -> label overlaps may change, and the camera-
+            // constraint region moves with the content (getCurrentPageBounds is
+            // invalidated by EVERY shape change — trains tick at 10Hz — so each
+            // call re-folds ~1,500 shape bounds; per pointer-move was pure
+            // waste). Both are throttled together (leading edge keeps the
+            // edge-scroll frontier growing mid-drag) with a trailing debounce
+            // so the drag's FINAL position always gets a recompute. They run
+            // AFTER the line redraw above, so an inward move sees the shrunk
+            // lines too, not their stale extent.
+            const t = performance.now();
+            if (t - lastDeclutter.current > 150) {
+              lastDeclutter.current = t;
               recomputeLabelDeclutter(editor);
               updateCameraConstraints();
-            }, 180);
-          }
-        },
-        { ignoreShapeLock: true },
-      );
-    });
+            } else {
+              if (declutterTimer.current !== null)
+                clearTimeout(declutterTimer.current);
+              declutterTimer.current = setTimeout(() => {
+                declutterTimer.current = null;
+                lastDeclutter.current = performance.now();
+                recomputeLabelDeclutter(editor);
+                updateCameraConstraints();
+              }, 180);
+            }
+          },
+          { ignoreShapeLock: true },
+        );
+      });
 
-    const fit = () => {
-      const vp = editor.getViewportScreenBounds();
-      if (!vp || vp.w < 1 || vp.h < 1) {
-        requestAnimationFrame(fit);
-        return;
-      }
-      // Shapes exist by now — take the first constraint measurement.
-      updateCameraConstraints();
-      editor.zoomToFit();
-      // A phone fits the whole network into a sliver — start closer in,
-      // centred on the same spot, and let the user pan out for the edges.
-      if (vp.w <= 640) {
-        const cam = editor.getCamera();
-        const z = cam.z * 1.5;
-        const c = editor.getViewportPageBounds().center;
-        editor.setCamera({ x: vp.w / 2 / z - c.x, y: vp.h / 2 / z - c.y, z });
-      }
-    };
-    requestAnimationFrame(fit);
+      const fit = () => {
+        const vp = editor.getViewportScreenBounds();
+        if (!vp || vp.w < 1 || vp.h < 1) {
+          requestAnimationFrame(fit);
+          return;
+        }
+        // Shapes exist by now — take the first constraint measurement.
+        updateCameraConstraints();
+        editor.zoomToFit();
+        // A phone fits the whole network into a sliver — start closer in,
+        // centred on the same spot, and let the user pan out for the edges.
+        if (vp.w <= 640) {
+          const cam = editor.getCamera();
+          const z = cam.z * 1.5;
+          const c = editor.getViewportPageBounds().center;
+          editor.setCamera({ x: vp.w / 2 / z - c.x, y: vp.h / 2 / z - c.y, z });
+        }
+      };
+      requestAnimationFrame(fit);
 
-    editorRef.current = editor;
-  }, [positionTrains]);
+      editorRef.current = editor;
+    },
+    [positionTrains],
+  );
 
   // Animate stations to the target layout (and follow with the lines).
-  const applyMode = useCallback((editor: Editor, geo: boolean) => {
-    if (animFrame.current !== null) cancelAnimationFrame(animFrame.current);
-    if (settleExtras.current !== null) {
-      cancelAnimationFrame(settleExtras.current);
-      settleExtras.current = null;
-    }
-
-    // Allow programmatic moves while animating; lock to view-only in geo mode.
-    editor.updateInstanceState({ isReadonly: false });
-
-    const ids = [...geoPos.current.keys()];
-    const starts = new Map<TLShapeId, Pose>(
-      ids.map((id) => {
-        const s = editor.getShape(id);
-        return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
-      }),
-    );
-    // Leaving editable mode: remember the user's custom layout first.
-    if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
-    const targets = geo ? geoPos.current : customPos.current;
-
-    // Each line's per-pair SegProfiles (along/perp/arc) are precomputed once at
-    // mount (segProfilesRef); the tween re-anchors them to the current chord
-    // between the two live stations, keeping stations on the line.
-    const lineMorph = editor
-      .getCurrentPageShapes()
-      .filter(
-        (s): s is TubeLineShape => s.type === "tube-line" && !s.props.core,
-      )
-      .map((s) => ({
-        id: s.id,
-        coreId: coreIdForRef.current.get(s.id),
-        stationIds: s.props.stationIds as TLShapeId[],
-        // Tween frames blend THINNED profiles (trains and the settle pass
-        // stay full-resolution). Zoomed out, the whole network is in view
-        // and must be computed every frame — but a 3-unit deviation is only
-        // ~0.3 screen px there, so the coarser level carries the load;
-        // zoomed in, detail matters but S5's viewport scoping below means
-        // only the visible few lines are computed at all.
-        segMorph:
-          (editor.getZoomLevel() < TWEEN_COARSE_ZOOM
-            ? segProfilesCoarserRef.current.get(s.id)
-            : segProfilesCoarseRef.current.get(s.id)) ?? [],
-        // Conservative bbox for every mid-tween frame of this line: each
-        // blended point is a lerp of octilinear and curve components, both
-        // bounded by (start-path bbox ∪ end-path bbox) expanded by the
-        // profile's max perpendicular excursion — cheap to test against the
-        // live viewport each frame, so off-screen lines skip geometry AND
-        // writes entirely (positions are absolute; the settle pass trues
-        // everything network-wide).
-        bbox: null as null | { x0: number; y0: number; x1: number; y1: number },
-      }));
-
-    // Only animate stations that actually move (none, in the common no-edit
-    // case) — keeps the whole-network tween cheap.
-    const movingIds = ids.filter((id) => {
-      const s = starts.get(id)!;
-      const g = targets.get(id)!;
-      return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
-    });
-
-    // Tween-pose map: every station's centre, updated in plain JS per frame
-    // (only movingIds entries ever change). The line loop reads it instead of
-    // stationCentre() — those read-backs were ~4,000 getShapePageTransform
-    // calls per morph frame — and it's what makes batching the frame's writes
-    // possible at all: lines drawn AFTER batched station writes would
-    // otherwise see the previous frame's centres.
-    const centres = new Map<TLShapeId, Pt>();
-    for (const id of ids) {
-      const c = stationCentre(editor, id);
-      if (c) centres.set(id, c);
-    }
-    // A station's top-left delta equals its centre delta (fixed marker size),
-    // so per frame each moving centre is startCentre + (target - start) * e —
-    // the same interpolant as the shape write below.
-    const startCentres = new Map<TLShapeId, Pt>();
-    for (const id of movingIds) {
-      const c = centres.get(id);
-      if (c) startCentres.set(id, { x: c.x, y: c.y });
-    }
-
-    // Per-line tween bbox (S5): every blended point is a lerp of an
-    // octilinear component (contained in its endpoints' AABB — the elbow and
-    // its fillet never leave the rectangle) and a curve component (chord
-    // point + perp excursion), with endpoints travelling start→target. So
-    // AABB(all start ∪ target centres) grown by max(|perp|·chord) bounds
-    // every frame of the tween.
-    for (const lm of lineMorph) {
-      let x0 = Infinity;
-      let y0 = Infinity;
-      let x1 = -Infinity;
-      let y1 = -Infinity;
-      let ok = true;
-      const centrePts: Pt[] = [];
-      for (const id of lm.stationIds) {
-        const c = centres.get(id);
-        if (!c) {
-          ok = false;
-          break;
-        }
-        centrePts.push(c);
-        const s = starts.get(id);
-        const g = targets.get(id);
-        const tx = s && g ? c.x + (g.x - s.x) : c.x;
-        const ty = s && g ? c.y + (g.y - s.y) : c.y;
-        if (c.x < x0) x0 = c.x;
-        if (c.x > x1) x1 = c.x;
-        if (c.y < y0) y0 = c.y;
-        if (c.y > y1) y1 = c.y;
-        if (tx < x0) x0 = tx;
-        if (tx > x1) x1 = tx;
-        if (ty < y0) y0 = ty;
-        if (ty > y1) y1 = ty;
+  const applyMode = useCallback(
+    (editor: Editor, geo: boolean) => {
+      if (animFrame.current !== null) cancelAnimationFrame(animFrame.current);
+      if (settleExtras.current !== null) {
+        cancelAnimationFrame(settleExtras.current);
+        settleExtras.current = null;
       }
-      if (!ok) continue; // missing centre — never skip this line
-      let margin = 20; // fillet arcs + rounding slack
-      for (let i = 0; i < centrePts.length - 1; i++) {
-        const prof = lm.segMorph[i];
-        if (!prof) continue;
-        let maxPerp = 0;
-        for (const p of prof.perp) {
-          const a = Math.abs(p);
-          if (a > maxPerp) maxPerp = a;
-        }
-        const chord = Math.hypot(
-          centrePts[i + 1].x - centrePts[i].x,
-          centrePts[i + 1].y - centrePts[i].y,
-        );
-        const exc = maxPerp * chord * 1.1; // stations drift the chord a bit
-        if (exc > margin) margin = exc;
-      }
-      lm.bbox = {
-        x0: x0 - margin,
-        y0: y0 - margin,
-        x1: x1 + margin,
-        y1: y1 + margin,
-      };
-    }
 
-    animating.current = true;
-    let startTs: number | null = null;
+      // Allow programmatic moves while animating; lock to view-only in geo mode.
+      editor.updateInstanceState({ isReadonly: false });
 
-    // Tween frames only: round path points to 2 decimals (≤0.014px error,
-    // invisible) — full-precision floats tripled the d string length, and the
-    // string build + browser path parse are per-frame costs. The settle pass
-    // does NOT round, keeping settled geometry byte-identical to before.
-    const r2 = (v: number) => Math.round(v * 100) / 100;
+      const ids = [...geoPos.current.keys()];
+      const starts = new Map<TLShapeId, Pose>(
+        ids.map((id) => {
+          const s = editor.getShape(id);
+          return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
+        }),
+      );
+      // Leaving editable mode: remember the user's custom layout first.
+      if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
+      const targets = geo ? geoPos.current : customPos.current;
 
-    const tick = (now: number) => {
-      if (startTs === null) startTs = now;
-      const t = Math.min(1, (now - startTs) / ANIM_MS);
-      const e = easeInOutCubic(t);
-      const tickStart = performance.now();
-      // Viewport gate (S5): tween frames only compute and write shapes whose
-      // tween bbox can intersect the (expanded) viewport — off-screen work is
-      // invisible and the settle pass trues the whole network. The FINAL
-      // frame writes everything so no shape is left short of its target.
-      const finalFrame = t >= 1;
-      const vp = editor.getViewportPageBounds();
-      const vpApron = Math.max(vp.w, vp.h) * 0.25;
-      const vx0 = vp.x - vpApron;
-      const vy0 = vp.y - vpApron;
-      const vx1 = vp.x + vp.w + vpApron;
-      const vy1 = vp.y + vp.h + vpApron;
-      // ONE batched write for the whole frame — stations, casings and core
-      // twins together. 365 per-shape updateShape calls cost ~14.5ms/frame in
-      // call overhead alone.
-      const partials: ShapePartial[] = [];
-      for (const id of movingIds) {
+      // Each line's per-pair SegProfiles (along/perp/arc) are precomputed once at
+      // mount (segProfilesRef); the tween re-anchors them to the current chord
+      // between the two live stations, keeping stations on the line.
+      const lineMorph = editor
+        .getCurrentPageShapes()
+        .filter(
+          (s): s is TubeLineShape => s.type === "tube-line" && !s.props.core,
+        )
+        .map((s) => ({
+          id: s.id,
+          coreId: coreIdForRef.current.get(s.id),
+          stationIds: s.props.stationIds as TLShapeId[],
+          // Tween frames blend THINNED profiles (trains and the settle pass
+          // stay full-resolution). Zoomed out, the whole network is in view
+          // and must be computed every frame — but a 3-unit deviation is only
+          // ~0.3 screen px there, so the coarser level carries the load;
+          // zoomed in, detail matters but S5's viewport scoping below means
+          // only the visible few lines are computed at all.
+          segMorph:
+            (editor.getZoomLevel() < TWEEN_COARSE_ZOOM
+              ? segProfilesCoarserRef.current.get(s.id)
+              : segProfilesCoarseRef.current.get(s.id)) ?? [],
+          // Conservative bbox for every mid-tween frame of this line: each
+          // blended point is a lerp of octilinear and curve components, both
+          // bounded by (start-path bbox ∪ end-path bbox) expanded by the
+          // profile's max perpendicular excursion — cheap to test against the
+          // live viewport each frame, so off-screen lines skip geometry AND
+          // writes entirely (positions are absolute; the settle pass trues
+          // everything network-wide).
+          bbox: null as null | {
+            x0: number;
+            y0: number;
+            x1: number;
+            y1: number;
+          },
+        }));
+
+      // Only animate stations that actually move (none, in the common no-edit
+      // case) — keeps the whole-network tween cheap.
+      const movingIds = ids.filter((id) => {
         const s = starts.get(id)!;
         const g = targets.get(id)!;
-        // The centres map must track EVERY moving station each frame (lines
-        // and trains read it) — only the shape WRITE is viewport-gated.
-        const c0 = startCentres.get(id);
-        const c = centres.get(id);
-        if (c0 && c) {
-          c.x = c0.x + (g.x - s.x) * e;
-          c.y = c0.y + (g.y - s.y) * e;
-        }
-        if (!finalFrame && c0) {
-          // Whole travel segment (start→target centre) off the expanded
-          // viewport → the write is invisible this frame.
-          const lox = Math.min(c0.x, c0.x + (g.x - s.x));
-          const hix = Math.max(c0.x, c0.x + (g.x - s.x));
-          const loy = Math.min(c0.y, c0.y + (g.y - s.y));
-          const hiy = Math.max(c0.y, c0.y + (g.y - s.y));
-          if (hix < vx0 || lox > vx1 || hiy < vy0 || loy > vy1) continue;
-        }
-        partials.push({
-          id,
-          type: "station",
-          x: s.x + (g.x - s.x) * e,
-          y: s.y + (g.y - s.y) * e,
-        });
+        return Math.abs(s.x - g.x) > 0.5 || Math.abs(s.y - g.y) > 0.5;
+      });
+
+      // Tween-pose map: every station's centre, updated in plain JS per frame
+      // (only movingIds entries ever change). The line loop reads it instead of
+      // stationCentre() — those read-backs were ~4,000 getShapePageTransform
+      // calls per morph frame — and it's what makes batching the frame's writes
+      // possible at all: lines drawn AFTER batched station writes would
+      // otherwise see the previous frame's centres.
+      const centres = new Map<TLShapeId, Pt>();
+      for (const id of ids) {
+        const c = stationCentre(editor, id);
+        if (c) centres.set(id, c);
       }
-      // Draw each line by blending every station-pair segment between its
-      // octilinear editable shape (morphFrac 0) and its OSM curve
-      // (morphFrac 1), anchored to the two CURRENT station centres. Because
-      // every segment's endpoints sit exactly on a station centre, the
-      // stations never detach from the line during the tween.
-      const morphFrac = geo ? e : 1 - e;
-      morphFracRef.current = morphFrac; // trains follow the same blend
-      morphCentresRef.current = centres; // ...and read the same centres
+      // A station's top-left delta equals its centre delta (fixed marker size),
+      // so per frame each moving centre is startCentre + (target - start) * e —
+      // the same interpolant as the shape write below.
+      const startCentres = new Map<TLShapeId, Pt>();
+      for (const id of movingIds) {
+        const c = centres.get(id);
+        if (c) startCentres.set(id, { x: c.x, y: c.y });
+      }
+
+      // Per-line tween bbox (S5): every blended point is a lerp of an
+      // octilinear component (contained in its endpoints' AABB — the elbow and
+      // its fillet never leave the rectangle) and a curve component (chord
+      // point + perp excursion), with endpoints travelling start→target. So
+      // AABB(all start ∪ target centres) grown by max(|perp|·chord) bounds
+      // every frame of the tween.
       for (const lm of lineMorph) {
-        // The settle branch below redraws every line at full resolution in
-        // this very callback — a coarse final-frame pass would be duplicate.
-        if (finalFrame) break;
-        if (
-          !finalFrame &&
-          lm.bbox &&
-          (lm.bbox.x1 < vx0 ||
-            lm.bbox.x0 > vx1 ||
-            lm.bbox.y1 < vy0 ||
-            lm.bbox.y0 > vy1)
-        ) {
-          continue; // whole tween stays off-screen — settle trues it
-        }
-        const lmCentres: Pt[] = [];
+        let x0 = Infinity;
+        let y0 = Infinity;
+        let x1 = -Infinity;
+        let y1 = -Infinity;
+        let ok = true;
+        const centrePts: Pt[] = [];
         for (const id of lm.stationIds) {
           const c = centres.get(id);
-          if (c) lmCentres.push(c);
-        }
-        if (lmCentres.length < 2) continue;
-        let pts: Pt[];
-        if (lmCentres.length === lm.stationIds.length) {
-          pts = [];
-          for (let i = 0; i < lmCentres.length - 1; i++) {
-            const segPts = morphSegmentPoints(
-              lmCentres[i],
-              lmCentres[i + 1],
-              lm.segMorph[i] ?? null,
-              morphFrac,
-            );
-            for (let k = 0; k < segPts.length; k++) {
-              // Drop each segment's first point — it is the previous
-              // segment's shared station endpoint.
-              if (i > 0 && k === 0) continue;
-              const p = segPts[k];
-              p.x = r2(p.x);
-              p.y = r2(p.y);
-              pts.push(p);
-            }
+          if (!c) {
+            ok = false;
+            break;
           }
-        } else {
-          // Some stations missing → octilinear through what we have.
-          pts = octilinearPoints(lmCentres);
+          centrePts.push(c);
+          const s = starts.get(id);
+          const g = targets.get(id);
+          const tx = s && g ? c.x + (g.x - s.x) : c.x;
+          const ty = s && g ? c.y + (g.y - s.y) : c.y;
+          if (c.x < x0) x0 = c.x;
+          if (c.x > x1) x1 = c.x;
+          if (c.y < y0) y0 = c.y;
+          if (c.y > y1) y1 = c.y;
+          if (tx < x0) x0 = tx;
+          if (tx > x1) x1 = tx;
+          if (ty < y0) y0 = ty;
+          if (ty > y1) y1 = ty;
         }
-        pushLinePartials(partials, lm.id, pathFromPoints(pts), lm.coreId);
+        if (!ok) continue; // missing centre — never skip this line
+        let margin = 20; // fillet arcs + rounding slack
+        for (let i = 0; i < centrePts.length - 1; i++) {
+          const prof = lm.segMorph[i];
+          if (!prof) continue;
+          let maxPerp = 0;
+          for (const p of prof.perp) {
+            const a = Math.abs(p);
+            if (a > maxPerp) maxPerp = a;
+          }
+          const chord = Math.hypot(
+            centrePts[i + 1].x - centrePts[i].x,
+            centrePts[i + 1].y - centrePts[i].y,
+          );
+          const exc = maxPerp * chord * 1.1; // stations drift the chord a bit
+          if (exc > margin) margin = exc;
+        }
+        lm.bbox = {
+          x0: x0 - margin,
+          y0: y0 - margin,
+          x1: x1 + margin,
+          y1: y1 + margin,
+        };
       }
-      editor.run(
-        () => {
-          editor.updateShapes(partials);
-        },
-        { ignoreShapeLock: true },
-      );
-      // Re-pose the visible trains on the freshly drawn morph frame — the
-      // ambient ~10fps tick would let them visibly lag the 60fps line tween.
-      // The tween flavor early-skips off-screen trains and leaves
-      // create/delete to the ambient full pass (which keeps running).
-      positionTrains(undefined, false, true);
-      {
-        const p = debugPerfRef.current;
-        const spent = performance.now() - tickStart;
-        p.morphMs = p.morphMs ? p.morphMs * 0.9 + spent * 0.1 : spent;
-      }
-      if (t < 1) {
-        animFrame.current = requestAnimationFrame(tick);
-      } else {
-        animFrame.current = null;
-        animating.current = false;
-        morphFracRef.current = geo ? 1 : 0;
-        morphCentresRef.current = null; // settled — live centre reads resume
-        geomGenRef.current++; // new layout — dwell headings stale
-        // Settle: geographic snaps lines onto the real OSM track curves;
-        // editable settles onto octilinear connectors.
-        recomputeAllLines(
-          editor,
-          geo ? lineGeo.current : null,
-          !geo,
-          coreIdForRef.current,
+
+      animating.current = true;
+      let startTs: number | null = null;
+
+      // Tween frames only: round path points to 2 decimals (≤0.014px error,
+      // invisible) — full-precision floats tripled the d string length, and the
+      // string build + browser path parse are per-frame costs. The settle pass
+      // does NOT round, keeping settled geometry byte-identical to before.
+      const r2 = (v: number) => Math.round(v * 100) / 100;
+
+      const tick = (now: number) => {
+        if (startTs === null) startTs = now;
+        const t = Math.min(1, (now - startTs) / ANIM_MS);
+        const e = easeInOutCubic(t);
+        const tickStart = performance.now();
+        // Viewport gate (S5): tween frames only compute and write shapes whose
+        // tween bbox can intersect the (expanded) viewport — off-screen work is
+        // invisible and the settle pass trues the whole network. The FINAL
+        // frame writes everything so no shape is left short of its target.
+        const finalFrame = t >= 1;
+        const vp = editor.getViewportPageBounds();
+        const vpApron = Math.max(vp.w, vp.h) * 0.25;
+        const vx0 = vp.x - vpApron;
+        const vy0 = vp.y - vpApron;
+        const vx1 = vp.x + vp.w + vpApron;
+        const vy1 = vp.y + vp.h + vpApron;
+        // ONE batched write for the whole frame — stations, casings and core
+        // twins together. 365 per-shape updateShape calls cost ~14.5ms/frame in
+        // call overhead alone.
+        const partials: ShapePartial[] = [];
+        for (const id of movingIds) {
+          const s = starts.get(id)!;
+          const g = targets.get(id)!;
+          // The centres map must track EVERY moving station each frame (lines
+          // and trains read it) — only the shape WRITE is viewport-gated.
+          const c0 = startCentres.get(id);
+          const c = centres.get(id);
+          if (c0 && c) {
+            c.x = c0.x + (g.x - s.x) * e;
+            c.y = c0.y + (g.y - s.y) * e;
+          }
+          if (!finalFrame && c0) {
+            // Whole travel segment (start→target centre) off the expanded
+            // viewport → the write is invisible this frame.
+            const lox = Math.min(c0.x, c0.x + (g.x - s.x));
+            const hix = Math.max(c0.x, c0.x + (g.x - s.x));
+            const loy = Math.min(c0.y, c0.y + (g.y - s.y));
+            const hiy = Math.max(c0.y, c0.y + (g.y - s.y));
+            if (hix < vx0 || lox > vx1 || hiy < vy0 || loy > vy1) continue;
+          }
+          partials.push({
+            id,
+            type: "station",
+            x: s.x + (g.x - s.x) * e,
+            y: s.y + (g.y - s.y) * e,
+          });
+        }
+        // Draw each line by blending every station-pair segment between its
+        // octilinear editable shape (morphFrac 0) and its OSM curve
+        // (morphFrac 1), anchored to the two CURRENT station centres. Because
+        // every segment's endpoints sit exactly on a station centre, the
+        // stations never detach from the line during the tween.
+        const morphFrac = geo ? e : 1 - e;
+        morphFracRef.current = morphFrac; // trains follow the same blend
+        morphCentresRef.current = centres; // ...and read the same centres
+        for (const lm of lineMorph) {
+          // The settle branch below redraws every line at full resolution in
+          // this very callback — a coarse final-frame pass would be duplicate.
+          if (finalFrame) break;
+          if (
+            !finalFrame &&
+            lm.bbox &&
+            (lm.bbox.x1 < vx0 ||
+              lm.bbox.x0 > vx1 ||
+              lm.bbox.y1 < vy0 ||
+              lm.bbox.y0 > vy1)
+          ) {
+            continue; // whole tween stays off-screen — settle trues it
+          }
+          const lmCentres: Pt[] = [];
+          for (const id of lm.stationIds) {
+            const c = centres.get(id);
+            if (c) lmCentres.push(c);
+          }
+          if (lmCentres.length < 2) continue;
+          let pts: Pt[];
+          if (lmCentres.length === lm.stationIds.length) {
+            pts = [];
+            for (let i = 0; i < lmCentres.length - 1; i++) {
+              const segPts = morphSegmentPoints(
+                lmCentres[i],
+                lmCentres[i + 1],
+                lm.segMorph[i] ?? null,
+                morphFrac,
+              );
+              for (let k = 0; k < segPts.length; k++) {
+                // Drop each segment's first point — it is the previous
+                // segment's shared station endpoint.
+                if (i > 0 && k === 0) continue;
+                const p = segPts[k];
+                p.x = r2(p.x);
+                p.y = r2(p.y);
+                pts.push(p);
+              }
+            }
+          } else {
+            // Some stations missing → octilinear through what we have.
+            pts = octilinearPoints(lmCentres);
+          }
+          pushLinePartials(partials, lm.id, pathFromPoints(pts), lm.coreId);
+        }
+        editor.run(
+          () => {
+            editor.updateShapes(partials);
+          },
+          { ignoreShapeLock: true },
         );
-        editor.updateInstanceState({ isReadonly: geo });
-        positionTrains();
-        // The label declutter (greedy O(n²) over 505 labels) and the camera
-        // constraint re-measure (full page-bounds fold) ran here in the SAME
-        // frame as the settle redraw — a visible ~2x frame spike right at the
-        // morph's end. The settle pixels are already final (F3: the tween at
-        // frac 1/0 reproduces the rest geometry), labels cross-fade over
-        // 150ms and one frame of a stale camera clamp is unobservable, so
-        // both defer to the next frame. Cancelled at the top of applyMode
-        // and guarded on `animating` so a double-toggle mid-morph can't run
-        // stale settle work against the NEW tween.
-        settleExtras.current = requestAnimationFrame(() => {
-          settleExtras.current = null;
-          if (animating.current) return;
-          recomputeLabelDeclutter(editor); // layout changed with the mode
-          // The two layouts span different extents — re-measure the camera
-          // constraints now that the morph has settled.
-          updateCameraConstraintsRef.current?.();
-        });
-      }
-    };
-    animFrame.current = requestAnimationFrame(tick);
-  }, [positionTrains]);
+        // Re-pose the visible trains on the freshly drawn morph frame — the
+        // ambient ~10fps tick would let them visibly lag the 60fps line tween.
+        // The tween flavor early-skips off-screen trains and leaves
+        // create/delete to the ambient full pass (which keeps running).
+        positionTrains(undefined, false, true);
+        {
+          const p = debugPerfRef.current;
+          const spent = performance.now() - tickStart;
+          p.morphMs = p.morphMs ? p.morphMs * 0.9 + spent * 0.1 : spent;
+        }
+        if (t < 1) {
+          animFrame.current = requestAnimationFrame(tick);
+        } else {
+          animFrame.current = null;
+          animating.current = false;
+          morphFracRef.current = geo ? 1 : 0;
+          morphCentresRef.current = null; // settled — live centre reads resume
+          geomGenRef.current++; // new layout — dwell headings stale
+          // Settle: geographic snaps lines onto the real OSM track curves;
+          // editable settles onto octilinear connectors.
+          recomputeAllLines(
+            editor,
+            geo ? lineGeo.current : null,
+            !geo,
+            coreIdForRef.current,
+          );
+          editor.updateInstanceState({ isReadonly: geo });
+          positionTrains();
+          // The label declutter (greedy O(n²) over 505 labels) and the camera
+          // constraint re-measure (full page-bounds fold) ran here in the SAME
+          // frame as the settle redraw — a visible ~2x frame spike right at the
+          // morph's end. The settle pixels are already final (F3: the tween at
+          // frac 1/0 reproduces the rest geometry), labels cross-fade over
+          // 150ms and one frame of a stale camera clamp is unobservable, so
+          // both defer to the next frame. Cancelled at the top of applyMode
+          // and guarded on `animating` so a double-toggle mid-morph can't run
+          // stale settle work against the NEW tween.
+          settleExtras.current = requestAnimationFrame(() => {
+            settleExtras.current = null;
+            if (animating.current) return;
+            recomputeLabelDeclutter(editor); // layout changed with the mode
+            // The two layouts span different extents — re-measure the camera
+            // constraints now that the morph has settled.
+            updateCameraConstraintsRef.current?.();
+          });
+        }
+      };
+      animFrame.current = requestAnimationFrame(tick);
+    },
+    [positionTrains],
+  );
 
   // Animate only on a real mode change — skip the initial mount (and React
   // strict-mode's double-invoke), which would otherwise run a no-op animation.

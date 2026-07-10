@@ -1,0 +1,3 @@
+# Build-pipeline output (scripts/ regenerates it) — formatting it by hand
+# would just churn on the next regeneration.
+lib/tube/network.generated.json

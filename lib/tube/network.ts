@@ -90,7 +90,8 @@ export function getTubeNetwork(): TubeNetwork {
     latMin = Math.min(latMin, lat);
     latMax = Math.max(latMax, lat);
   };
-  for (const l of data.lines) for (const [lon, lat] of l.points) consider(lon, lat);
+  for (const l of data.lines)
+    for (const [lon, lat] of l.points) consider(lon, lat);
   for (const l of data.lines)
     if (l.geoPath) for (const [lon, lat] of l.geoPath) consider(lon, lat);
   for (const s of data.stations) consider(s.lon, s.lat);

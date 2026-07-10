@@ -50,12 +50,12 @@ users share one upstream hit and we stay under the **500 req/min per key** limit
 
 - **Auth:** `app_key` only; `app_id` is gone.
 - **Rate limit:** 500 req/min per key (HTTP 429 over it). The per-response
-  cache TTL is a *separate* number — respect it, don't poll faster.
+  cache TTL is a _separate_ number — respect it, don't poll faster.
 - **Licensing:** TfL's transport-data T&Cs (NOT OGL v3.0). Commercial use is
   allowed; **"Powered by TfL Open Data" attribution is required.**
 - **Deprecations:** mode `tflrail` → use `elizabeth-line`.
 - **No Oyster/contactless balance or journey history via open data** — TfL Go
-  does that through the user's *personal* account login, not any public API.
+  does that through the user's _personal_ account login, not any public API.
 - **The schematic Tube-map layout is NOT in the API** — only geographic
   lat/long. Topological x/y positions come from a community dataset or are
   hand-authored; the official Tube-map artwork is copyrighted.

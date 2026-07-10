@@ -26,8 +26,8 @@ Positions come from TfL's **Arrivals** predictions (per-stop ETAs), refreshed
 every 30s, with local trajectory-following between refreshes so trains move
 continuously — across stations, with platform dwells and eased acceleration.
 
-**Accuracy caveat:** TfL has *no* public train-position API; per-stop arrival
-times are all we get, so the *along-segment* position is a kinematic estimate
+**Accuracy caveat:** TfL has _no_ public train-position API; per-stop arrival
+times are all we get, so the _along-segment_ position is a kinematic estimate
 between two known arrival times. The lateral placement (which line, which
 segment, on the drawn geometry) is exact.
 
@@ -56,6 +56,7 @@ TrainShapeUtil  (components/shapes/TrainShapeUtil.tsx) — a coloured <div>
 ```
 
 Two independent clocks, deliberately decoupled:
+
 - **Data cadence** — a 30s `setInterval` poll rebuilds `trainStore`.
 - **Visual cadence** — a `requestAnimationFrame` loop (throttled to ~10 fps)
   re-poses shapes from the current store.
@@ -112,7 +113,7 @@ clamped to a ≥15s window. Removes the dominant residual warp (~p90 300m).
 
 Runs on a single rAF loop with two cadences: a **full pass** every
 `TRAIN_TICK_MS` (create/delete, off-screen bookkeeping, ~0.5-screen-px gate)
-and a **fine pass on every other frame** that advances *visible* trains with a
+and a **fine pass on every other frame** that advances _visible_ trains with a
 ~0.08-screen-px gate — sub-pixel per-frame motion instead of half-pixel hops
 at 10Hz (that stepping is what reads as "not buttery" once zoomed in). Fine
 passes bail entirely below zoom 0.5, where 10Hz steps are already sub-pixel,
@@ -142,7 +143,7 @@ on top of it):
   top-left). Props never change during motion, so the memoized shape
   component renders once per train — per-frame React re-renders were the
   dominant cost. Updates go through one batched `updateShapes` call.
-- **Perceptual gating** — skip updates under ~0.5 *screen* px
+- **Perceptual gating** — skip updates under ~0.5 _screen_ px
   (zoom-adaptive; invisible by construction) and skip trains off-screen both
   before and after the move (positions are absolute, so they're exact when
   they re-enter view).
@@ -193,7 +194,7 @@ For each record:
      lookup on the projected OSM curve; falls back `pointAlong` → `straightAt`).
    - **editable**: `octiPointAt(cA, cB, fFwd)`.
    - **morphing**: `pointAlong(morphSegmentPoints(cA, cB, profile, morphFrac), fFwd)`.
-   (`fFwd = reversed ? 1−f : f` — segment indices name the forward pair.)
+     (`fFwd = reversed ? 1−f : f` — segment indices name the forward pair.)
 4. **Rotation** = `atan2(tangent)` → `props.rot`, applied as a CSS rotation
    about the div centre (tldraw's shape `rotation` pivots the top-left corner).
 5. **Shape CRUD** inside `editor.run(fn, {ignoreShapeLock:true})`: create
@@ -203,13 +204,13 @@ For each record:
 
 ## 5. File map & refs
 
-| File | Responsibility |
-|---|---|
-| `lib/tube/trains.ts` | Pure derivation + kinematics: `deriveTrains`, `stitchTrains`, `trainPose`, `trainTimeAt`. Unit-testable against recorded arrivals. |
-| `components/TubeMap.tsx` | State + rendering: refs, poll loop, rAF loop, `positionTrains`, geometry helpers, mode-morph. |
-| `components/shapes/TrainShapeUtil.tsx` | The `train` tldraw shape (rectangle, `canCull=false`, CSS-rotated). |
-| `app/api/tfl/[...path]/route.ts` | Server proxy (hides app_key, `revalidate: 30`). |
-| `lib/tube/network.ts` / `scripts/build-tube-data.mjs` | Projected network + `naptanToHub`. |
+| File                                                  | Responsibility                                                                                                                     |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `lib/tube/trains.ts`                                  | Pure derivation + kinematics: `deriveTrains`, `stitchTrains`, `trainPose`, `trainTimeAt`. Unit-testable against recorded arrivals. |
+| `components/TubeMap.tsx`                              | State + rendering: refs, poll loop, rAF loop, `positionTrains`, geometry helpers, mode-morph.                                      |
+| `components/shapes/TrainShapeUtil.tsx`                | The `train` tldraw shape (rectangle, `canCull=false`, CSS-rotated).                                                                |
+| `app/api/tfl/[...path]/route.ts`                      | Server proxy (hides app_key, `revalidate: 30`).                                                                                    |
+| `lib/tube/network.ts` / `scripts/build-tube-data.mjs` | Projected network + `naptanToHub`.                                                                                                 |
 
 Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 `branchesForLineRef`, `branchStationIdsRef`, `segProfilesRef`, `lineSegGeo`,
@@ -247,19 +248,19 @@ Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 
 ## 7. Constants / tuning knobs
 
-| Constant | File | Value | Effect |
-|---|---|---|---|
-| `TRAIN_POLL_MS` | TubeMap.tsx | 30000 | data refresh. Don't go lower (TfL TTL + rate limits). |
-| `TRAIN_TICK_MS` | TubeMap.tsx | 100 | full-pass cadence; visible trains also get per-frame fine passes. |
-| `TRAIN_BLEND_MS` | TubeMap.tsx | 1500 | min correction-ease window (auto-widens: `2×|timeOff|`). |
-| `TRAIN_BLEND_MAX_MS` | TubeMap.tsx | 90000 | corrections beyond this jump via the 2D fallback. |
-| `STEP_HORIZON_MS` / `MAX_STEPS` | trains.ts | 180s / 10 | trajectory coverage past fetch. |
-| `DWELL_MS` / `DWELL_MAX_FRAC` | trains.ts | 30s / 0.25 | platform hold (measured median ~44s incl. terminus/sampling inflation). |
-| `MIN_STEP_WINDOW_MS` | trains.ts | 15s | floor for a stitched step-0 window. |
-| `SEG_SPEED_MPS`, `MIN/MAX_SEG_SECONDS`, `LADDER_MAX_SECONDS` | trains.ts | 10, 25/240, 360 | run-time fallback + learning filter. |
-| `SHOWN_LINES` | TubeMap.tsx | `null` | `null` = whole network (~600 trains). |
-| `TWEEN_THIN_TOL_FINE/COARSE`, `TWEEN_COARSE_ZOOM` | TubeMap.tsx | 0.75 / 3 / 0.5 | tween-only line-geometry thinning; the settle pass always draws full resolution. |
-| `DASH_LOD_ZOOM` | TubeLineShapeUtil.tsx | 0.35 | National Rail dash marks render solid white below this zoom. |
+| Constant                                                     | File                  | Value           | Effect                                                                           |
+| ------------------------------------------------------------ | --------------------- | --------------- | -------------------------------------------------------------------------------- |
+| `TRAIN_POLL_MS`                                              | TubeMap.tsx           | 30000           | data refresh. Don't go lower (TfL TTL + rate limits).                            |
+| `TRAIN_TICK_MS`                                              | TubeMap.tsx           | 100             | full-pass cadence; visible trains also get per-frame fine passes.                |
+| `TRAIN_BLEND_MS`                                             | TubeMap.tsx           | 1500            | min correction-ease window (auto-widens: `2×                                     | timeOff | `). |
+| `TRAIN_BLEND_MAX_MS`                                         | TubeMap.tsx           | 90000           | corrections beyond this jump via the 2D fallback.                                |
+| `STEP_HORIZON_MS` / `MAX_STEPS`                              | trains.ts             | 180s / 10       | trajectory coverage past fetch.                                                  |
+| `DWELL_MS` / `DWELL_MAX_FRAC`                                | trains.ts             | 30s / 0.25      | platform hold (measured median ~44s incl. terminus/sampling inflation).          |
+| `MIN_STEP_WINDOW_MS`                                         | trains.ts             | 15s             | floor for a stitched step-0 window.                                              |
+| `SEG_SPEED_MPS`, `MIN/MAX_SEG_SECONDS`, `LADDER_MAX_SECONDS` | trains.ts             | 10, 25/240, 360 | run-time fallback + learning filter.                                             |
+| `SHOWN_LINES`                                                | TubeMap.tsx           | `null`          | `null` = whole network (~600 trains).                                            |
+| `TWEEN_THIN_TOL_FINE/COARSE`, `TWEEN_COARSE_ZOOM`            | TubeMap.tsx           | 0.75 / 3 / 0.5  | tween-only line-geometry thinning; the settle pass always draws full resolution. |
+| `DASH_LOD_ZOOM`                                              | TubeLineShapeUtil.tsx | 0.35            | National Rail dash marks render solid white below this zoom.                     |
 
 **Morph performance budgets** (2026-07-09 pass, ~750 live trains, sync-JS per
 frame): tween frame ≤15ms at z≥0.5 (viewport scoping bites), ≤25ms at fit zoom
