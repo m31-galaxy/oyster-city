@@ -829,6 +829,15 @@ export default function TubeMap() {
     () => false,
   );
   const [geoMode, setGeoMode] = useState(false);
+  // The edit-mode checkbox (octolinear only). Its CHECKED state survives geo
+  // trips — geographic mode hides the checkbox and suspends editing, and
+  // returning to octolinear resumes whatever the box last said.
+  const [editMode, setEditMode] = useState(false);
+  // Whether editing is in EFFECT right now (checkbox on AND octolinear).
+  // Read by the select-tool veto in handleMount and the morph settle.
+  const editActiveRef = useRef(false);
+  // Selection parked while editing is off, restored on the next enable.
+  const savedSelectionRef = useRef<TLShapeId[]>([]);
 
   const editorRef = useRef<Editor | null>(null);
   const geoPos = useRef<Map<TLShapeId, Pose>>(new Map());
@@ -1374,6 +1383,28 @@ export default function TubeMap() {
     [],
   );
 
+  // Apply edit mode to the editor. On: the select tool and draggable
+  // stations (the octolinear mode's original behaviour), with the parked
+  // selection restored. Off: a pan-only viewer — hand tool, no selection,
+  // view-only store — with the outgoing selection parked for next time.
+  // The select-tool veto in handleMount reads editActiveRef, so while off
+  // even the V hotkey can't bring drags back.
+  const applyEditMode = useCallback((editor: Editor, active: boolean) => {
+    editActiveRef.current = active;
+    if (active) {
+      editor.updateInstanceState({ isReadonly: false });
+      editor.setCurrentTool("select");
+      const ids = savedSelectionRef.current.filter((id) => editor.getShape(id));
+      savedSelectionRef.current = [];
+      if (ids.length) editor.select(...ids);
+    } else {
+      savedSelectionRef.current = [...editor.getSelectedShapeIds()];
+      editor.selectNone();
+      editor.setCurrentTool("hand");
+      editor.updateInstanceState({ isReadonly: true });
+    }
+  }, []);
+
   const handleMount = useCallback(
     (editor: Editor) => {
       if (process.env.NODE_ENV !== "production") {
@@ -1775,18 +1806,23 @@ export default function TubeMap() {
       stnEditor.groupShapes = (shapes, opts) =>
         shapes.some(isStation) ? editor : origGroup(shapes, opts);
 
-      // Tool surface: only select (station drags), hand (panning), and zoom
-      // stay reachable. Every other default tool draws whiteboard marks
-      // (draw, geo, arrow, line, note, text, highlight, laser) or erases
-      // them — and with hideUi their single-letter hotkeys (A, D, R, T, …)
-      // are still mounted. The veto sits on setCurrentTool, the chokepoint
-      // every entry point (hotkey, programmatic, future UI) funnels through.
-      const allowedTools = new Set(["select", "hand", "zoom"]);
+      // Tool surface: hand (panning) and zoom always; select only while
+      // edit mode is in effect (otherwise the V hotkey would reopen station
+      // drags in the pan-only viewer). Every other default tool draws
+      // whiteboard marks (draw, geo, arrow, line, note, text, highlight,
+      // laser) or erases them — and with hideUi their single-letter hotkeys
+      // (A, D, R, T, …) are still mounted. The veto sits on setCurrentTool,
+      // the chokepoint every entry point (hotkey, programmatic, future UI)
+      // funnels through.
       const origSetCurrentTool = editor.setCurrentTool.bind(editor);
-      editor.setCurrentTool = (id, info = {}) =>
-        allowedTools.has(String(id).split(".")[0])
+      editor.setCurrentTool = (id, info = {}) => {
+        const root = String(id).split(".")[0];
+        return root === "hand" ||
+          root === "zoom" ||
+          (root === "select" && editActiveRef.current)
           ? origSetCurrentTool(id, info)
           : editor;
+      };
 
       // External content — pasting or drag-dropping text, files, urls, or
       // foreign whiteboard shapes — has no place on the map (and pasting
@@ -2096,9 +2132,13 @@ export default function TubeMap() {
       };
       requestAnimationFrame(fit);
 
+      // Boot as a viewer: edit mode starts unchecked, so the hand tool and
+      // a view-only store (tldraw itself boots into select).
+      applyEditMode(editor, false);
+
       editorRef.current = editor;
     },
-    [positionTrains],
+    [positionTrains, applyEditMode],
   );
 
   // Animate stations to the target layout (and follow with the lines).
@@ -2110,7 +2150,8 @@ export default function TubeMap() {
         settleExtras.current = null;
       }
 
-      // Allow programmatic moves while animating; lock to view-only in geo mode.
+      // Allow programmatic moves while animating; the settle below restores
+      // view-only unless octolinear edit mode is in effect.
       editor.updateInstanceState({ isReadonly: false });
 
       const ids = [...geoPos.current.keys()];
@@ -2120,7 +2161,7 @@ export default function TubeMap() {
           return [id, { x: s?.x ?? 0, y: s?.y ?? 0 }];
         }),
       );
-      // Leaving editable mode: remember the user's custom layout first.
+      // Leaving the octolinear layout: remember the user's custom layout first.
       if (geo) for (const [id, p] of starts) customPos.current.set(id, p);
       const targets = geo ? geoPos.current : customPos.current;
 
@@ -2389,7 +2430,9 @@ export default function TubeMap() {
             !geo,
             coreIdForRef.current,
           );
-          editor.updateInstanceState({ isReadonly: geo });
+          editor.updateInstanceState({
+            isReadonly: geo || !editActiveRef.current,
+          });
           positionTrains();
           // The label declutter (greedy O(n²) over 505 labels) and the camera
           // constraint re-measure (full page-bounds fold) ran here in the SAME
@@ -2414,6 +2457,19 @@ export default function TubeMap() {
     },
     [positionTrains],
   );
+
+  // Keep the editor's edit state in step with the checkbox AND the layout
+  // mode: geographic suspends editing (auto-disable) without touching the
+  // checkbox state, so returning to octolinear resumes it. Declared BEFORE
+  // the morph effect below — on the same geoMode flip, editActiveRef must
+  // be current by the time the morph's settle picks its readonly value.
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const active = editMode && !geoMode;
+    if (active === editActiveRef.current) return;
+    applyEditMode(editor, active);
+  }, [geoMode, editMode, applyEditMode]);
 
   // Animate only on a real mode change — skip the initial mount (and React
   // strict-mode's double-invoke), which would otherwise run a no-op animation.
@@ -2781,33 +2837,51 @@ export default function TubeMap() {
       },
       camera: {
         zoom: editor.getZoomLevel(),
-        mode: geoMode ? "geographic" : "editable",
+        mode: geoMode
+          ? "geographic"
+          : editMode
+            ? "octolinear (edit)"
+            : "octolinear",
         morph: morphFracRef.current,
       },
     };
-  }, [geoMode]);
+  }, [geoMode, editMode]);
 
   if (!mounted) return null;
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
-      <div className="mode-toggle" role="group" aria-label="Map layout mode">
-        <button
-          type="button"
-          className={!geoMode ? "active" : undefined}
-          aria-pressed={!geoMode}
-          onClick={() => setGeoMode(false)}
-        >
-          Editable
-        </button>
-        <button
-          type="button"
-          className={geoMode ? "active" : undefined}
-          aria-pressed={geoMode}
-          onClick={() => setGeoMode(true)}
-        >
-          Geographic
-        </button>
+      <div className="mode-controls">
+        <div className="mode-toggle" role="group" aria-label="Map layout mode">
+          <button
+            type="button"
+            className={!geoMode ? "active" : undefined}
+            aria-pressed={!geoMode}
+            onClick={() => setGeoMode(false)}
+          >
+            Octolinear
+          </button>
+          <button
+            type="button"
+            className={geoMode ? "active" : undefined}
+            aria-pressed={geoMode}
+            onClick={() => setGeoMode(true)}
+          >
+            Geographic
+          </button>
+        </div>
+        {/* Editing only applies to the octolinear layout; the checkbox hides
+            in geographic mode but keeps its state for the trip back. */}
+        {!geoMode && (
+          <label className="edit-toggle">
+            <input
+              type="checkbox"
+              checked={editMode}
+              onChange={(e) => setEditMode(e.target.checked)}
+            />
+            Edit mode
+          </label>
+        )}
       </div>
       <DebugPanel collect={collectDebugStats} />
       <Tldraw
