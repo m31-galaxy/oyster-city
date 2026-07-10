@@ -7,7 +7,13 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { Tldraw, createShapeId, type Editor, type TLShapeId } from "tldraw";
+import {
+  Tldraw,
+  createShapeId,
+  react,
+  type Editor,
+  type TLShapeId,
+} from "tldraw";
 import "tldraw/tldraw.css";
 import {
   TubeLineShapeUtil,
@@ -24,7 +30,13 @@ import {
 import DebugPanel, { type DebugStats } from "@/components/DebugPanel";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
-import { closedLines, closedStations } from "@/lib/tube/status";
+import {
+  closedLines,
+  getLineOverride,
+  lineOverridesRev,
+  publishPolledClosures,
+  setStationTopology,
+} from "@/lib/tube/status";
 import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
 import { NR_LINE_IDS } from "@/lib/rail/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
@@ -878,10 +890,6 @@ export default function TubeMap() {
   );
   const naptanToHubRef = useRef<Record<string, string>>({});
   const stationPosRef = useRef<Map<string, [number, number]>>(new Map());
-  // Network station id -> ids of the lines serving it (static topology, built
-  // at mount). The poll derives the closed-STATION set from it: a station
-  // dims only when every one of its lines is closed.
-  const stationLinesRef = useRef<Map<string, string[]>>(new Map());
   const lineColorRef = useRef<Map<string, string>>(new Map());
   const trainStore = useRef<Map<string, TrainRecord>>(new Map());
   const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
@@ -1381,7 +1389,10 @@ export default function TubeMap() {
 
     const lineCount = new Map<string, number>();
     const colourFor = new Map<string, string>();
-    const stationLines = stationLinesRef.current;
+    // Station -> serving lines: lib/tube/status derives the closed-station
+    // set from this (a station dims only when every one of its lines is
+    // closed).
+    const stationLines = new Map<string, string[]>();
     for (const line of lines) {
       for (const sid of line.stationIds) {
         lineCount.set(sid, (lineCount.get(sid) ?? 0) + 1);
@@ -1391,6 +1402,7 @@ export default function TubeMap() {
         else if (!served.includes(line.id)) served.push(line.id);
       }
     }
+    setStationTopology(stationLines);
     const stations = net.stations.filter((s) => lineCount.has(s.id));
     const centreFor = new Map<string, Pt>(
       stations.map((s) => [s.id, { x: s.cx, y: s.cy }]),
@@ -2417,30 +2429,19 @@ export default function TubeMap() {
             // unparseable status — fail open
           }
         }
-        dbg.closedLines = [...closed];
-        // Publish for the shapes' dimming (only on actual change — the atom
-        // write re-renders every component whose answer flips). Stations
-        // derive from lines, so they only need recomputing inside the guard.
-        {
-          const prev = closedLines.get();
-          if (
-            prev.size !== closed.size ||
-            [...closed].some((id) => !prev.has(id))
-          ) {
-            closedLines.set(closed);
-            const dark = new Set<string>();
-            for (const [sid, served] of stationLinesRef.current) {
-              if (served.every((id) => closed.has(id))) dark.add(sid);
-            }
-            closedStations.set(dark);
-          }
-        }
+        // Publish the raw set; lib/tube/status layers any debug-panel
+        // overrides on top, change-checks the atoms, and derives the
+        // closed-station set. Gating below uses the EFFECTIVE set so a
+        // forced closure also parks that line's trains.
+        publishPolledClosures(closed);
+        const gated = closedLines.get();
+        dbg.closedLines = [...gated];
         if (cancelled || signal.aborted) return;
         const fetchMs = Date.now();
         dbg.lastPollMs = fetchMs;
         const byLine = new Map<string, Prediction[]>();
         for (const p of preds) {
-          if (closed.has(p.lineId)) continue; // ghost trains on a closed line
+          if (gated.has(p.lineId)) continue; // ghost trains on a closed line
           const list = byLine.get(p.lineId);
           if (list) list.push(p);
           else byLine.set(p.lineId, [p]);
@@ -2481,7 +2482,7 @@ export default function TubeMap() {
         if (hasRail && railOk) {
           for (const [key, rec] of trainStore.current) {
             if (!NR_LINE_IDS.has(rec.lineId) || next.has(key)) continue;
-            if (closed.has(rec.lineId)) continue; // closure purges retention
+            if (gated.has(rec.lineId)) continue; // closure purges retention
             const last = rec.steps[rec.steps.length - 1];
             if (last && last.endMs > fetchMs - 60_000) next.set(key, rec);
           }
@@ -2512,11 +2513,24 @@ export default function TubeMap() {
     };
     document.addEventListener("visibilitychange", onVisible);
 
+    // A debug-panel status override should re-gate trains immediately, not
+    // up to TRAIN_POLL_MS later (dimming is instant either way — the shapes
+    // read the atoms). react() runs once up front to capture the dependency;
+    // skip that initial call.
+    let overridesSeen = lineOverridesRev.get();
+    const stopOverrideReact = react("re-poll on line override", () => {
+      const rev = lineOverridesRev.get();
+      if (rev === overridesSeen) return;
+      overridesSeen = rev;
+      poll();
+    });
+
     return () => {
       cancelled = true;
       ac?.abort();
       if (iv) clearInterval(iv);
       if (retry) clearTimeout(retry);
+      stopOverrideReact();
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [mounted]);
@@ -2651,6 +2665,11 @@ export default function TubeMap() {
         railStatus: dbgPoll.railStatus,
         railPreds: dbgPoll.railPreds,
         closedLines: dbgPoll.closedLines,
+        lineStates: [...branchesForLineRef.current.keys()].map((id) => ({
+          id,
+          closed: closedLines.get().has(id),
+          forced: getLineOverride(id) !== null,
+        })),
       },
       trains: {
         records: store.size,

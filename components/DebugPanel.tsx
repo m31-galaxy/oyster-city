@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { cycleLineOverride } from "@/lib/tube/status";
 
 // Lightweight diagnostics overlay: a floating readout of the map's live
 // internals (poll freshness, data sources, train/station/render counts,
@@ -18,6 +19,7 @@ export interface DebugStats {
     railStatus: string;
     railPreds: number;
     closedLines: string[];
+    lineStates: { id: string; closed: boolean; forced: boolean }[];
   };
   trains: {
     records: number;
@@ -83,6 +85,19 @@ const h = (label: string) => (
     {label}
   </div>
 );
+
+/** Line-status chip: green = open, red = closed; amber ring = forced. */
+const chipStyle = (closed: boolean, forced: boolean): CSSProperties => ({
+  padding: "1px 6px",
+  fontFamily: "inherit",
+  fontSize: 10,
+  lineHeight: 1.5,
+  color: closed ? "#fda4af" : "#86efac",
+  background: closed ? "rgba(190, 18, 60, 0.25)" : "rgba(22, 101, 52, 0.25)",
+  border: `1px solid ${forced ? "#fbbf24" : "transparent"}`,
+  borderRadius: 4,
+  cursor: "pointer",
+});
 
 export default function DebugPanel({
   collect,
@@ -150,12 +165,37 @@ export default function DebugPanel({
               </div>
               {stats.poll.closedLines.length > 0 && (
                 <div style={{ color: "#a1a1aa" }}>
-                  closed (trains gated):{" "}
+                  gated at last poll:{" "}
                   {stats.poll.closedLines
                     .map((l) => l.slice(0, 12))
                     .join(" · ")}
                 </div>
               )}
+
+              {h("line status (click: flip → pin → live)")}
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 3,
+                  marginTop: 2,
+                }}
+              >
+                {stats.poll.lineStates.map((l) => (
+                  <button
+                    key={l.id}
+                    type="button"
+                    style={chipStyle(l.closed, l.forced)}
+                    onClick={() => {
+                      cycleLineOverride(l.id);
+                      setStats(collect());
+                    }}
+                    title={`${l.closed ? "closed" : "open"}${l.forced ? " (forced — amber ring)" : " (live)"} — click to cycle`}
+                  >
+                    {l.id.slice(0, 12)}
+                  </button>
+                ))}
+              </div>
 
               {h("trains")}
               <div>
