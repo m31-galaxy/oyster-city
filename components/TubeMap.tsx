@@ -72,10 +72,9 @@ const tldrawOptions = {
 // Edit mode dresses the canvas as a blueprint: blue paper, a deep-blue
 // vignette, and a whitish-blue drafting grid that pans and zooms with the
 // camera. It renders as the tldraw Background component — always mounted,
-// so CSS can animate the reveal (a circular wipe radiating from the
-// edit-mode checkbox, with the grid and vignette fading in staggered) —
-// and applyEditMode drives it through the blueprintOn atom
-// (lib/tube/blueprint.ts, shared with the station labels' ink flip).
+// so CSS can animate the reveal (a fade, with the grid and vignette on
+// staggered clocks) — and applyEditMode drives it through the blueprintOn
+// atom (lib/tube/blueprint.ts, shared with the station labels' ink flip).
 
 /** Minor drafting-grid cell in map units; majors every 5th line. */
 const BLUEPRINT_GRID = 40;
@@ -87,7 +86,7 @@ const GRID_MAJOR_INK = "rgba(219, 234, 254, 0.3)";
  * whole cascade fits STAGGER_BUDGET_MS regardless of line count), and after
  * everything has landed the per-line elements swap for two pattern-filled
  * rects that pan and zoom for free. */
-const GRID_DRAW_BASE_MS = 250; // let the wipe open before inking starts
+const GRID_DRAW_BASE_MS = 250; // let the fade land before inking starts
 const GRID_DRAW_MS = 450;
 const GRID_STAGGER_BUDGET_MS = 550;
 const GRID_DRAW_TOTAL_MS =
@@ -102,7 +101,7 @@ function BlueprintBackground() {
   const active = useValue("blueprint-active", () => blueprintOn.get(), []);
   // The grid outlives the checkbox: it draws itself in line-by-line on
   // enable, and on disable stays mounted through the collapse so it rides
-  // the wipe out instead of vanishing a frame early.
+  // the fade out instead of vanishing a frame early.
   const [gridMounted, setGridMounted] = useState(false);
   const [drawing, setDrawing] = useState(false);
   useEffect(() => {
@@ -1608,7 +1607,7 @@ export default function TubeMap() {
   // even the V hotkey can't bring drags back.
   const applyEditMode = useCallback((editor: Editor, active: boolean) => {
     editActiveRef.current = active;
-    blueprintOn.set(active); // the backdrop wipe starts with the flip
+    blueprintOn.set(active); // the backdrop fade starts with the flip
     if (active) {
       editor.updateInstanceState({ isReadonly: false });
       editor.setCurrentTool("select");

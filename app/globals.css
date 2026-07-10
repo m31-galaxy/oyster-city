@@ -150,17 +150,14 @@ textarea {
 /* ---------- Blueprint edit-mode backdrop ---------- */
 
 /* Replaces tldraw's Background: the plain paper always, with the blueprint
-   stack above it revealed by a circular wipe that radiates from the
-   edit-mode checkbox (--bp-origin-*). The grid and vignette fade in on
-   their own slightly-later clocks so the reveal reads in layers: paper
-   turns blue, the vignette settles, the drafting grid draws in. */
+   stack above it fading in over it. The grid and vignette run on their own
+   slightly-later clocks so the reveal reads in layers: paper turns blue,
+   the vignette settles, the drafting grid draws in. */
 .map-underlay {
   position: absolute;
   inset: 0;
   background: var(--bg);
   pointer-events: none;
-  --bp-origin-x: calc(100% - 80px);
-  --bp-origin-y: 72px;
 }
 
 .blueprint {
@@ -172,15 +169,14 @@ textarea {
     #1a4489 55%,
     #123468 100%
   );
-  clip-path: circle(0% at var(--bp-origin-x) var(--bp-origin-y));
-  will-change: clip-path;
+  opacity: 0;
   /* Collapse (unchecking) runs a touch faster than the reveal. */
-  transition: clip-path 550ms cubic-bezier(0.5, 0, 0.75, 0.4);
+  transition: opacity 450ms ease;
 }
 
 .blueprint--on {
-  clip-path: circle(142% at var(--bp-origin-x) var(--bp-origin-y));
-  transition: clip-path 750ms cubic-bezier(0.25, 0.1, 0.2, 1);
+  opacity: 1;
+  transition: opacity 600ms ease;
 }
 
 .blueprint-grid {
@@ -337,11 +333,6 @@ textarea {
   .edit-toggle input {
     width: 18px;
     height: 18px;
-  }
-
-  /* Taller controls push the edit checkbox (the wipe origin) further down. */
-  .map-underlay {
-    --bp-origin-y: 96px;
   }
 }
 
