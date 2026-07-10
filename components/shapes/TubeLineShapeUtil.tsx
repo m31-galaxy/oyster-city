@@ -7,12 +7,38 @@ import {
   useValue,
   type TLBaseShape,
 } from "tldraw";
+import { closedLines } from "@/lib/tube/status";
 
 /** Below this zoom the 10-unit National Rail dash marks are ≤3.5 screen px —
  * unreadable fuzz that still costs per-pixel pattern rasterisation across
  * ~68 core paths on every zoom/pan repaint. The core renders solid white
  * instead; the flip only happens on threshold crossings. */
 const DASH_LOD_ZOOM = 0.35;
+
+/** The canvas background (globals.css --bg) that dimmed lines mix toward. */
+const DIM_BG = { r: 0xf4, g: 0xf4, b: 0xf5 };
+/** Share of the background in a dimmed colour: greyscale the line colour by
+ * luminance, then pull it this far toward the background — dark lines (the
+ * Northern's black) land as a mid grey instead of staying near-black, and
+ * every closed line converges into one quiet family. */
+const DIM_MIX = 0.6;
+const dimCache = new Map<string, string>();
+function dimmedColour(hex: string): string {
+  const hit = dimCache.get(hex);
+  if (hit) return hit;
+  const n = parseInt(hex.slice(1), 16);
+  const grey = Math.min(
+    // Luminance cap: the palest lines (Circle's yellow, Waterloo & City's
+    // mint) would otherwise mix to within a few steps of the background
+    // and effectively vanish — closed should read as "quiet", not "gone".
+    160,
+    0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255),
+  );
+  const mix = (bg: number) => Math.round(grey + (bg - grey) * DIM_MIX);
+  const out = `#${((1 << 24) | (mix(DIM_BG.r) << 16) | (mix(DIM_BG.g) << 8) | mix(DIM_BG.b)).toString(16).slice(1)}`;
+  dimCache.set(hex, out);
+  return out;
+}
 
 export interface TubeLineProps {
   w: number;
@@ -32,6 +58,8 @@ export interface TubeLineProps {
    * on official TfL maps — the mark that distinguishes e.g. Thameslink from
    * the solid-cored Elizabeth line / Overground family. */
   dashed: boolean;
+  /** TfL line id (e.g. "northern") — keys the closed-line dimming. */
+  lineId: string;
   /** tldraw shape ids of the stations this line connects, in order. */
   stationIds: string[];
 }
@@ -57,6 +85,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     hollow: T.boolean,
     core: T.boolean,
     dashed: T.boolean,
+    lineId: T.string,
     stationIds: T.arrayOf(T.string),
   };
 
@@ -69,6 +98,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       hollow: false,
       core: false,
       dashed: false,
+      lineId: "",
       stationIds: [],
     };
   }
@@ -91,7 +121,7 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
   }
 
   override component(shape: TubeLineShape) {
-    const { w, h, color, d, core, dashed } = shape.props;
+    const { w, h, color: lineColor, d, core, dashed, lineId } = shape.props;
     // Reactive LOD boolean — re-renders only when the threshold is crossed
     // (the StationShapeUtil.showLabel pattern). Non-dashed shapes short-
     // circuit before reading the zoom, so they never even subscribe to it.
@@ -101,6 +131,15 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       () => dashed && editor.getZoomLevel() >= DASH_LOD_ZOOM,
       [editor, dashed],
     );
+    // Fully-closed lines dim to a background-mixed grey (the same status set
+    // that gates their ghost trains). Boolean per shape — re-renders only
+    // when this line's closure flips.
+    const dimmed = useValue(
+      "line-dimmed",
+      () => lineId !== "" && closedLines.get().has(lineId),
+      [lineId],
+    );
+    const color = dimmed ? dimmedColour(lineColor) : lineColor;
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.

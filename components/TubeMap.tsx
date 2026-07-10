@@ -18,6 +18,7 @@ import {
 import DebugPanel, { type DebugStats } from "@/components/DebugPanel";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
+import { closedLines } from "@/lib/tube/status";
 import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
 import { NR_LINE_IDS } from "@/lib/rail/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
@@ -1189,6 +1190,7 @@ export default function TubeMap() {
           hollow,
           core: false,
           dashed: isNationalRailLine(line.id),
+          lineId: line.id,
           stationIds: ids,
         },
       };
@@ -2347,9 +2349,11 @@ export default function TubeMap() {
           // system keeps emitting Arrivals for CLOSED lines (stabled trains
           // parked at platforms under dummy vehicle ids, plus schedule-seeded
           // phantoms — verified: 76 jubilee predictions at "Service Closed").
-          // A status failure fails OPEN (no gating) — worst case is ghosts,
-          // never missing real trains.
-          fetch(`/api/tfl/Line/${tflIds.join(",")}/Status`, {
+          // ALL line ids, not just TfL ones — TfL serves status for
+          // Thameslink too, so NR lines gate and dim the same way. A status
+          // failure fails OPEN (no gating) — worst case is ghosts, never
+          // missing real trains.
+          fetch(`/api/tfl/Line/${lineIds.join(",")}/Status`, {
             signal,
             cache: "no-store",
           }).catch(() => null),
@@ -2392,6 +2396,17 @@ export default function TubeMap() {
           }
         }
         dbg.closedLines = [...closed];
+        // Publish for the line shapes' dimming (only on actual change — the
+        // atom write re-renders every line component whose answer flips).
+        {
+          const prev = closedLines.get();
+          if (
+            prev.size !== closed.size ||
+            [...closed].some((id) => !prev.has(id))
+          ) {
+            closedLines.set(closed);
+          }
+        }
         if (cancelled || signal.aborted) return;
         const fetchMs = Date.now();
         dbg.lastPollMs = fetchMs;
@@ -2438,6 +2453,7 @@ export default function TubeMap() {
         if (hasRail && railOk) {
           for (const [key, rec] of trainStore.current) {
             if (!NR_LINE_IDS.has(rec.lineId) || next.has(key)) continue;
+            if (closed.has(rec.lineId)) continue; // closure purges retention
             const last = rec.steps[rec.steps.length - 1];
             if (last && last.endMs > fetchMs - 60_000) next.set(key, rec);
           }
