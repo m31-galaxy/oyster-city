@@ -18,7 +18,7 @@ import {
 import DebugPanel, { type DebugStats } from "@/components/DebugPanel";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
-import { closedLines } from "@/lib/tube/status";
+import { closedLines, closedStations } from "@/lib/tube/status";
 import { isHollowLine, isNationalRailLine } from "@/lib/tfl/lines";
 import { NR_LINE_IDS } from "@/lib/rail/lines";
 import { labelRect } from "@/components/shapes/StationShapeUtil";
@@ -862,6 +862,10 @@ export default function TubeMap() {
   );
   const naptanToHubRef = useRef<Record<string, string>>({});
   const stationPosRef = useRef<Map<string, [number, number]>>(new Map());
+  // Network station id -> ids of the lines serving it (static topology, built
+  // at mount). The poll derives the closed-STATION set from it: a station
+  // dims only when every one of its lines is closed.
+  const stationLinesRef = useRef<Map<string, string[]>>(new Map());
   const lineColorRef = useRef<Map<string, string>>(new Map());
   const trainStore = useRef<Map<string, TrainRecord>>(new Map());
   const trainShapes = useRef<Map<string, TLShapeId>>(new Map());
@@ -932,10 +936,14 @@ export default function TubeMap() {
 
     const lineCount = new Map<string, number>();
     const colourFor = new Map<string, string>();
+    const stationLines = stationLinesRef.current;
     for (const line of lines) {
       for (const sid of line.stationIds) {
         lineCount.set(sid, (lineCount.get(sid) ?? 0) + 1);
         if (!colourFor.has(sid)) colourFor.set(sid, line.color);
+        const served = stationLines.get(sid);
+        if (!served) stationLines.set(sid, [line.id]);
+        else if (!served.includes(line.id)) served.push(line.id);
       }
     }
     const stations = net.stations.filter((s) => lineCount.has(s.id));
@@ -2396,8 +2404,9 @@ export default function TubeMap() {
           }
         }
         dbg.closedLines = [...closed];
-        // Publish for the line shapes' dimming (only on actual change — the
-        // atom write re-renders every line component whose answer flips).
+        // Publish for the shapes' dimming (only on actual change — the atom
+        // write re-renders every component whose answer flips). Stations
+        // derive from lines, so they only need recomputing inside the guard.
         {
           const prev = closedLines.get();
           if (
@@ -2405,6 +2414,11 @@ export default function TubeMap() {
             [...closed].some((id) => !prev.has(id))
           ) {
             closedLines.set(closed);
+            const dark = new Set<string>();
+            for (const [sid, served] of stationLinesRef.current) {
+              if (served.every((id) => closed.has(id))) dark.add(sid);
+            }
+            closedStations.set(dark);
           }
         }
         if (cancelled || signal.aborted) return;

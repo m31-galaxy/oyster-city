@@ -9,6 +9,7 @@ import {
   type TLBaseShape,
 } from "tldraw";
 import { hiddenLabels } from "@/lib/tube/labels";
+import { closedStations, dimmedColour } from "@/lib/tube/status";
 
 export interface StationProps {
   w: number;
@@ -34,6 +35,8 @@ const MARKER = 11; // interchange ring diameter (px)
 const DOT = 7; // single-line tick diameter (px)
 /** Below this zoom only interchanges are labelled; at/above it, every station. */
 const LABEL_ZOOM = 0.7;
+/** Ring/label ink; dims with the rest of the marker when the station closes. */
+const INK = "#111111";
 
 export class StationShapeUtil extends ShapeUtil<StationShape> {
   static override type = "station" as const;
@@ -156,13 +159,22 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       },
       [editor, interchange, name, shape.id],
     );
+    // A station dims only when EVERY line serving it is closed (the poll
+    // publishes that set) — an interchange with one live line stays lit.
+    // Boolean per shape, so it re-renders only when its own answer flips.
+    const dimmed = useValue(
+      "station-dimmed",
+      () => closedStations.get().has(shape.props.stationId),
+      [shape.props.stationId],
+    );
+    const ink = dimmed ? dimmedColour(INK) : INK;
     const marker: CSSProperties = interchange
       ? {
           width: MARKER,
           height: MARKER,
           borderRadius: "50%",
           background: "#ffffff",
-          border: "2.5px solid #111111",
+          border: `2.5px solid ${ink}`,
           boxSizing: "border-box",
         }
       : {
@@ -170,7 +182,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           height: DOT,
           margin: (MARKER - DOT) / 2,
           borderRadius: "50%",
-          background: color,
+          background: dimmed ? dimmedColour(color) : color,
         };
 
     return (
@@ -184,7 +196,11 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
           {name && (
             <div style={labelAnchorStyle()}>
               <span
-                style={{ ...labelStyle(labelPos), ...labelFade(showLabel) }}
+                style={{
+                  ...labelStyle(labelPos),
+                  ...labelFade(showLabel),
+                  color: ink,
+                }}
               >
                 {name}
               </span>
@@ -255,7 +271,8 @@ function labelAnchorStyle(): CSSProperties {
   };
 }
 
-/** Place the label N/S/E/W of the marker centre per the labelPos hint. */
+/** Place the label N/S/E/W of the marker centre per the labelPos hint.
+ * Ink colour is supplied by the caller (it dims when the station closes). */
 function labelStyle(pos: string): CSSProperties {
   const offset = MARKER / 2 + 3; // marker radius + gap, measured from the centre
   const style: CSSProperties = {
@@ -263,7 +280,6 @@ function labelStyle(pos: string): CSSProperties {
     fontSize: 9,
     fontWeight: 600,
     lineHeight: 1.05,
-    color: "#111111",
     whiteSpace: "nowrap",
     pointerEvents: "none",
     fontFamily: "var(--font-tube), system-ui, -apple-system, sans-serif",
