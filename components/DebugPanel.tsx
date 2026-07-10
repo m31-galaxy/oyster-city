@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 
 // Lightweight diagnostics overlay: a floating readout of the map's live
 // internals (poll freshness, data sources, train/station/render counts,
@@ -92,19 +92,28 @@ export default function DebugPanel({
   const [open, setOpen] = useState(false);
   const [stats, setStats] = useState<DebugStats | null>(null);
 
+  // Opening seeds the readout in the toggle event itself (an effect must not
+  // set state synchronously); the 1Hz interval below keeps it fresh.
+  const toggle = useCallback(
+    (next: boolean) => {
+      if (next) setStats(collect());
+      setOpen(next);
+    },
+    [collect],
+  );
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
-      if (e.key === "`") setOpen((o) => !o);
+      if (e.key === "`") toggle(!open);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [open, toggle]);
 
   useEffect(() => {
     if (!open) return;
-    setStats(collect());
     const iv = setInterval(() => setStats(collect()), 1000);
     return () => clearInterval(iv);
   }, [open, collect]);
@@ -114,7 +123,7 @@ export default function DebugPanel({
       <button
         type="button"
         style={buttonStyle}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => toggle(!open)}
         title="Toggle debug panel (`)"
       >
         {open ? "debug ×" : "debug"}

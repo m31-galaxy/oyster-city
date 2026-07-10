@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { Tldraw, createShapeId, type Editor, type TLShapeId } from "tldraw";
 import "tldraw/tldraw.css";
 import {
@@ -792,8 +798,18 @@ function recomputeAllLines(
  * A geo/editable toggle animates every station between its geographically
  * accurate position and the user's custom (dragged) layout.
  */
+// The "mounted" store never changes after hydration, but useSyncExternalStore
+// still needs a stable subscribe function to avoid re-subscribing per render.
+const emptySubscribe = () => () => {};
+
 export default function TubeMap() {
-  const [mounted, setMounted] = useState(false);
+  // False on the server and for the hydration render, true immediately after —
+  // gates tldraw (client-only) past SSR without a setState-in-effect cascade.
+  const mounted = useSyncExternalStore(
+    emptySubscribe,
+    () => true,
+    () => false,
+  );
   const [geoMode, setGeoMode] = useState(false);
 
   const editorRef = useRef<Editor | null>(null);
@@ -913,7 +929,436 @@ export default function TubeMap() {
    * morph settle) — invalidates memoised dwell headings. */
   const geomGenRef = useRef(0);
 
-  useEffect(() => setMounted(true), []);
+  // Reposition every live train onto its current segment, matching how the line
+  // is drawn: the geo curve, the octilinear connector, or the live morph blend.
+  //
+  // `onlyBranches` limits the pass to trains on those tube-line shapes — used
+  // by the station-drag side effect and the mode-morph tick to move trains in
+  // the SAME synchronous batch that redraws the lines (otherwise trains lag
+  // the line at the ambient ~10fps tick and look detached). A filtered pass
+  // only updates existing shapes: create/delete must see every key, so they
+  // stay with the full ambient pass.
+  //
+  // `fine` marks the per-frame smoothing pass: visible trains only (via their
+  // last rendered point), near-zero update gates so motion advances every
+  // frame in sub-pixel steps instead of ~0.5-screen-px hops at 10Hz. It
+  // skips create/delete and rs initialisation (the 10Hz full pass owns
+  // those), and bails entirely when zoomed out far enough that full-pass
+  // steps are already sub-pixel.
+  const positionTrains = useCallback(
+    (onlyBranches?: ReadonlySet<string>, fine = false, tween = false) => {
+      const editor = editorRef.current;
+      if (!editor) return;
+      if (fine && editor.getZoomLevel() < 0.5) return;
+      const store = trainStore.current;
+      const shapes = trainShapes.current;
+      const render = trainRender.current;
+      if (store.size === 0 && shapes.size === 0) return;
+      const now = performance.now();
+      const nowEpoch = Date.now();
+      // Debug telemetry: EMA of pass cost, recorded at every exit below.
+      // Tween passes are counted inside the tick's morphMs instead.
+      const recordPass = () => {
+        if (tween) return;
+        const p = debugPerfRef.current;
+        const spent = performance.now() - now;
+        if (fine) p.fineMs = p.fineMs ? p.fineMs * 0.9 + spent * 0.1 : spent;
+        else p.fullMs = p.fullMs ? p.fullMs * 0.9 + spent * 0.1 : spent;
+      };
+      // Absence detection: if positioning passes stopped for a while (hidden
+      // tab, sleep), drop all per-train blend/heading state — the next pass
+      // places everything at its true current position before the user sees a
+      // frame, instead of animating a mass catch-up they never watched. Keep
+      // snapping through the first fresh poll (RESYNC_MS), which carries the
+      // absence's accumulated data drift.
+      if (lastPassRef.current && nowEpoch - lastPassRef.current > WAKE_GAP_MS) {
+        resyncUntilRef.current = nowEpoch + RESYNC_MS;
+        render.clear();
+      }
+      lastPassRef.current = nowEpoch;
+      const morphFrac = morphFracRef.current;
+      const geo = morphFrac >= 1 - 1e-6;
+      const octi = morphFrac <= 1e-6;
+      const settled = geo || octi;
+      // Perceptual gating: skip shape updates smaller than half a SCREEN pixel
+      // (zoomed out, every train moves sub-pixel per frame), and skip trains
+      // that are off-screen before AND after the move — positions are absolute,
+      // so they're exact whenever they re-enter view. Both cut the per-frame
+      // update count during the morph without any visible difference. The fine
+      // per-frame pass instead uses near-zero gates: visible motion advances
+      // every frame in sub-pixel increments — that's the butter.
+      const zoom = editor.getZoomLevel();
+      // Fine gate: ~0.08 screen px — far below perception at 60fps, but ~3x
+      // fewer store writes than updating every moving train every frame.
+      const minDelta = fine ? 0.08 / zoom : Math.max(0.2, 0.5 / zoom);
+      const minRot = fine ? 0.004 : 0.02;
+      const vp = editor.getViewportPageBounds();
+      // Tween passes use a proportional margin (the morph sweeps shapes fast,
+      // so a fixed 50-unit apron under-covers at speed); the ambient 10Hz
+      // full pass is the backstop that trues late sweep-ins within ≤100ms.
+      const apron = tween ? Math.max(vp.w, vp.h) * 0.25 : 50;
+      const vpX0 = vp.x - apron;
+      const vpY0 = vp.y - apron;
+      const vpX1 = vp.x + vp.w + apron;
+      const vpY1 = vp.y + vp.h + apron;
+      const onScreen = (px: number, py: number) =>
+        px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
+
+      // Station centres memoised for THIS pass (positions can't change inside
+      // a synchronous pass; every pass starts a fresh memo).
+      const centreCache = new Map<TLShapeId, Pt | null>();
+      const centreOf = (id: TLShapeId): Pt | null => {
+        let c = centreCache.get(id);
+        if (c === undefined) {
+          c = stationCentre(editor, id);
+          centreCache.set(id, c);
+        }
+        return c;
+      };
+
+      // Page-space point + tangent for a pose, using the geometry that matches
+      // how the line is currently drawn. Shared by the main placement and the
+      // dwell look-ahead that pre-aims a stopped train's heading.
+      const placedFor = (
+        pose: TrainPose,
+      ): { point: Pt; tangent: Pt } | null => {
+        const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
+        if (!netIds) return null;
+        const i = pose.segIndex;
+        const idA = shapeIdForRef.current.get(netIds[i]);
+        const idB = shapeIdForRef.current.get(netIds[i + 1]);
+        if (!idA || !idB) return null;
+        // Mid-morph, centres come from the tween's own pose map (set for
+        // exactly the animation's duration) so trains ride the SAME geometry
+        // the lines were drawn from this frame; settled passes read live —
+        // memoised per pass, since ~140 visible trains share a much smaller
+        // station set and each transform read costs more than the map hit.
+        const tweenMap = morphCentresRef.current;
+        const cA = tweenMap?.get(idA) ?? centreOf(idA);
+        const cB = tweenMap?.get(idB) ?? centreOf(idB);
+        if (!cA || !cB) return null;
+        const fFwd = pose.reversed ? 1 - pose.f : pose.f;
+        const branchId = pose.branchShapeId as TLShapeId;
+        if (geo) {
+          const seg = lineSegGeo.current.get(branchId)?.[i];
+          const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
+          return seg && seg.length >= 2
+            ? arc
+              ? pointAlongArc(seg, arc, fFwd)
+              : pointAlong(seg, fFwd)
+            : straightAt(cA, cB, fFwd);
+        }
+        if (octi) return octiPointAt(cA, cB, fFwd);
+        const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
+        return morphPointAt(cA, cB, profile, morphFrac, fFwd);
+      };
+
+      // Read-only pass first: compute poses and collect the create/update/delete
+      // work. Store writes (and geo mode's readonly lift) happen only when there
+      // IS work — most ambient ticks are no-ops thanks to the perceptual gate,
+      // and a no-op tick that toggled instance state 10x/s caused store churn
+      // during panning for nothing.
+      const seen = new Set<string>();
+      const toCreate: {
+        id: TLShapeId;
+        type: "train";
+        x: number;
+        y: number;
+        rotation: number;
+        isLocked: boolean;
+        props: { w: number; h: number; color: string };
+      }[] = [];
+      // One batched updateShapes call; heading goes in the shape's TOP-LEVEL
+      // rotation (props stay constant), so tldraw's memoized component never
+      // re-renders — per-frame React re-renders of 600+ trains were the
+      // mode-morph's dominant cost. Rotation pivots the top-left corner, so
+      // x/y are counter-offset to keep the marker CENTRE on the track point.
+      const toUpdate: {
+        id: TLShapeId;
+        type: "train";
+        x: number;
+        y: number;
+        rotation: number;
+      }[] = [];
+      for (const [key, rec] of store) {
+        // On a fresh poll, convert the correction into a TIME offset that a
+        // critically damped spring drives back to zero: the train runs
+        // briefly slow (or gently catches up) instead of teleporting or
+        // sliding backward. The spring's velocity carries across captures, so
+        // a poll landing mid-glide re-aims it with NO speed jump; a hard
+        // monotonic clamp keeps display speed within 0.25x-1.75x of real.
+        // Falls back to a decaying 2D point offset when the new trajectory
+        // doesn't pass the displayed pose (reroute / branch switch). Skipped
+        // during the morph, where the whole line is already moving.
+        let rs = render.get(key);
+        // Fine and tween passes smooth what's already (near) on screen —
+        // BEFORE any pose computation, which is most of a pass's cost;
+        // initialisation and newly-visible trains belong to the 10Hz full
+        // pass.
+        if ((fine || tween) && (!rs || !onScreen(rs.x, rs.y))) continue;
+        let capture2D = false;
+        if (rs && rs.fetchMs !== rec.fetchMs) {
+          rs.fetchMs = rec.fetchMs;
+          if (nowEpoch < resyncUntilRef.current) {
+            // Post-wake window: present fresh data instantly, no blending.
+            rs.springO = 0;
+            rs.springV = 0;
+            rs.offX = 0;
+            rs.offY = 0;
+          } else if (settled) {
+            const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
+            const off = tEq === null ? null : tEq - nowEpoch;
+            if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
+              // Position-continuous by construction (the new trajectory
+              // passes the displayed pose at nowEpoch + off); springV is
+              // deliberately NOT reset — velocity continuity.
+              rs.springO = off;
+              // Stiffness ~4/|off|s: small corrections settle in ~1.5-3s and
+              // a 45s correction in ~80s (like the old 2x|off| window). The
+              // steepest stretch rides the 0.25x monotonic clamp below.
+              rs.springW = Math.min(3, 4000 / Math.max(1334, Math.abs(off)));
+              rs.offX = 0;
+              rs.offY = 0;
+            } else {
+              capture2D = true;
+              rs.springO = 0;
+              rs.springV = 0;
+            }
+          } else {
+            rs.springO = 0;
+            rs.springV = 0;
+            rs.offX = 0;
+            rs.offY = 0;
+          }
+        }
+        let decay = 0;
+        let dispTime = nowEpoch;
+        let headDtMs = 0;
+        if (rs) {
+          headDtMs = Math.max(0, nowEpoch - rs.springT);
+          if (settled) {
+            // Integrate the critically damped spring (closed form), then
+            // clamp display time to monotonic forward within [0.25, 1.75]x.
+            // Everything runs on the SAME clock as display time (Date.now):
+            // deriving dt from performance.now would freeze trains whenever
+            // the two clocks diverge (system sleep/clock slew — and the
+            // virtual-time test harness).
+            const dtMs = Math.max(0, nowEpoch - rs.springT);
+            const dtS = dtMs / 1000;
+            const a = rs.springV + rs.springW * rs.springO;
+            const e = Math.exp(-rs.springW * dtS);
+            rs.springO = (rs.springO + a * dtS) * e;
+            rs.springV = (rs.springV - a * rs.springW * dtS) * e;
+            dispTime = nowEpoch + rs.springO;
+            if (dtMs > 0) {
+              const lo = rs.dispTime + 0.25 * dtMs;
+              const hi = rs.dispTime + 1.75 * dtMs;
+              if (dispTime < lo || dispTime > hi) {
+                dispTime = dispTime < lo ? lo : hi;
+                rs.springO = dispTime - nowEpoch;
+                // Re-sync the spring's velocity to the APPLIED derivative so
+                // the clamp releasing doesn't kink the display speed.
+                rs.springV = (dispTime - rs.dispTime - dtMs) / dtS;
+              }
+            }
+            const dt2D = (now - rs.offStart) / rs.blendMs;
+            decay = dt2D >= 1 ? 0 : 1 - smoothstepEase(dt2D);
+          } else {
+            rs.springO = 0;
+            rs.springV = 0;
+          }
+          rs.springT = nowEpoch;
+          rs.dispTime = dispTime;
+        }
+        const pose = trainPose(rec, dispTime);
+        if (!pose) continue;
+        if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
+        // Dwell fast-path (fine passes): a stationary train whose corrections
+        // have decayed, heading has settled and line geometry hasn't moved
+        // renders exactly where it already is — skip the geometry eval, which
+        // is the bulk of per-train cost, for the ~half of the visible fleet
+        // dwelling at any moment. A dwelling pose sits pinned at f=0, so its
+        // position can't drift with display time; departure flips
+        // pose.moving, which lands in the full pipeline again.
+        if (
+          fine &&
+          !pose.moving &&
+          rs &&
+          rs.pose &&
+          !rs.pose.moving &&
+          rs.pose.branchShapeId === pose.branchShapeId &&
+          rs.pose.segIndex === pose.segIndex &&
+          rs.pose.reversed === pose.reversed &&
+          rs.geomGen === geomGenRef.current &&
+          ((now - rs.offStart) / rs.blendMs >= 1 ||
+            (rs.offX === 0 && rs.offY === 0)) &&
+          rs.headRot !== undefined &&
+          Math.abs(rs.rot - rs.headRot) < minRot
+        ) {
+          seen.add(key);
+          continue;
+        }
+        const placed = placedFor(pose);
+        if (!placed) continue;
+        const tx = placed.point.x;
+        const ty = placed.point.y;
+        if (!rs) {
+          rs = {
+            x: tx,
+            y: ty,
+            fetchMs: rec.fetchMs,
+            pose,
+            springO: 0,
+            springV: 0,
+            springW: 3,
+            springT: nowEpoch,
+            dispTime: nowEpoch,
+            rot: Number.NaN,
+            offX: 0,
+            offY: 0,
+            offStart: now,
+            blendMs: TRAIN_BLEND_MS,
+          };
+          render.set(key, rs);
+        }
+        if (capture2D) {
+          const ox = rs.x - tx;
+          const oy = rs.y - ty;
+          if (Math.hypot(ox, oy) > TRAIN_GLIDE_SNAP_UNITS) {
+            rs.offX = 0;
+            rs.offY = 0;
+            decay = 0;
+          } else {
+            rs.offX = ox;
+            rs.offY = oy;
+            rs.offStart = now;
+            rs.blendMs = TRAIN_BLEND_MS;
+            decay = 1;
+          }
+        }
+        const dispX = tx + rs.offX * decay;
+        const dispY = ty + rs.offY * decay;
+        rs.x = dispX;
+        rs.y = dispY;
+        rs.pose = pose;
+        rs.geomGen = geomGenRef.current;
+        // Heading: smooth the displayed rotation toward the target tangent
+        // (shortest arc, tau ~120ms) so reversals and departures swing over
+        // ~0.4s instead of snapping. A dwelling on-screen train aims at its
+        // DEPARTURE tangent (probe the trajectory ahead), turning on the
+        // platform before it moves.
+        let targetRot = Math.atan2(placed.tangent.y, placed.tangent.x);
+        if (settled && !pose.moving && onScreen(dispX, dispY)) {
+          // The probed departure tangent only changes when the record
+          // refreshes, the dwell step changes, or the line geometry moves —
+          // memoise on those (probing cost 3 trainPose+placedFor per train
+          // per frame, which dominated the fine pass at editing zooms).
+          const headKey = `${rec.fetchMs}:${pose.branchShapeId}:${pose.segIndex}:${pose.reversed}:${geomGenRef.current}`;
+          if (rs.headKey === headKey && rs.headRot !== undefined) {
+            targetRot = rs.headRot;
+          } else {
+            for (const k of HEADING_PROBES) {
+              const fut = trainPose(rec, dispTime + k);
+              if (!fut) break;
+              if (fut.moving) {
+                const fp = placedFor(fut);
+                if (fp) targetRot = Math.atan2(fp.tangent.y, fp.tangent.x);
+                break;
+              }
+            }
+            rs.headKey = headKey;
+            rs.headRot = targetRot;
+          }
+        }
+        let rot: number;
+        if (Number.isFinite(rs.rot)) {
+          const delta =
+            ((targetRot - rs.rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
+          rot =
+            rs.rot + delta * (1 - Math.exp(-headDtMs / TRAIN_HEADING_TAU_MS));
+        } else {
+          rot = targetRot; // first placement — no spawn swing
+        }
+        rs.rot = rot;
+        // Rotation pivots the origin (top-left): offset it so the rotated
+        // centre R(rot)·(w/2, h/2) lands exactly on the track point.
+        const cos = Math.cos(rot);
+        const sin = Math.sin(rot);
+        const x = dispX - ((TRAIN_W / 2) * cos - (TRAIN_H / 2) * sin);
+        const y = dispY - ((TRAIN_W / 2) * sin + (TRAIN_H / 2) * cos);
+        seen.add(key);
+        const shapeId = shapes.get(key);
+        if (!shapeId) {
+          // Creation belongs to the ambient full pass.
+          if (onlyBranches || tween) continue;
+          const newId = createShapeId();
+          shapes.set(key, newId);
+          toCreate.push({
+            id: newId,
+            type: "train",
+            x,
+            y,
+            rotation: rot,
+            isLocked: true,
+            props: { w: TRAIN_W, h: TRAIN_H, color: rec.color },
+          });
+        } else {
+          const cur = editor.getShape(shapeId) as TrainShape | undefined;
+          if (!cur) continue;
+          if (!onScreen(cur.x, cur.y) && !onScreen(x, y)) continue;
+          // Skip sub-perceptual jitter (< ~0.5 screen px / 0.02 rad). The
+          // rotation delta is wrapped so a heading crossing the ±π seam
+          // doesn't read as a ~2π change.
+          const dRot = Math.abs(
+            ((cur.rotation - rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI,
+          );
+          if (
+            Math.abs(cur.x - x) > minDelta ||
+            Math.abs(cur.y - y) > minDelta ||
+            dRot > minRot
+          ) {
+            toUpdate.push({ id: shapeId, type: "train", x, y, rotation: rot });
+          }
+        }
+      }
+      const toDelete: TLShapeId[] = [];
+      if (!onlyBranches && !fine && !tween) {
+        for (const [key, shapeId] of shapes) {
+          if (!seen.has(key)) {
+            toDelete.push(shapeId);
+            shapes.delete(key);
+            render.delete(key);
+          }
+        }
+      }
+      if (!toCreate.length && !toUpdate.length && !toDelete.length) {
+        recordPass();
+        return;
+      }
+
+      // Trains are programmatic; geo mode's readonly instance state blocks all
+      // create/update, so lift it just for this synchronous batch, then
+      // restore. History is skipped too: an undo that removed a train shape
+      // would hide that train for good — its key still maps to the dead id,
+      // so the create branch never runs again.
+      const readonly = editor.getInstanceState().isReadonly;
+      if (readonly) editor.updateInstanceState({ isReadonly: false });
+      try {
+        editor.run(
+          () => {
+            if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
+            if (toUpdate.length) editor.updateShapes(toUpdate);
+            if (toDelete.length) editor.deleteShapes(toDelete);
+          },
+          { ignoreShapeLock: true, history: "ignore" },
+        );
+      } finally {
+        if (readonly) editor.updateInstanceState({ isReadonly: true });
+      }
+      recordPass();
+    },
+    [],
+  );
 
   const handleMount = useCallback((editor: Editor) => {
     if (process.env.NODE_ENV !== "production") {
@@ -1569,7 +2014,7 @@ export default function TubeMap() {
     requestAnimationFrame(fit);
 
     editorRef.current = editor;
-  }, []);
+  }, [positionTrains]);
 
   // Animate stations to the target layout (and follow with the lines).
   const applyMode = useCallback((editor: Editor, geo: boolean) => {
@@ -1875,7 +2320,7 @@ export default function TubeMap() {
       }
     };
     animFrame.current = requestAnimationFrame(tick);
-  }, []);
+  }, [positionTrains]);
 
   // Animate only on a real mode change — skip the initial mount (and React
   // strict-mode's double-invoke), which would otherwise run a no-op animation.
@@ -1886,437 +2331,6 @@ export default function TubeMap() {
     lastMode.current = geoMode;
     applyMode(editor, geoMode);
   }, [geoMode, applyMode]);
-
-  // Reposition every live train onto its current segment, matching how the line
-  // is drawn: the geo curve, the octilinear connector, or the live morph blend.
-  //
-  // `onlyBranches` limits the pass to trains on those tube-line shapes — used
-  // by the station-drag side effect and the mode-morph tick to move trains in
-  // the SAME synchronous batch that redraws the lines (otherwise trains lag
-  // the line at the ambient ~10fps tick and look detached). A filtered pass
-  // only updates existing shapes: create/delete must see every key, so they
-  // stay with the full ambient pass.
-  //
-  // `fine` marks the per-frame smoothing pass: visible trains only (via their
-  // last rendered point), near-zero update gates so motion advances every
-  // frame in sub-pixel steps instead of ~0.5-screen-px hops at 10Hz. It
-  // skips create/delete and rs initialisation (the 10Hz full pass owns
-  // those), and bails entirely when zoomed out far enough that full-pass
-  // steps are already sub-pixel.
-  const positionTrains = useCallback(
-    (onlyBranches?: ReadonlySet<string>, fine = false, tween = false) => {
-      const editor = editorRef.current;
-      if (!editor) return;
-      if (fine && editor.getZoomLevel() < 0.5) return;
-      const store = trainStore.current;
-      const shapes = trainShapes.current;
-      const render = trainRender.current;
-      if (store.size === 0 && shapes.size === 0) return;
-      const now = performance.now();
-      const nowEpoch = Date.now();
-      // Debug telemetry: EMA of pass cost, recorded at every exit below.
-      // Tween passes are counted inside the tick's morphMs instead.
-      const recordPass = () => {
-        if (tween) return;
-        const p = debugPerfRef.current;
-        const spent = performance.now() - now;
-        if (fine) p.fineMs = p.fineMs ? p.fineMs * 0.9 + spent * 0.1 : spent;
-        else p.fullMs = p.fullMs ? p.fullMs * 0.9 + spent * 0.1 : spent;
-      };
-      // Absence detection: if positioning passes stopped for a while (hidden
-      // tab, sleep), drop all per-train blend/heading state — the next pass
-      // places everything at its true current position before the user sees a
-      // frame, instead of animating a mass catch-up they never watched. Keep
-      // snapping through the first fresh poll (RESYNC_MS), which carries the
-      // absence's accumulated data drift.
-      if (lastPassRef.current && nowEpoch - lastPassRef.current > WAKE_GAP_MS) {
-        resyncUntilRef.current = nowEpoch + RESYNC_MS;
-        render.clear();
-      }
-      lastPassRef.current = nowEpoch;
-      const morphFrac = morphFracRef.current;
-      const geo = morphFrac >= 1 - 1e-6;
-      const octi = morphFrac <= 1e-6;
-      const settled = geo || octi;
-      // Perceptual gating: skip shape updates smaller than half a SCREEN pixel
-      // (zoomed out, every train moves sub-pixel per frame), and skip trains
-      // that are off-screen before AND after the move — positions are absolute,
-      // so they're exact whenever they re-enter view. Both cut the per-frame
-      // update count during the morph without any visible difference. The fine
-      // per-frame pass instead uses near-zero gates: visible motion advances
-      // every frame in sub-pixel increments — that's the butter.
-      const zoom = editor.getZoomLevel();
-      // Fine gate: ~0.08 screen px — far below perception at 60fps, but ~3x
-      // fewer store writes than updating every moving train every frame.
-      const minDelta = fine ? 0.08 / zoom : Math.max(0.2, 0.5 / zoom);
-      const minRot = fine ? 0.004 : 0.02;
-      const vp = editor.getViewportPageBounds();
-      // Tween passes use a proportional margin (the morph sweeps shapes fast,
-      // so a fixed 50-unit apron under-covers at speed); the ambient 10Hz
-      // full pass is the backstop that trues late sweep-ins within ≤100ms.
-      const apron = tween ? Math.max(vp.w, vp.h) * 0.25 : 50;
-      const vpX0 = vp.x - apron;
-      const vpY0 = vp.y - apron;
-      const vpX1 = vp.x + vp.w + apron;
-      const vpY1 = vp.y + vp.h + apron;
-      const onScreen = (px: number, py: number) =>
-        px >= vpX0 && px <= vpX1 && py >= vpY0 && py <= vpY1;
-
-      // Station centres memoised for THIS pass (positions can't change inside
-      // a synchronous pass; every pass starts a fresh memo).
-      const centreCache = new Map<TLShapeId, Pt | null>();
-      const centreOf = (id: TLShapeId): Pt | null => {
-        let c = centreCache.get(id);
-        if (c === undefined) {
-          c = stationCentre(editor, id);
-          centreCache.set(id, c);
-        }
-        return c;
-      };
-
-      // Page-space point + tangent for a pose, using the geometry that matches
-      // how the line is currently drawn. Shared by the main placement and the
-      // dwell look-ahead that pre-aims a stopped train's heading.
-      const placedFor = (
-        pose: TrainPose,
-      ): { point: Pt; tangent: Pt } | null => {
-        const netIds = branchStationIdsRef.current.get(pose.branchShapeId);
-        if (!netIds) return null;
-        const i = pose.segIndex;
-        const idA = shapeIdForRef.current.get(netIds[i]);
-        const idB = shapeIdForRef.current.get(netIds[i + 1]);
-        if (!idA || !idB) return null;
-        // Mid-morph, centres come from the tween's own pose map (set for
-        // exactly the animation's duration) so trains ride the SAME geometry
-        // the lines were drawn from this frame; settled passes read live —
-        // memoised per pass, since ~140 visible trains share a much smaller
-        // station set and each transform read costs more than the map hit.
-        const tweenMap = morphCentresRef.current;
-        const cA = tweenMap?.get(idA) ?? centreOf(idA);
-        const cB = tweenMap?.get(idB) ?? centreOf(idB);
-        if (!cA || !cB) return null;
-        const fFwd = pose.reversed ? 1 - pose.f : pose.f;
-        const branchId = pose.branchShapeId as TLShapeId;
-        if (geo) {
-          const seg = lineSegGeo.current.get(branchId)?.[i];
-          const arc = segProfilesRef.current.get(branchId)?.[i]?.arc;
-          return seg && seg.length >= 2
-            ? arc
-              ? pointAlongArc(seg, arc, fFwd)
-              : pointAlong(seg, fFwd)
-            : straightAt(cA, cB, fFwd);
-        }
-        if (octi) return octiPointAt(cA, cB, fFwd);
-        const profile = segProfilesRef.current.get(branchId)?.[i] ?? null;
-        return morphPointAt(cA, cB, profile, morphFrac, fFwd);
-      };
-
-      // Read-only pass first: compute poses and collect the create/update/delete
-      // work. Store writes (and geo mode's readonly lift) happen only when there
-      // IS work — most ambient ticks are no-ops thanks to the perceptual gate,
-      // and a no-op tick that toggled instance state 10x/s caused store churn
-      // during panning for nothing.
-      const seen = new Set<string>();
-      const toCreate: {
-        id: TLShapeId;
-        type: "train";
-        x: number;
-        y: number;
-        rotation: number;
-        isLocked: boolean;
-        props: { w: number; h: number; color: string };
-      }[] = [];
-      // One batched updateShapes call; heading goes in the shape's TOP-LEVEL
-      // rotation (props stay constant), so tldraw's memoized component never
-      // re-renders — per-frame React re-renders of 600+ trains were the
-      // mode-morph's dominant cost. Rotation pivots the top-left corner, so
-      // x/y are counter-offset to keep the marker CENTRE on the track point.
-      const toUpdate: {
-        id: TLShapeId;
-        type: "train";
-        x: number;
-        y: number;
-        rotation: number;
-      }[] = [];
-      for (const [key, rec] of store) {
-        // On a fresh poll, convert the correction into a TIME offset that a
-        // critically damped spring drives back to zero: the train runs
-        // briefly slow (or gently catches up) instead of teleporting or
-        // sliding backward. The spring's velocity carries across captures, so
-        // a poll landing mid-glide re-aims it with NO speed jump; a hard
-        // monotonic clamp keeps display speed within 0.25x-1.75x of real.
-        // Falls back to a decaying 2D point offset when the new trajectory
-        // doesn't pass the displayed pose (reroute / branch switch). Skipped
-        // during the morph, where the whole line is already moving.
-        let rs = render.get(key);
-        // Fine and tween passes smooth what's already (near) on screen —
-        // BEFORE any pose computation, which is most of a pass's cost;
-        // initialisation and newly-visible trains belong to the 10Hz full
-        // pass.
-        if ((fine || tween) && (!rs || !onScreen(rs.x, rs.y))) continue;
-        let capture2D = false;
-        if (rs && rs.fetchMs !== rec.fetchMs) {
-          rs.fetchMs = rec.fetchMs;
-          if (nowEpoch < resyncUntilRef.current) {
-            // Post-wake window: present fresh data instantly, no blending.
-            rs.springO = 0;
-            rs.springV = 0;
-            rs.offX = 0;
-            rs.offY = 0;
-          } else if (settled) {
-            const tEq = rs.pose ? trainTimeAt(rec, rs.pose) : null;
-            const off = tEq === null ? null : tEq - nowEpoch;
-            if (off !== null && Math.abs(off) <= TRAIN_BLEND_MAX_MS) {
-              // Position-continuous by construction (the new trajectory
-              // passes the displayed pose at nowEpoch + off); springV is
-              // deliberately NOT reset — velocity continuity.
-              rs.springO = off;
-              // Stiffness ~4/|off|s: small corrections settle in ~1.5-3s and
-              // a 45s correction in ~80s (like the old 2x|off| window). The
-              // steepest stretch rides the 0.25x monotonic clamp below.
-              rs.springW = Math.min(3, 4000 / Math.max(1334, Math.abs(off)));
-              rs.offX = 0;
-              rs.offY = 0;
-            } else {
-              capture2D = true;
-              rs.springO = 0;
-              rs.springV = 0;
-            }
-          } else {
-            rs.springO = 0;
-            rs.springV = 0;
-            rs.offX = 0;
-            rs.offY = 0;
-          }
-        }
-        let decay = 0;
-        let dispTime = nowEpoch;
-        let headDtMs = 0;
-        if (rs) {
-          headDtMs = Math.max(0, nowEpoch - rs.springT);
-          if (settled) {
-            // Integrate the critically damped spring (closed form), then
-            // clamp display time to monotonic forward within [0.25, 1.75]x.
-            // Everything runs on the SAME clock as display time (Date.now):
-            // deriving dt from performance.now would freeze trains whenever
-            // the two clocks diverge (system sleep/clock slew — and the
-            // virtual-time test harness).
-            const dtMs = Math.max(0, nowEpoch - rs.springT);
-            const dtS = dtMs / 1000;
-            const a = rs.springV + rs.springW * rs.springO;
-            const e = Math.exp(-rs.springW * dtS);
-            rs.springO = (rs.springO + a * dtS) * e;
-            rs.springV = (rs.springV - a * rs.springW * dtS) * e;
-            dispTime = nowEpoch + rs.springO;
-            if (dtMs > 0) {
-              const lo = rs.dispTime + 0.25 * dtMs;
-              const hi = rs.dispTime + 1.75 * dtMs;
-              if (dispTime < lo || dispTime > hi) {
-                dispTime = dispTime < lo ? lo : hi;
-                rs.springO = dispTime - nowEpoch;
-                // Re-sync the spring's velocity to the APPLIED derivative so
-                // the clamp releasing doesn't kink the display speed.
-                rs.springV = (dispTime - rs.dispTime - dtMs) / dtS;
-              }
-            }
-            const dt2D = (now - rs.offStart) / rs.blendMs;
-            decay = dt2D >= 1 ? 0 : 1 - smoothstepEase(dt2D);
-          } else {
-            rs.springO = 0;
-            rs.springV = 0;
-          }
-          rs.springT = nowEpoch;
-          rs.dispTime = dispTime;
-        }
-        const pose = trainPose(rec, dispTime);
-        if (!pose) continue;
-        if (onlyBranches && !onlyBranches.has(pose.branchShapeId)) continue;
-        // Dwell fast-path (fine passes): a stationary train whose corrections
-        // have decayed, heading has settled and line geometry hasn't moved
-        // renders exactly where it already is — skip the geometry eval, which
-        // is the bulk of per-train cost, for the ~half of the visible fleet
-        // dwelling at any moment. A dwelling pose sits pinned at f=0, so its
-        // position can't drift with display time; departure flips
-        // pose.moving, which lands in the full pipeline again.
-        if (
-          fine &&
-          !pose.moving &&
-          rs &&
-          rs.pose &&
-          !rs.pose.moving &&
-          rs.pose.branchShapeId === pose.branchShapeId &&
-          rs.pose.segIndex === pose.segIndex &&
-          rs.pose.reversed === pose.reversed &&
-          rs.geomGen === geomGenRef.current &&
-          ((now - rs.offStart) / rs.blendMs >= 1 ||
-            (rs.offX === 0 && rs.offY === 0)) &&
-          rs.headRot !== undefined &&
-          Math.abs(rs.rot - rs.headRot) < minRot
-        ) {
-          seen.add(key);
-          continue;
-        }
-        const placed = placedFor(pose);
-        if (!placed) continue;
-        const tx = placed.point.x;
-        const ty = placed.point.y;
-        if (!rs) {
-          rs = {
-            x: tx,
-            y: ty,
-            fetchMs: rec.fetchMs,
-            pose,
-            springO: 0,
-            springV: 0,
-            springW: 3,
-            springT: nowEpoch,
-            dispTime: nowEpoch,
-            rot: Number.NaN,
-            offX: 0,
-            offY: 0,
-            offStart: now,
-            blendMs: TRAIN_BLEND_MS,
-          };
-          render.set(key, rs);
-        }
-        if (capture2D) {
-          const ox = rs.x - tx;
-          const oy = rs.y - ty;
-          if (Math.hypot(ox, oy) > TRAIN_GLIDE_SNAP_UNITS) {
-            rs.offX = 0;
-            rs.offY = 0;
-            decay = 0;
-          } else {
-            rs.offX = ox;
-            rs.offY = oy;
-            rs.offStart = now;
-            rs.blendMs = TRAIN_BLEND_MS;
-            decay = 1;
-          }
-        }
-        const dispX = tx + rs.offX * decay;
-        const dispY = ty + rs.offY * decay;
-        rs.x = dispX;
-        rs.y = dispY;
-        rs.pose = pose;
-        rs.geomGen = geomGenRef.current;
-        // Heading: smooth the displayed rotation toward the target tangent
-        // (shortest arc, tau ~120ms) so reversals and departures swing over
-        // ~0.4s instead of snapping. A dwelling on-screen train aims at its
-        // DEPARTURE tangent (probe the trajectory ahead), turning on the
-        // platform before it moves.
-        let targetRot = Math.atan2(placed.tangent.y, placed.tangent.x);
-        if (settled && !pose.moving && onScreen(dispX, dispY)) {
-          // The probed departure tangent only changes when the record
-          // refreshes, the dwell step changes, or the line geometry moves —
-          // memoise on those (probing cost 3 trainPose+placedFor per train
-          // per frame, which dominated the fine pass at editing zooms).
-          const headKey = `${rec.fetchMs}:${pose.branchShapeId}:${pose.segIndex}:${pose.reversed}:${geomGenRef.current}`;
-          if (rs.headKey === headKey && rs.headRot !== undefined) {
-            targetRot = rs.headRot;
-          } else {
-            for (const k of HEADING_PROBES) {
-              const fut = trainPose(rec, dispTime + k);
-              if (!fut) break;
-              if (fut.moving) {
-                const fp = placedFor(fut);
-                if (fp) targetRot = Math.atan2(fp.tangent.y, fp.tangent.x);
-                break;
-              }
-            }
-            rs.headKey = headKey;
-            rs.headRot = targetRot;
-          }
-        }
-        let rot: number;
-        if (Number.isFinite(rs.rot)) {
-          const delta =
-            ((targetRot - rs.rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI;
-          rot =
-            rs.rot + delta * (1 - Math.exp(-headDtMs / TRAIN_HEADING_TAU_MS));
-        } else {
-          rot = targetRot; // first placement — no spawn swing
-        }
-        rs.rot = rot;
-        // Rotation pivots the origin (top-left): offset it so the rotated
-        // centre R(rot)·(w/2, h/2) lands exactly on the track point.
-        const cos = Math.cos(rot);
-        const sin = Math.sin(rot);
-        const x = dispX - ((TRAIN_W / 2) * cos - (TRAIN_H / 2) * sin);
-        const y = dispY - ((TRAIN_W / 2) * sin + (TRAIN_H / 2) * cos);
-        seen.add(key);
-        const shapeId = shapes.get(key);
-        if (!shapeId) {
-          // Creation belongs to the ambient full pass.
-          if (onlyBranches || tween) continue;
-          const newId = createShapeId();
-          shapes.set(key, newId);
-          toCreate.push({
-            id: newId,
-            type: "train",
-            x,
-            y,
-            rotation: rot,
-            isLocked: true,
-            props: { w: TRAIN_W, h: TRAIN_H, color: rec.color },
-          });
-        } else {
-          const cur = editor.getShape(shapeId) as TrainShape | undefined;
-          if (!cur) continue;
-          if (!onScreen(cur.x, cur.y) && !onScreen(x, y)) continue;
-          // Skip sub-perceptual jitter (< ~0.5 screen px / 0.02 rad). The
-          // rotation delta is wrapped so a heading crossing the ±π seam
-          // doesn't read as a ~2π change.
-          const dRot = Math.abs(
-            ((cur.rotation - rot + 3 * Math.PI) % (2 * Math.PI)) - Math.PI,
-          );
-          if (
-            Math.abs(cur.x - x) > minDelta ||
-            Math.abs(cur.y - y) > minDelta ||
-            dRot > minRot
-          ) {
-            toUpdate.push({ id: shapeId, type: "train", x, y, rotation: rot });
-          }
-        }
-      }
-      const toDelete: TLShapeId[] = [];
-      if (!onlyBranches && !fine && !tween) {
-        for (const [key, shapeId] of shapes) {
-          if (!seen.has(key)) {
-            toDelete.push(shapeId);
-            shapes.delete(key);
-            render.delete(key);
-          }
-        }
-      }
-      if (!toCreate.length && !toUpdate.length && !toDelete.length) {
-        recordPass();
-        return;
-      }
-
-      // Trains are programmatic; geo mode's readonly instance state blocks all
-      // create/update, so lift it just for this synchronous batch, then
-      // restore. History is skipped too: an undo that removed a train shape
-      // would hide that train for good — its key still maps to the dead id,
-      // so the create branch never runs again.
-      const readonly = editor.getInstanceState().isReadonly;
-      if (readonly) editor.updateInstanceState({ isReadonly: false });
-      try {
-        editor.run(
-          () => {
-            if (toCreate.length) editor.createShapes<TrainShape>(toCreate);
-            if (toUpdate.length) editor.updateShapes(toUpdate);
-            if (toDelete.length) editor.deleteShapes(toDelete);
-          },
-          { ignoreShapeLock: true, history: "ignore" },
-        );
-      } finally {
-        if (readonly) editor.updateInstanceState({ isReadonly: true });
-      }
-      recordPass();
-    },
-    [],
-  );
 
   // Poll live arrivals (~30s) and rebuild the train store, keyed by branch.
   useEffect(() => {
