@@ -182,11 +182,16 @@ textarea {
   transition: opacity 600ms ease;
 }
 
+/* Oversized 2x so the compositor bridge (transform during camera motion —
+   see BlueprintBackground) has spare grid to slide into view; content is
+   only repainted when the rest camera snaps. */
 .blueprint-grid {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  left: -50%;
+  top: -50%;
+  width: 200%;
+  height: 200%;
+  will-change: transform;
   opacity: 0;
   transition: opacity 250ms ease;
 }
@@ -203,14 +208,14 @@ textarea {
    re-rendering ~230 line casings + 505 stations — that synchronous commit,
    re-rasterized at zoomed scale, read as a screen-wide flicker. */
 
-/* White drafting ink around the tube lines: a wide translucent glow under a
-   crisp opaque outline (opaque so overlapping outlines don't alpha-stack
-   into seams), rendered as plain strokes beneath each casing
-   (TubeLineShapeUtil). Deliberately NO transition: fading would repaint
-   ~230 large line svgs every frame for its duration — the screen-wide
-   flicker at high zoom. Instead the ink flips in ONE repaint, timed by
-   TubeMap's bpStyled state to land while the paper is light (white on
-   white is invisible), and the composited paper fade does the revealing. */
+/* White drafting ink around the tube lines: one crisp opaque outline stroke
+   beneath each casing (TubeLineShapeUtil) — opaque so overlaps don't
+   alpha-stack into seams, single so zoom re-rasters stay cheap.
+   Deliberately NO transition: fading would repaint ~230 large line svgs
+   every frame for its duration — the screen-wide flicker at high zoom.
+   Instead the ink flips in ONE repaint, timed by TubeMap's bpStyled state
+   to land while the paper is light (white on white is invisible), and the
+   composited paper fade does the revealing. */
 .bp-outline {
   opacity: 0;
 }
@@ -219,21 +224,19 @@ textarea {
   opacity: 1;
 }
 
-/* Station markers: crisp white ring + soft halo in blueprint mode. */
+/* Station markers: a crisp white ring in blueprint mode. No blur term —
+   soft shadows on hundreds of markers made zoom re-rasters measurably
+   heavier, and the ringed look holds up without it. */
 .stn-marker {
   transition: box-shadow 400ms ease;
 }
 
 .bp-mode .stn-marker--dot {
-  box-shadow:
-    0 0 0 1.5px rgba(234, 242, 255, 0.9),
-    0 0 7px 1px rgba(219, 234, 254, 0.45);
+  box-shadow: 0 0 0 1.5px rgba(234, 242, 255, 0.95);
 }
 
 .bp-mode .stn-marker--ring {
-  box-shadow:
-    0 0 0 1.5px rgba(234, 242, 255, 0.65),
-    0 0 8px 2px rgba(219, 234, 254, 0.4);
+  box-shadow: 0 0 0 1.5px rgba(234, 242, 255, 0.7);
 }
 
 /* Station-label ink. Dimmed (closed-station) ink is a gentler grey than the

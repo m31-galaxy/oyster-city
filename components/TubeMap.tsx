@@ -127,21 +127,69 @@ function BlueprintBackground() {
     () => (gridMounted ? editor.getViewportScreenBounds() : null),
     [editor, gridMounted],
   );
-  // Same offset arithmetic as tldraw's DefaultGrid: the page origin lands
-  // at (cam.x * z, cam.y * z) screen px; the grid tiles from there.
-  const cell = (cam?.z ?? 1) * BLUEPRINT_GRID;
+  // The svg CONTENT renders for a RESTING camera (2x-oversized so there is
+  // spare grid around the viewport) and live camera motion is bridged by a
+  // compositor-only transform on the svg — repainting a full-viewport grid
+  // on every zoom/pan frame competed for the raster budget and showed up
+  // as tile flicker during zooms. The rest camera snaps to the live one
+  // 120ms after motion stops (one repaint), or immediately when the bridge
+  // would run past the oversize coverage (zoom beyond ~1.45x either way,
+  // or a pan past ~40% of the viewport).
+  const [restCam, setRestCam] = useState<{
+    x: number;
+    y: number;
+    z: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!cam || !vsb) {
+      setRestCam(null);
+      return;
+    }
+    setRestCam((prev) => {
+      if (!prev) return cam;
+      const k = cam.z / prev.z;
+      const dx = Math.abs((cam.x - prev.x) * cam.z);
+      const dy = Math.abs((cam.y - prev.y) * cam.z);
+      return k > 1.45 || k < 0.55 || dx > vsb.w * 0.4 || dy > vsb.h * 0.4
+        ? cam
+        : prev;
+    });
+    const t = setTimeout(() => setRestCam(cam), 120);
+    return () => clearTimeout(t);
+  }, [cam, vsb]);
+  // Same offset arithmetic as tldraw's DefaultGrid — the page origin lands
+  // at (cam.x * z, cam.y * z) screen px — shifted by half a viewport
+  // because the svg's local origin sits at screen (-w/2, -h/2).
+  const cell = (restCam?.z ?? 1) * BLUEPRINT_GRID;
   const major = cell * 5;
-  const ox = cam ? mod(0.5 + cam.x * cam.z, cell) : 0;
-  const oy = cam ? mod(0.5 + cam.y * cam.z, cell) : 0;
-  const mox = cam ? mod(0.5 + cam.x * cam.z, major) : 0;
-  const moy = cam ? mod(0.5 + cam.y * cam.z, major) : 0;
+  const gx = restCam && vsb ? 0.5 + restCam.x * restCam.z + vsb.w / 2 : 0;
+  const gy = restCam && vsb ? 0.5 + restCam.y * restCam.z + vsb.h / 2 : 0;
+  const ox = mod(gx, cell);
+  const oy = mod(gy, cell);
+  const mox = mod(gx, major);
+  const moy = mod(gy, major);
   // Fade the minor grid away as its cells shrink below legibility.
   const minorOpacity = Math.max(0, Math.min(1, (cell - 9) / 14));
 
+  // The per-frame bridge: where the live camera has moved relative to the
+  // rendered rest state, expressed as translate+scale about the viewport
+  // origin (screen (0,0) = local (w/2, h/2) of the oversized svg).
+  let bridge: CSSProperties | undefined;
+  if (cam && restCam && vsb) {
+    const k = cam.z / restCam.z;
+    const bx = (cam.x - restCam.x) * cam.z;
+    const by = (cam.y - restCam.y) * cam.z;
+    bridge = {
+      transform: `translate(${bx}px, ${by}px) scale(${k})`,
+      transformOrigin: `${vsb.w / 2}px ${vsb.h / 2}px`,
+    };
+  }
+
   let grid: ReactNode = null;
-  if (cam && vsb) {
-    const w = vsb.w;
-    const h = vsb.h;
+  if (restCam && vsb) {
+    // Everything below draws into the OVERSIZED box (2w x 2h).
+    const w = vsb.w * 2;
+    const h = vsb.h * 2;
     const minors = minorOpacity >= 0.05;
     const step = minors ? cell : major;
     const stepX = minors ? ox : mox;
@@ -265,7 +313,7 @@ function BlueprintBackground() {
     <div className="map-underlay">
       <div className={active ? "blueprint blueprint--on" : "blueprint"}>
         {grid !== null && (
-          <svg className="blueprint-grid" aria-hidden="true">
+          <svg className="blueprint-grid" style={bridge} aria-hidden="true">
             {grid}
           </svg>
         )}

@@ -115,15 +115,15 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
       [lineId],
     );
     const color = dimmed ? dimmedColour(lineColor) : lineColor;
-    // Blueprint mode (edit): white drafting ink around the line — a wide
-    // translucent glow under a crisp OPAQUE outline. Plain strokes,
-    // deliberately NOT a drop-shadow filter: filters re-rasterize per
-    // repaint and would tax pans and drag redraws. The paths stay mounted;
-    // visibility is the map root's .bp-mode class (one style pass, zero
-    // re-renders) flipped in a single repaint with no transition — see
-    // .bp-outline in globals.css for the white-on-white choreography that
-    // keeps the flip invisible. Casings only — a hollow line's core twin
-    // rides its casing.
+    // Blueprint mode (edit): white drafting ink around the line — ONE crisp
+    // opaque outline stroke. Deliberately not a drop-shadow filter (filters
+    // re-rasterize per repaint) and no translucent halo twin (a second
+    // 14px blended stroke per casing measurably slowed zoom re-rasters —
+    // tile flicker). The path stays mounted; visibility is the map root's
+    // .bp-mode class (one style pass, zero re-renders) flipped in a single
+    // repaint with no transition — see .bp-outline in globals.css for the
+    // white-on-white choreography that keeps the flip invisible. Casings
+    // only — a hollow line's core twin rides its casing.
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.
@@ -142,26 +142,15 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
           style={{ overflow: "visible", display: "block" }}
         >
           {!core && (
-            <>
-              <path
-                className="bp-outline"
-                d={d}
-                fill="none"
-                stroke="rgba(219, 234, 254, 0.22)"
-                strokeWidth={14}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-              />
-              <path
-                className="bp-outline"
-                d={d}
-                fill="none"
-                stroke="#eaf2ff"
-                strokeWidth={9}
-                strokeLinejoin="round"
-                strokeLinecap="round"
-              />
-            </>
+            <path
+              className="bp-outline"
+              d={d}
+              fill="none"
+              stroke="#eaf2ff"
+              strokeWidth={9}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
           )}
           <path
             d={d}
