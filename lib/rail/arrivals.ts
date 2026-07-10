@@ -1,181 +1,141 @@
 import "server-only";
 import type { Prediction } from "@/lib/tfl/types";
 import { RAIL_LINES, type RailLineConfig } from "./lines";
-import { fetchBoard, type LdbBoard, type LdbCallingPoint } from "./ldbws";
+import {
+  fetchDepBoard,
+  londonIsoToMs,
+  type LdbsvBoard,
+  type LdbsvLocation,
+} from "./ldbsv";
 import { fixtureBoards } from "./fixture";
 
-// Turn Darwin departure-board sightings into the SAME Prediction[] shape the
+// Turn staff departure-board sightings into the SAME Prediction[] shape the
 // TfL Arrivals endpoint yields, so lib/tube/trains.ts consumes National Rail
-// lines with zero changes. Everything the train model needs survives the
-// translation: a stable per-train identity (Darwin serviceID — unlike TfL
-// vehicleIds these are genuinely unique), and a ladder of upcoming stops
-// with ABSOLUTE expected times (LDBWS "HH:mm" London-local, resolved to the
-// nearest occurrence — the same absolute-time anchoring that made tube
-// positions cache-proof).
+// lines with zero changes. The staff data is strictly better than TfL's:
+// identity is Darwin's globally-unique `rid` (no vehicleId collisions by
+// construction), times are absolute ISO with seconds precision, and
+// `subsequentLocations` includes PASSED stations (isPass) — extra anchors
+// that tighten interpolation between calling points.
+//
+// Departures-board semantics: a service appears on the boards of stations
+// it has yet to DEPART, each sighting carrying its full remaining route.
+// After it leaves our last polled board, no board shows it again — the
+// client keeps its last record walking to the trajectory's end instead
+// (see the NR retention in TubeMap's poll).
 
-/** Only emit a train once it is inside the drawn network, or due at its
- * first drawn station this soon — otherwise a Bedford train 25 minutes out
- * would sit parked as a ghost at the map-edge station until it arrived. */
+/** Only emit a train once it is due at its first drawn station this soon —
+ * otherwise a Bedford train 25 minutes out would sit parked as a ghost at
+ * the map-edge station until it arrived. Services with an actual time at a
+ * drawn station (already inside) always pass. */
 const ENTRY_GATE_MS = 10 * 60_000;
 /** Drop pending anchors this far in the past (board staleness guard). */
 const STALE_MS = 90_000;
 
-/** Resolve an LDBWS "HH:mm" (Europe/London local) to epoch ms, choosing the
- * occurrence nearest to now — boards straddle midnight in both directions. */
-export function londonTimeToMs(hhmm: string, nowMs: number): number | null {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
-  if (!m) return null;
-  const target = Number(m[1]) * 60 + Number(m[2]);
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Europe/London",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(nowMs));
-  const get = (t: string) =>
-    Number(parts.find((p) => p.type === t)?.value ?? 0);
-  const nowMin = (get("hour") % 24) * 60 + get("minute");
-  let delta = target - nowMin;
-  if (delta > 720) delta -= 1440;
-  if (delta < -720) delta += 1440;
-  // Land on the exact minute: strip now's seconds before applying the delta.
-  return nowMs - get("second") * 1000 - (nowMs % 1000) + delta * 60_000;
-}
-
-/** Effective time of a calling point: actual, else estimate, else schedule.
- * "On time" (and other non-times like "Delayed"/"No report") fall through to
- * the schedule; "Cancelled" yields null so the anchor is skipped. */
-function pointTimeMs(
-  p: LdbCallingPoint,
-  nowMs: number,
-): {
-  ms: number | null;
-  called: boolean;
-} {
-  const resolve = (v: string | undefined): number | null => {
-    if (!v) return null;
-    if (/cancelled/i.test(v)) return null;
-    return londonTimeToMs(v, nowMs);
-  };
-  if (p.at !== undefined) {
-    return { ms: resolve(p.at) ?? resolve(p.st), called: true };
-  }
-  if (p.et !== undefined && /cancelled/i.test(p.et)) {
-    return { ms: null, called: false };
-  }
-  return { ms: resolve(p.et) ?? resolve(p.st), called: false };
-}
-
 interface Anchor {
-  crs: string;
+  stationId: string;
   ms: number;
   called: boolean;
 }
 
-interface ServiceState {
-  serviceID: string;
-  destinationName: string;
-  /** Best-known anchor per CRS (earliest time wins across boards). */
-  anchors: Map<string, Anchor>;
-}
-
-/** Fold one board's sighting of a service into its accumulated anchor set. */
-function foldService(
-  state: ServiceState,
-  board: LdbBoard,
-  svc: { sta?: string; eta?: string; std?: string; etd?: string },
-  prev: LdbCallingPoint[],
-  next: LdbCallingPoint[],
-  nowMs: number,
-) {
-  const add = (crs: string, ms: number | null, called: boolean) => {
-    if (ms === null) return;
-    const cur = state.anchors.get(crs);
-    // Called (actual) beats estimate; otherwise keep the earliest estimate —
-    // boards revise upward as delays develop, and the freshest board wins on
-    // the next poll anyway.
-    if (
-      !cur ||
-      (called && !cur.called) ||
-      (called === cur.called && ms < cur.ms)
-    ) {
-      state.anchors.set(crs, { crs, ms, called });
-    }
+/** A location's anchor time: prefer the ARRIVAL (that's what Prediction's
+ * expectedArrival means), fall back to the departure (origins, passes at
+ * some junctions); actual beats estimate beats schedule. */
+function locationTime(loc: LdbsvLocation): {
+  ms: number | null;
+  called: boolean;
+} {
+  const arr = loc.ata ?? loc.eta ?? loc.sta;
+  const dep = loc.atd ?? loc.etd ?? loc.std;
+  const iso = arr ?? dep;
+  if (!iso) return { ms: null, called: false };
+  return {
+    ms: londonIsoToMs(iso),
+    called: loc.ata != null || loc.atd != null,
   };
-  for (const p of prev) {
-    const { ms, called } = pointTimeMs(p, nowMs);
-    add(p.crs, ms, called);
-  }
-  // The board station row itself: prefer the arrival time, fall back to the
-  // departure (origins have no sta).
-  const rowTime =
-    (svc.eta && !/on time|delayed|cancelled|no report/i.test(svc.eta)
-      ? londonTimeToMs(svc.eta, nowMs)
-      : null) ??
-    (svc.sta ? londonTimeToMs(svc.sta, nowMs) : null) ??
-    (svc.etd && !/on time|delayed|cancelled|no report/i.test(svc.etd)
-      ? londonTimeToMs(svc.etd, nowMs)
-      : null) ??
-    (svc.std ? londonTimeToMs(svc.std, nowMs) : null);
-  add(board.crs, rowTime, false);
-  for (const p of next) {
-    const { ms, called } = pointTimeMs(p, nowMs);
-    add(p.crs, ms, called);
-  }
 }
 
 /** Assemble Prediction[] for one configured line from its polled boards. */
 function predictionsForLine(
   line: RailLineConfig,
-  boards: LdbBoard[],
+  boards: LdbsvBoard[],
   nowMs: number,
 ): Prediction[] {
-  const services = new Map<string, ServiceState>();
+  // rid -> best-known anchors per station (a service can appear on several
+  // boards; actuals beat estimates, then earliest wins).
+  const services = new Map<
+    string,
+    { destination: string; anchors: Map<string, Anchor> }
+  >();
   for (const board of boards) {
-    for (const svc of board.services) {
-      if (!line.operatorCodes.includes(svc.operatorCode)) continue;
-      if (!svc.serviceID) continue;
-      let state = services.get(svc.serviceID);
+    for (const svc of board.trainServices ?? []) {
+      if (!svc.rid) continue;
+      if (svc.operatorCode && !line.operatorCodes.includes(svc.operatorCode))
+        continue;
+      if (svc.isPassengerService === false || svc.isCancelled) continue;
+      let state = services.get(svc.rid);
       if (!state) {
         state = {
-          serviceID: svc.serviceID,
-          destinationName: svc.destinationName,
+          destination: svc.destination?.[0]?.locationName ?? "",
           anchors: new Map(),
         };
-        services.set(svc.serviceID, state);
+        services.set(svc.rid, state);
       }
-      foldService(state, board, svc, svc.previous, svc.subsequent, nowMs);
+      const add = (
+        stationId: string,
+        t: { ms: number | null; called: boolean },
+      ) => {
+        if (t.ms === null) return;
+        const cur = state.anchors.get(stationId);
+        if (
+          !cur ||
+          (t.called && !cur.called) ||
+          (t.called === cur.called && t.ms < cur.ms)
+        ) {
+          state.anchors.set(stationId, {
+            stationId,
+            ms: t.ms,
+            called: t.called,
+          });
+        }
+      };
+      // The board station row itself...
+      const rowStation = line.crsToStation[board.crs];
+      if (rowStation) add(rowStation, locationTime(svc));
+      // ...and every remaining location we draw. Passing points at drawn
+      // stations (isPass) count too — extra anchors, better interpolation.
+      // Junctions have no crs and stay unmapped for now.
+      for (const loc of svc.subsequentLocations ?? []) {
+        if (loc.isCancelled) continue;
+        const stationId = loc.crs ? line.crsToStation[loc.crs] : undefined;
+        if (!stationId) continue;
+        add(stationId, locationTime(loc));
+      }
     }
   }
 
   const out: Prediction[] = [];
-  for (const state of services.values()) {
-    const inNet = [...state.anchors.values()].filter(
-      (a) => line.crsToStation[a.crs] !== undefined,
-    );
-    const pending = inNet
+  for (const [rid, state] of services) {
+    const pending = [...state.anchors.values()]
       .filter((a) => !a.called && a.ms > nowMs - STALE_MS)
       .sort((a, b) => a.ms - b.ms);
     if (!pending.length) continue;
-    // Entry gate: inside the network already (has called at a drawn
+    // Entry gate: inside the network already (an actual time at a drawn
     // station), or first drawn stop is imminent.
-    const inside = inNet.some((a) => a.called);
+    const inside = [...state.anchors.values()].some((a) => a.called);
     if (!inside && pending[0].ms - nowMs > ENTRY_GATE_MS) continue;
     for (const a of pending) {
-      const stationId = line.crsToStation[a.crs];
       out.push({
-        id: `${state.serviceID}:${a.crs}`,
+        id: `${rid}:${a.stationId}`,
         lineId: line.lineId,
         lineName: line.lineName,
-        vehicleId: state.serviceID,
-        naptanId: stationId,
-        stationName: a.crs,
+        vehicleId: rid,
+        naptanId: a.stationId,
+        stationName: a.stationId,
         platformName: "",
         direction: "",
         destinationNaptanId: "",
-        destinationName: state.destinationName,
-        towards: state.destinationName,
+        destinationName: state.destination,
+        towards: state.destination,
         currentLocation: "",
         timeToStation: Math.round((a.ms - nowMs) / 1000),
         expectedArrival: new Date(a.ms).toISOString(),
@@ -192,8 +152,9 @@ export type RailSource = "fixture" | "darwin" | "disabled";
 /**
  * Live arrivals for every configured National Rail line, in TfL Prediction
  * shape. Sources, in order: RAIL_FIXTURE=1 (synthetic moving services, for
- * development without credentials), RAIL_LDB_TOKEN (Darwin LDBWS), else [].
- * Board failures degrade per-board — one down station doesn't sink the poll.
+ * development without credentials), RAIL_LDB_TOKEN (staff departure boards
+ * via the Rail Data Marketplace), else disabled. Board failures degrade
+ * per-board — one down station doesn't sink the poll.
  */
 export async function getRailArrivals(): Promise<{
   source: RailSource;
@@ -213,10 +174,9 @@ export async function getRailArrivals(): Promise<{
 
   const out: Prediction[] = [];
   for (const line of RAIL_LINES) {
-    const settled: PromiseSettledResult<LdbBoard>[] = await Promise.allSettled(
-      line.boardCrs.map((crs) => fetchBoard(crs)),
-    );
-    const boards: LdbBoard[] = [];
+    const settled: PromiseSettledResult<LdbsvBoard>[] =
+      await Promise.allSettled(line.boardCrs.map((crs) => fetchDepBoard(crs)));
+    const boards: LdbsvBoard[] = [];
     for (const [i, r] of settled.entries()) {
       if (r.status === "fulfilled") boards.push(r.value);
       else

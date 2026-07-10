@@ -2430,6 +2430,18 @@ export default function TubeMap() {
           );
           for (const r of recs) next.set(r.key, r);
         }
+        // NR retention: staff DEPARTURE boards drop a service once it leaves
+        // its last polled board station, but its record already carries the
+        // full remaining route with times — keep it walking to the
+        // trajectory's end (plus a grace minute) instead of vanishing
+        // mid-run on its final, board-less stretch.
+        if (hasRail && railOk) {
+          for (const [key, rec] of trainStore.current) {
+            if (!NR_LINE_IDS.has(rec.lineId) || next.has(key)) continue;
+            const last = rec.steps[rec.steps.length - 1];
+            if (last && last.endMs > fetchMs - 60_000) next.set(key, rec);
+          }
+        }
         trainStore.current = next;
       } catch {
         // aborted or network error — keep the old store this round

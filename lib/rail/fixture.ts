@@ -1,12 +1,13 @@
 import "server-only";
 import type { RailLineConfig } from "./lines";
-import type { LdbBoard, LdbCallingPoint, LdbService } from "./ldbws";
+import type { LdbsvBoard, LdbsvService } from "./ldbsv";
 
-// Synthetic Darwin boards for development without LDBWS credentials
-// (RAIL_FIXTURE=1): plausible service patterns over the drawn Thameslink
-// corridors, anchored to wall-clock time so the trains genuinely run. Times
-// are minute-granular "HH:mm" strings exactly like real boards, so the whole
-// parse/resolve/derive pipeline is exercised — only the HTTP layer is faked.
+// Synthetic staff departure boards for development without Rail Data
+// Marketplace credentials (RAIL_FIXTURE=1): plausible service patterns over
+// the drawn Thameslink corridors, anchored to wall-clock time so the trains
+// genuinely run. Emits the same LDBSV JSON shapes (rids, ISO London-local
+// times, subsequentLocations) so the whole parse/derive pipeline is
+// exercised — only the HTTP layer is faked.
 
 /** [crs, runSecondsFromPreviousStop] — first entry's seconds are ignored. */
 type Pattern = [string, number][];
@@ -159,18 +160,29 @@ const PATTERNS: Record<string, { headwaySec: number; stops: Pattern }[]> = {
   ],
 };
 
-const hhmm = (ms: number): string =>
-  new Intl.DateTimeFormat("en-GB", {
+/** Epoch -> "yyyy-MM-ddTHH:mm:ss" Europe/London (the LDBSV wire format). */
+const londonIso = (ms: number): string => {
+  const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/London",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
     hour12: false,
-  }).format(new Date(ms));
+  }).formatToParts(new Date(ms));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}T${Number(get("hour")) % 24 < 10 ? "0" : ""}${Number(get("hour")) % 24}:${get("minute")}:${get("second")}`;
+};
 
 /** Synthetic boards: every live service on every pattern, one fake board. */
-export function fixtureBoards(line: RailLineConfig, nowMs: number): LdbBoard[] {
+export function fixtureBoards(
+  line: RailLineConfig,
+  nowMs: number,
+): LdbsvBoard[] {
   const patterns = PATTERNS[line.lineId] ?? [];
-  const services: LdbService[] = [];
+  const services: LdbsvService[] = [];
   for (const [pi, pattern] of patterns.entries()) {
     const journeySec = pattern.stops.reduce((s, [, r]) => s + r, 0);
     const cycle = pattern.headwaySec;
@@ -179,36 +191,43 @@ export function fixtureBoards(line: RailLineConfig, nowMs: number): LdbBoard[] {
     const live = Math.ceil(journeySec / cycle) + 1;
     for (let k = 0; k < live; k++) {
       // Deterministic per (pattern, slot): the departure time is quantised to
-      // the headway grid, so successive polls see the SAME service ids with
+      // the headway grid, so successive polls see the SAME service rids with
       // consistent times — exactly like re-polling a real board.
       const departMs = (Math.floor(nowMs / 1000 / cycle) - k) * cycle * 1000;
-      const id = `fix-${line.lineId}-${pi}-${Math.floor(departMs / 1000)}`;
-      const prev: LdbCallingPoint[] = [];
-      const next: LdbCallingPoint[] = [];
+      const rid = `fix${line.lineId}${pi}x${Math.floor(departMs / 1000)}`;
+      const subsequent = [];
       let t = departMs;
       for (const [i, [crs, run]] of pattern.stops.entries()) {
         if (i > 0) t += run * 1000 + 30_000; // run + dwell
-        const point: LdbCallingPoint = { locationName: crs, crs };
-        if (t <= nowMs) {
-          point.at = hhmm(t);
-          prev.push(point);
-        } else {
-          point.st = hhmm(t);
-          point.et = "On time";
-          next.push(point);
-        }
+        // Departures boards only carry the remaining route — visited stops
+        // drop off. (Fixture stops are 2–4min apart, so the entry gate's
+        // "first stop imminent" arm always admits in-flight services.)
+        if (t <= nowMs) continue;
+        const iso = londonIso(t);
+        subsequent.push({
+          crs,
+          tiploc: crs,
+          sta: iso,
+          eta: iso,
+          isPass: false,
+        });
       }
-      if (!next.length) continue; // journey complete
+      if (!subsequent.length) continue; // journey complete
       services.push({
-        serviceID: id,
+        rid,
         operatorCode: line.operatorCodes[0],
-        destinationName: pattern.stops[pattern.stops.length - 1][0],
-        previous: prev,
-        subsequent: next,
+        isPassengerService: true,
+        isCancelled: false,
+        destination: [
+          { locationName: pattern.stops[pattern.stops.length - 1][0] },
+        ],
+        subsequentLocations: subsequent,
       });
     }
   }
-  // A single synthetic board carrying every service; the board's own CRS is
-  // deliberately unmapped so only the calling points contribute anchors.
-  return [{ crs: "FIX", generatedAt: new Date(nowMs).toISOString(), services }];
+  // A single synthetic board carrying every service; its own CRS is
+  // deliberately unmapped so only the locations contribute anchors.
+  return [
+    { crs: "FIX", generatedAt: londonIso(nowMs), trainServices: services },
+  ];
 }

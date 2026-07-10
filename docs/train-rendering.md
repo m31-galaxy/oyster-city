@@ -222,13 +222,19 @@ Refs in `TubeMap.tsx` (populated in `handleMount`): `shapeIdForRef`,
 - **Poll `useEffect`** (`[mounted]`): waits (200ms retries) for the editor +
   branch registry, then a 30s `setInterval`. ONE fetch for all TfL line ids
   (comma path) plus, in parallel, `/api/rail/arrivals` for National Rail
-  lines (TfL serves no national-rail predictions): a Darwin LDBWS adapter
-  (`lib/rail/`) polls a dozen Thameslink station boards server-side and
-  re-emits the same `Prediction[]` shape, keyed by Darwin serviceID — a
-  genuinely unique per-train id, so the vehicleId-collision class can't
-  occur on NR lines. A rail-side failure carries the previous NR records
-  forward (trajectories keep walking) without sinking the TfL lines. On a
-  TfL failure the previous store is **kept** — trajectories
+  lines (TfL serves no national-rail predictions): `lib/rail/` polls a dozen
+  Thameslink STAFF departure boards (Rail Data Marketplace "Live Departure
+  Board - Staff Version", JSON + x-apikey; the product routes only the
+  departures operations) and re-emits the same `Prediction[]` shape, keyed
+  by Darwin `rid` — globally unique, so the vehicleId-collision class can't
+  occur on NR lines — with seconds-precision ISO times (parsed as
+  Europe/London; the wire format has no zone designator) and passing-point
+  anchors (`isPass` locations at drawn stations). Departure boards drop a
+  service once it leaves its last polled board, so the poll RETAINS an NR
+  record until its trajectory's end rather than vanishing it mid-run. A
+  rail-side failure carries all previous NR records forward without sinking
+  the TfL lines. On a TfL failure the previous store is **kept** —
+  trajectories
   cover the gap and trains glide on (previously, failed lines had their trains
   deleted and re-created).
 - **rAF `useEffect`**: single self-scheduling loop, throttled to
