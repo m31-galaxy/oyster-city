@@ -32,9 +32,12 @@ const dimCache = new Map<string, string>();
 
 /** Closed-line/-station colour: luminance greyscale mixed toward the canvas
  * background. Shared by the line, station, and label renderers so the whole
- * closed network dims into the same family. */
-export function dimmedColour(hex: string): string {
-  const hit = dimCache.get(hex);
+ * closed network dims into the same family. `mix` overrides how far toward
+ * the background to pull — text needs a gentler mix than geometry to stay
+ * readable (see StationShapeUtil's label ink). */
+export function dimmedColour(hex: string, mix: number = DIM_MIX): string {
+  const key = `${hex}@${mix}`;
+  const hit = dimCache.get(key);
   if (hit) return hit;
   const n = parseInt(hex.slice(1), 16);
   const grey = Math.min(
@@ -44,8 +47,8 @@ export function dimmedColour(hex: string): string {
     160,
     0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255),
   );
-  const mix = (bg: number) => Math.round(grey + (bg - grey) * DIM_MIX);
-  const out = `#${((1 << 24) | (mix(DIM_BG.r) << 16) | (mix(DIM_BG.g) << 8) | mix(DIM_BG.b)).toString(16).slice(1)}`;
-  dimCache.set(hex, out);
+  const toBg = (bg: number) => Math.round(grey + (bg - grey) * mix);
+  const out = `#${((1 << 24) | (toBg(DIM_BG.r) << 16) | (toBg(DIM_BG.g) << 8) | toBg(DIM_BG.b)).toString(16).slice(1)}`;
+  dimCache.set(key, out);
   return out;
 }

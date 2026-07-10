@@ -37,6 +37,10 @@ const DOT = 7; // single-line tick diameter (px)
 const LABEL_ZOOM = 0.7;
 /** Ring/label ink; dims with the rest of the marker when the station closes. */
 const INK = "#111111";
+/** Label-ink dim mix: gentler than the geometry's default so 9px closed-
+ * station names stay legible — #6C6C6C is ~4.8:1 against the canvas
+ * background (WCAG AA for small text), where the lines' grey is ~2.6:1. */
+const LABEL_DIM_MIX = 0.4;
 
 export class StationShapeUtil extends ShapeUtil<StationShape> {
   static override type = "station" as const;
@@ -167,14 +171,17 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       () => closedStations.get().has(shape.props.stationId),
       [shape.props.stationId],
     );
-    const ink = dimmed ? dimmedColour(INK) : INK;
+    // The ring dims into the same family as the lines; the label dims LESS
+    // (LABEL_DIM_MIX) so the name stays readable.
+    const ringInk = dimmed ? dimmedColour(INK) : INK;
+    const labelInk = dimmed ? dimmedColour(INK, LABEL_DIM_MIX) : INK;
     const marker: CSSProperties = interchange
       ? {
           width: MARKER,
           height: MARKER,
           borderRadius: "50%",
           background: "#ffffff",
-          border: `2.5px solid ${ink}`,
+          border: `2.5px solid ${ringInk}`,
           boxSizing: "border-box",
         }
       : {
@@ -199,7 +206,7 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
                 style={{
                   ...labelStyle(labelPos),
                   ...labelFade(showLabel),
-                  color: ink,
+                  color: labelInk,
                 }}
               >
                 {name}
