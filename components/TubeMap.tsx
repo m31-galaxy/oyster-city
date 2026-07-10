@@ -53,8 +53,14 @@ import {
 import type { LineStatus, Prediction } from "@/lib/tfl/types";
 
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil, TrainShapeUtil];
-// Double-clicking empty canvas would drop a text shape on the map.
-const tldrawOptions = { createTextOnCanvasDoubleClick: false };
+// Double-clicking empty canvas would drop a text shape on the map, and
+// pasting would drop clipboard content (and has crashed the canvas in the
+// field). Cancelling here stops a paste before any content handling runs;
+// drag-drops don't pass this hook and are no-op'd in handleMount instead.
+const tldrawOptions = {
+  createTextOnCanvasDoubleClick: false,
+  onBeforePasteFromClipboard: () => false as const,
+};
 const MARKER = 11;
 const ANIM_MS = 650;
 /** How often to refresh live train predictions (matches TfL's arrivals TTL). */
@@ -1691,10 +1697,12 @@ export default function TubeMap() {
       );
       recomputeLabelDeclutter(editor);
 
-      // Stations are draggable but otherwise immutable. hideUi keeps tldraw's
-      // keyboard shortcuts and clipboard events mounted, so delete / cut /
-      // paste / duplicate (and alt-drag cloning) all reach the editor — each
-      // is vetoed once at its deepest chokepoint rather than per entry point.
+      // Stations are draggable but otherwise immutable, and the canvas is a
+      // map, not a whiteboard. hideUi keeps tldraw's keyboard shortcuts and
+      // clipboard events mounted, so delete / cut / paste / duplicate /
+      // alt-drag cloning / tool hotkeys / canvas-mode toggles all reach the
+      // editor — each is vetoed once at its deepest chokepoint rather than
+      // per entry point.
       //
       // Deleting (⌫, cut, the eraser tool): cancelled in the store, which
       // covers every route including undo/redo diffs.
@@ -1766,6 +1774,58 @@ export default function TubeMap() {
       const origGroup = stnEditor.groupShapes.bind(editor);
       stnEditor.groupShapes = (shapes, opts) =>
         shapes.some(isStation) ? editor : origGroup(shapes, opts);
+
+      // Tool surface: only select (station drags), hand (panning), and zoom
+      // stay reachable. Every other default tool draws whiteboard marks
+      // (draw, geo, arrow, line, note, text, highlight, laser) or erases
+      // them — and with hideUi their single-letter hotkeys (A, D, R, T, …)
+      // are still mounted. The veto sits on setCurrentTool, the chokepoint
+      // every entry point (hotkey, programmatic, future UI) funnels through.
+      const allowedTools = new Set(["select", "hand", "zoom"]);
+      const origSetCurrentTool = editor.setCurrentTool.bind(editor);
+      editor.setCurrentTool = (id, info = {}) =>
+        allowedTools.has(String(id).split(".")[0])
+          ? origSetCurrentTool(id, info)
+          : editor;
+
+      // External content — pasting or drag-dropping text, files, urls, or
+      // foreign whiteboard shapes — has no place on the map (and pasting
+      // has crashed the canvas in the field). Vetoed at putExternalContent,
+      // the funnel under every per-type handler: no-oping the handlers via
+      // registerExternalContentHandler loses a race with <Tldraw>, which
+      // registers its defaults AFTER onMount. Pasted tldraw content rides
+      // putContentOntoCurrentPage (station-stripped above) instead, and
+      // onBeforePasteFromClipboard (tldrawOptions) stops pastes earlier
+      // still — this is the backstop for drag-drops and API calls.
+      editor.putExternalContent = async () => {};
+
+      // Canvas-restyling toggles ride the same always-mounted shortcuts:
+      // Cmd+/ flips tldraw's dark mode (unreadable labels on a dark map),
+      // Cmd+' draws the dot grid, and focus/debug modes swap the chrome.
+      // Pin all of them; isSnapMode (set below) and isReadonly (the geo-mode
+      // gate and the train tick) must stay writable.
+      const origUpdatePrefs = editor.user.updateUserPreferences.bind(
+        editor.user,
+      );
+      editor.user.updateUserPreferences = (prefs) => {
+        const { colorScheme, ...rest } = prefs;
+        void colorScheme;
+        origUpdatePrefs(rest);
+      };
+      editor.sideEffects.registerBeforeChangeHandler(
+        "instance",
+        (prev, next) =>
+          next.isGridMode === prev.isGridMode &&
+          next.isFocusMode === prev.isFocusMode &&
+          next.isDebugMode === prev.isDebugMode
+            ? next
+            : {
+                ...next,
+                isGridMode: prev.isGridMode,
+                isFocusMode: prev.isFocusMode,
+                isDebugMode: prev.isDebugMode,
+              },
+      );
 
       // Selection-gesture modifiers: rotation snaps to 45° increments by
       // default and resizing keeps the aspect ratio by default; holding Shift
