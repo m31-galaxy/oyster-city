@@ -17,6 +17,7 @@ export interface DebugStats {
     railSource: string;
     railStatus: string;
     railPreds: number;
+    closedLines: string[];
   };
   trains: {
     records: number;
@@ -138,6 +139,14 @@ export default function DebugPanel({
                 rail: {stats.poll.railSource} ({stats.poll.railStatus}) ·{" "}
                 {stats.poll.railPreds} preds
               </div>
+              {stats.poll.closedLines.length > 0 && (
+                <div style={{ color: "#a1a1aa" }}>
+                  closed (trains gated):{" "}
+                  {stats.poll.closedLines
+                    .map((l) => l.slice(0, 12))
+                    .join(" · ")}
+                </div>
+              )}
 
               {h("trains")}
               <div>

@@ -31,7 +31,7 @@ import {
   type TrainPose,
   type TrainRecord,
 } from "@/lib/tube/trains";
-import type { Prediction } from "@/lib/tfl/types";
+import type { LineStatus, Prediction } from "@/lib/tfl/types";
 
 const shapeUtils = [TubeLineShapeUtil, StationShapeUtil, TrainShapeUtil];
 // Double-clicking empty canvas would drop a text shape on the map.
@@ -39,6 +39,15 @@ const tldrawOptions = { createTextOnCanvasDoubleClick: false };
 const MARKER = 11;
 const ANIM_MS = 650;
 /** How often to refresh live train predictions (matches TfL's arrivals TTL). */
+/** Line-status severities that mean NO trains are running anywhere on the
+ * line — Arrivals data for these is ghost stock (parked trains, schedule
+ * phantoms) and gets dropped. Part-closure severities (3 Part Suspended,
+ * 5 Part Closure, 11 Part Closed) are deliberately absent: those lines run
+ * real trains on their unaffected sections.
+ *   1 Closed · 2 Suspended · 4 Planned Closure · 8 Bus Service (full rail
+ *   replacement) · 16 Not Running · 20 Service Closed (the nightly one) */
+const CLOSED_SEVERITIES = new Set([1, 2, 4, 8, 16, 20]);
+
 const TRAIN_POLL_MS = 30_000;
 /** How often to reposition trains — trains crawl, so this stays smooth. */
 const TRAIN_TICK_MS = 100;
@@ -823,6 +832,7 @@ export default function TubeMap() {
     railSource: "off",
     railStatus: "off",
     railPreds: 0,
+    closedLines: [] as string[],
   });
   const debugPerfRef = useRef({
     fullMs: 0,
@@ -2323,7 +2333,7 @@ export default function TubeMap() {
       const tflIds = lineIds.filter((id) => !NR_LINE_IDS.has(id));
       const hasRail = lineIds.some((id) => NR_LINE_IDS.has(id));
       try {
-        const [res, railRes] = await Promise.all([
+        const [res, railRes, statusRes] = await Promise.all([
           fetch(`/api/tfl/Line/${tflIds.join(",")}/Arrivals`, {
             signal,
             cache: "no-store",
@@ -2333,6 +2343,16 @@ export default function TubeMap() {
                 () => null,
               )
             : Promise.resolve(null),
+          // Line status rides along to gate ghost trains: TfL's countdown
+          // system keeps emitting Arrivals for CLOSED lines (stabled trains
+          // parked at platforms under dummy vehicle ids, plus schedule-seeded
+          // phantoms — verified: 76 jubilee predictions at "Service Closed").
+          // A status failure fails OPEN (no gating) — worst case is ghosts,
+          // never missing real trains.
+          fetch(`/api/tfl/Line/${tflIds.join(",")}/Status`, {
+            signal,
+            cache: "no-store",
+          }).catch(() => null),
         ]);
         const dbg = debugPollRef.current;
         dbg.tflOk = res.ok;
@@ -2350,11 +2370,34 @@ export default function TubeMap() {
           dbg.railPreds = railPreds.length;
           preds = preds.concat(railPreds);
         }
+        // A line is gated only when EVERY one of its statuses is a full
+        // closure — mixed states (part closure + minor delays, part
+        // suspended) still run real trains on the unaffected sections.
+        const closed = new Set<string>();
+        if (statusRes?.ok) {
+          try {
+            const statuses = (await statusRes.json()) as LineStatus[];
+            for (const l of statuses) {
+              if (
+                l.lineStatuses.length > 0 &&
+                l.lineStatuses.every((s) =>
+                  CLOSED_SEVERITIES.has(s.statusSeverity),
+                )
+              ) {
+                closed.add(l.id);
+              }
+            }
+          } catch {
+            // unparseable status — fail open
+          }
+        }
+        dbg.closedLines = [...closed];
         if (cancelled || signal.aborted) return;
         const fetchMs = Date.now();
         dbg.lastPollMs = fetchMs;
         const byLine = new Map<string, Prediction[]>();
         for (const p of preds) {
+          if (closed.has(p.lineId)) continue; // ghost trains on a closed line
           const list = byLine.get(p.lineId);
           if (list) list.push(p);
           else byLine.set(p.lineId, [p]);
@@ -2551,6 +2594,7 @@ export default function TubeMap() {
         railSource: dbgPoll.railSource,
         railStatus: dbgPoll.railStatus,
         railPreds: dbgPoll.railPreds,
+        closedLines: dbgPoll.closedLines,
       },
       trains: {
         records: store.size,
