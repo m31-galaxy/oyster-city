@@ -11,9 +11,13 @@ import {
   Tldraw,
   createShapeId,
   react,
+  useEditor,
+  useValue,
   type Editor,
+  type TLComponents,
   type TLShapeId,
 } from "tldraw";
+import { blueprintOn } from "@/lib/tube/blueprint";
 import "tldraw/tldraw.css";
 import {
   TubeLineShapeUtil,
@@ -61,6 +65,98 @@ const tldrawOptions = {
   createTextOnCanvasDoubleClick: false,
   onBeforePasteFromClipboard: () => false as const,
 };
+
+// ---------- Blueprint edit-mode backdrop ----------
+// Edit mode dresses the canvas as a blueprint: blue paper, a deep-blue
+// vignette, and a whitish-blue drafting grid that pans and zooms with the
+// camera. It renders as the tldraw Background component — always mounted,
+// so CSS can animate the reveal (a circular wipe radiating from the
+// edit-mode checkbox, with the grid and vignette fading in staggered) —
+// and applyEditMode drives it through the blueprintOn atom
+// (lib/tube/blueprint.ts, shared with the station labels' ink flip).
+
+/** Minor drafting-grid cell in map units; majors every 5th line. */
+const BLUEPRINT_GRID = 40;
+
+const mod = (v: number, m: number) => ((v % m) + m) % m;
+
+function BlueprintBackground() {
+  const editor = useEditor();
+  const active = useValue("blueprint-active", () => blueprintOn.get(), []);
+  // The camera is only READ while the blueprint is up, so panning and
+  // zooming re-render this component only in edit mode; off, the atom
+  // read short-circuits before the camera subscription is taken.
+  const cam = useValue(
+    "blueprint-camera",
+    () => (blueprintOn.get() ? editor.getCamera() : null),
+    [editor],
+  );
+  // Same offset arithmetic as tldraw's DefaultGrid: the page origin lands
+  // at (cam.x * z, cam.y * z) screen px; patterns tile from there.
+  const cell = (cam?.z ?? 1) * BLUEPRINT_GRID;
+  const major = cell * 5;
+  const ox = cam ? mod(0.5 + cam.x * cam.z, cell) : 0;
+  const oy = cam ? mod(0.5 + cam.y * cam.z, cell) : 0;
+  const mox = cam ? mod(0.5 + cam.x * cam.z, major) : 0;
+  const moy = cam ? mod(0.5 + cam.y * cam.z, major) : 0;
+  // Fade the minor grid away as its cells shrink below legibility.
+  const minorOpacity = Math.max(0, Math.min(1, (cell - 9) / 14));
+  return (
+    <div className="map-underlay">
+      <div className={active ? "blueprint blueprint--on" : "blueprint"}>
+        {cam !== null && (
+          <svg className="blueprint-grid" aria-hidden="true">
+            <defs>
+              <pattern
+                id="bp-minor"
+                width={cell}
+                height={cell}
+                x={ox}
+                y={oy}
+                patternUnits="userSpaceOnUse"
+              >
+                <path
+                  d={`M ${cell} 0 H 0 V ${cell}`}
+                  fill="none"
+                  stroke="rgba(219, 234, 254, 0.16)"
+                  strokeWidth="1"
+                />
+              </pattern>
+              <pattern
+                id="bp-major"
+                width={major}
+                height={major}
+                x={mox}
+                y={moy}
+                patternUnits="userSpaceOnUse"
+              >
+                <path
+                  d={`M ${major} 0 H 0 V ${major}`}
+                  fill="none"
+                  stroke="rgba(219, 234, 254, 0.3)"
+                  strokeWidth="1"
+                />
+              </pattern>
+            </defs>
+            {minorOpacity > 0 && (
+              <rect
+                width="100%"
+                height="100%"
+                fill="url(#bp-minor)"
+                opacity={minorOpacity}
+              />
+            )}
+            <rect width="100%" height="100%" fill="url(#bp-major)" />
+          </svg>
+        )}
+        <div className="blueprint-vignette" />
+      </div>
+    </div>
+  );
+}
+
+// Stable identity — tldraw remounts its internals if this object changes.
+const tlComponents: TLComponents = { Background: BlueprintBackground };
 const MARKER = 11;
 const ANIM_MS = 650;
 /** How often to refresh live train predictions (matches TfL's arrivals TTL). */
@@ -1391,6 +1487,7 @@ export default function TubeMap() {
   // even the V hotkey can't bring drags back.
   const applyEditMode = useCallback((editor: Editor, active: boolean) => {
     editActiveRef.current = active;
+    blueprintOn.set(active); // the backdrop wipe starts with the flip
     if (active) {
       editor.updateInstanceState({ isReadonly: false });
       editor.setCurrentTool("select");
@@ -2886,6 +2983,7 @@ export default function TubeMap() {
       <DebugPanel collect={collectDebugStats} />
       <Tldraw
         shapeUtils={shapeUtils}
+        components={tlComponents}
         hideUi
         options={tldrawOptions}
         onMount={handleMount}

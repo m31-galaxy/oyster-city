@@ -10,6 +10,7 @@ import {
 } from "tldraw";
 import { hiddenLabels } from "@/lib/tube/labels";
 import { closedStations, dimmedColour } from "@/lib/tube/status";
+import { blueprintOn } from "@/lib/tube/blueprint";
 
 export interface StationProps {
   w: number;
@@ -172,9 +173,23 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
       [shape.props.stationId],
     );
     // The ring dims into the same family as the lines; the label dims LESS
-    // (LABEL_DIM_MIX) so the name stays readable.
+    // (LABEL_DIM_MIX) so the name stays readable. On the blueprint backdrop
+    // (edit mode) label ink flips to whitish-blue — drafting annotations —
+    // since near-black ink sinks into the deep blue paper. The rings keep
+    // their dark ink: white-filled circles read fine on blue.
+    const blueprint = useValue(
+      "station-blueprint",
+      () => blueprintOn.get(),
+      [],
+    );
     const ringInk = dimmed ? dimmedColour(INK) : INK;
-    const labelInk = dimmed ? dimmedColour(INK, LABEL_DIM_MIX) : INK;
+    const labelInk = blueprint
+      ? dimmed
+        ? "rgba(219, 234, 254, 0.55)"
+        : "#eaf2ff"
+      : dimmed
+        ? dimmedColour(INK, LABEL_DIM_MIX)
+        : INK;
     const marker: CSSProperties = interchange
       ? {
           width: MARKER,
@@ -227,12 +242,13 @@ export class StationShapeUtil extends ShapeUtil<StationShape> {
 }
 
 /** Cross-fade for label show/hide. `visibility` flips after the fade ends so
- * a hidden label neither paints nor lingers as an invisible box. */
+ * a hidden label neither paints nor lingers as an invisible box. Ink-colour
+ * changes (the blueprint flip, closed-line dimming) fade too. */
 function labelFade(show: boolean): CSSProperties {
   return {
     opacity: show ? 1 : 0,
     visibility: show ? "visible" : "hidden",
-    transition: "opacity 150ms ease, visibility 150ms",
+    transition: "opacity 150ms ease, visibility 150ms, color 400ms ease",
   };
 }
 

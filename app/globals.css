@@ -147,6 +147,83 @@ textarea {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
+/* ---------- Blueprint edit-mode backdrop ---------- */
+
+/* Replaces tldraw's Background: the plain paper always, with the blueprint
+   stack above it revealed by a circular wipe that radiates from the
+   edit-mode checkbox (--bp-origin-*). The grid and vignette fade in on
+   their own slightly-later clocks so the reveal reads in layers: paper
+   turns blue, the vignette settles, the drafting grid draws in. */
+.map-underlay {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  pointer-events: none;
+  --bp-origin-x: calc(100% - 80px);
+  --bp-origin-y: 72px;
+}
+
+.blueprint {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    120% 95% at 50% 42%,
+    #23549f 0%,
+    #1a4489 55%,
+    #123468 100%
+  );
+  clip-path: circle(0% at var(--bp-origin-x) var(--bp-origin-y));
+  will-change: clip-path;
+  /* Collapse (unchecking) runs a touch faster than the reveal. */
+  transition: clip-path 550ms cubic-bezier(0.5, 0, 0.75, 0.4);
+}
+
+.blueprint--on {
+  clip-path: circle(142% at var(--bp-origin-x) var(--bp-origin-y));
+  transition: clip-path 750ms cubic-bezier(0.25, 0.1, 0.2, 1);
+}
+
+.blueprint-grid {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 250ms ease;
+}
+
+.blueprint--on .blueprint-grid {
+  opacity: 1;
+  transition: opacity 600ms ease 250ms;
+}
+
+.blueprint-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    115% 95% at 50% 45%,
+    rgba(6, 22, 56, 0) 52%,
+    rgba(5, 17, 45, 0.5) 82%,
+    rgba(3, 11, 32, 0.75) 100%
+  );
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+
+.blueprint--on .blueprint-vignette {
+  opacity: 1;
+  transition: opacity 900ms ease 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blueprint,
+  .blueprint-grid,
+  .blueprint-vignette {
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+  }
+}
+
 /* The octolinear-only edit-mode checkbox, pill-styled to match the toggle. */
 .edit-toggle {
   display: flex;
@@ -222,6 +299,11 @@ textarea {
   .edit-toggle input {
     width: 18px;
     height: 18px;
+  }
+
+  /* Taller controls push the edit checkbox (the wipe origin) further down. */
+  .map-underlay {
+    --bp-origin-y: 96px;
   }
 }
 
