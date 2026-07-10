@@ -170,7 +170,10 @@ textarea {
     #123468 100%
   );
   opacity: 0;
-  /* Collapse (unchecking) runs a touch faster than the reveal. */
+  /* Collapse (unchecking) runs a touch faster than the reveal. The fade is
+     the ONLY thing that animates over the whole viewport, so keep it on the
+     compositor. */
+  will-change: opacity;
   transition: opacity 450ms ease;
 }
 
@@ -203,11 +206,13 @@ textarea {
 /* White drafting ink around the tube lines: a wide translucent glow under a
    crisp opaque outline (opaque so overlapping outlines don't alpha-stack
    into seams), rendered as plain strokes beneath each casing
-   (TubeLineShapeUtil). Always mounted, faded with the mode — zero-opacity
-   paths cost nothing to paint. */
+   (TubeLineShapeUtil). Deliberately NO transition: fading would repaint
+   ~230 large line svgs every frame for its duration — the screen-wide
+   flicker at high zoom. Instead the ink flips in ONE repaint, timed by
+   TubeMap's bpStyled state to land while the paper is light (white on
+   white is invisible), and the composited paper fade does the revealing. */
 .bp-outline {
   opacity: 0;
-  transition: opacity 400ms ease;
 }
 
 .bp-mode .bp-outline {

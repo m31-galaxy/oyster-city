@@ -118,12 +118,12 @@ export class TubeLineShapeUtil extends ShapeUtil<TubeLineShape> {
     // Blueprint mode (edit): white drafting ink around the line — a wide
     // translucent glow under a crisp OPAQUE outline. Plain strokes,
     // deliberately NOT a drop-shadow filter: filters re-rasterize per
-    // repaint and would tax pans and drag redraws. The paths stay mounted
-    // and fade via CSS opacity, keyed off the map root's .bp-mode class —
-    // NOT component state, so toggling edit mode restyles every line in
-    // one style pass instead of re-rendering ~230 casings (that commit
-    // burst read as a screen-wide flicker at high zoom). Casings only —
-    // a hollow line's core twin rides its casing.
+    // repaint and would tax pans and drag redraws. The paths stay mounted;
+    // visibility is the map root's .bp-mode class (one style pass, zero
+    // re-renders) flipped in a single repaint with no transition — see
+    // .bp-outline in globals.css for the white-on-white choreography that
+    // keeps the flip invisible. Casings only — a hollow line's core twin
+    // rides its casing.
     // A National Rail core is NOT stroked with a dashed white line: where two
     // fragments' cores overlap along a junction stem, independent dash phases
     // union additively and can fill each other's gaps into solid white.

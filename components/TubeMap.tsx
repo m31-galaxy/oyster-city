@@ -1054,6 +1054,20 @@ export default function TubeMap() {
   const editActiveRef = useRef(false);
   // Selection parked while editing is off, restored on the next enable.
   const savedSelectionRef = useRef<TLShapeId[]>([]);
+  // Drives the root .bp-mode class (the shapes' white blueprint ink). The
+  // ink has NO per-element transitions — fading ~230 huge line svgs
+  // repainted every frame for 400ms at zoomed scale — so it flips in one
+  // repaint, choreographed to be invisible: white ink lands while the paper
+  // is still light (white-on-white), and the composited paper fade reveals
+  // it; on the way out the ink outlives the paper fade and drops once the
+  // paper is light again. Geo trips snap it off instead (see
+  // applyEditMode) so a morph never paints outline-laden frames.
+  const [bpStyled, setBpStyled] = useState(false);
+  const bpOffTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped at every morph settle so the edit effect re-runs: resuming edit
+  // after a geo trip waits for the settle rather than fading the blueprint
+  // in over the morph's per-frame shape writes.
+  const [settleTick, setSettleTick] = useState(0);
 
   const editorRef = useRef<Editor | null>(null);
   const geoPos = useRef<Map<TLShapeId, Pose>>(new Map());
@@ -1605,22 +1619,41 @@ export default function TubeMap() {
   // view-only store — with the outgoing selection parked for next time.
   // The select-tool veto in handleMount reads editActiveRef, so while off
   // even the V hotkey can't bring drags back.
-  const applyEditMode = useCallback((editor: Editor, active: boolean) => {
-    editActiveRef.current = active;
-    blueprintOn.set(active); // the backdrop fade starts with the flip
-    if (active) {
-      editor.updateInstanceState({ isReadonly: false });
-      editor.setCurrentTool("select");
-      const ids = savedSelectionRef.current.filter((id) => editor.getShape(id));
-      savedSelectionRef.current = [];
-      if (ids.length) editor.select(...ids);
-    } else {
-      savedSelectionRef.current = [...editor.getSelectedShapeIds()];
-      editor.selectNone();
-      editor.setCurrentTool("hand");
-      editor.updateInstanceState({ isReadonly: true });
-    }
-  }, []);
+  const applyEditMode = useCallback(
+    (editor: Editor, active: boolean, instantOff = false) => {
+      editActiveRef.current = active;
+      blueprintOn.set(active); // the backdrop fade starts with the flip
+      if (bpOffTimer.current !== null) {
+        clearTimeout(bpOffTimer.current);
+        bpOffTimer.current = null;
+      }
+      if (active) {
+        // Ink lands NOW, in one repaint — invisible against the still-light
+        // paper; the paper's composited fade-in is what reveals it.
+        setBpStyled(true);
+        editor.updateInstanceState({ isReadonly: false });
+        editor.setCurrentTool("select");
+        const ids = savedSelectionRef.current.filter((id) =>
+          editor.getShape(id),
+        );
+        savedSelectionRef.current = [];
+        if (ids.length) editor.select(...ids);
+      } else {
+        // The ink outlives the paper fade (450ms) and drops once the paper
+        // is light again — white-on-white, so the flip is invisible. Geo
+        // trips snap it off instead: the morph starts in the same frame,
+        // and its motion masks the pop far better than 450ms of
+        // outline-laden morph frames would look.
+        if (instantOff) setBpStyled(false);
+        else bpOffTimer.current = setTimeout(() => setBpStyled(false), 500);
+        savedSelectionRef.current = [...editor.getSelectedShapeIds()];
+        editor.selectNone();
+        editor.setCurrentTool("hand");
+        editor.updateInstanceState({ isReadonly: true });
+      }
+    },
+    [],
+  );
 
   const handleMount = useCallback(
     (editor: Editor) => {
@@ -2692,6 +2725,10 @@ export default function TubeMap() {
             isReadonly: geo || !editActiveRef.current,
           });
           positionTrains();
+          // Let the edit effect re-run: a deferred edit resume (geo ->
+          // octolinear with the checkbox remembered on) engages here, so
+          // the blueprint stages in AFTER the motion stops.
+          setSettleTick((t) => t + 1);
           // The label declutter (greedy O(n²) over 505 labels) and the camera
           // constraint re-measure (full page-bounds fold) ran here in the SAME
           // frame as the settle redraw — a visible ~2x frame spike right at the
@@ -2716,22 +2753,34 @@ export default function TubeMap() {
     [positionTrains],
   );
 
+  // Animate only on a real mode change — skip the initial mount (and React
+  // strict-mode's double-invoke), which would otherwise run a no-op
+  // animation. (Declared above the edit effect, which reads it to detect a
+  // pending morph.)
+  const lastMode = useRef(false);
+
   // Keep the editor's edit state in step with the checkbox AND the layout
   // mode: geographic suspends editing (auto-disable) without touching the
   // checkbox state, so returning to octolinear resumes it. Declared BEFORE
   // the morph effect below — on the same geoMode flip, editActiveRef must
   // be current by the time the morph's settle picks its readonly value.
+  //
+  // Morph awareness: lastMode still holding the OLD geoMode here means the
+  // morph effect below is about to run — in that case a resume is DEFERRED
+  // (morphPending keeps `active` false) and engages on the settleTick bump
+  // instead, so blueprint work never runs concurrently with the morph's
+  // per-frame shape writes. A geo-bound suspend, by contrast, applies
+  // immediately (selection must park before the morph) and snaps the ink
+  // off (instantOff) for the same reason.
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor) return;
-    const active = editMode && !geoMode;
+    const morphPending = lastMode.current !== geoMode;
+    const active = editMode && !geoMode && !morphPending;
     if (active === editActiveRef.current) return;
-    applyEditMode(editor, active);
-  }, [geoMode, editMode, applyEditMode]);
+    applyEditMode(editor, active, geoMode || morphPending);
+  }, [geoMode, editMode, settleTick, applyEditMode]);
 
-  // Animate only on a real mode change — skip the initial mount (and React
-  // strict-mode's double-invoke), which would otherwise run a no-op animation.
-  const lastMode = useRef(false);
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || lastMode.current === geoMode) return;
@@ -3110,11 +3159,11 @@ export default function TubeMap() {
   return (
     // .bp-mode drives ALL blueprint shape styling (line outlines, marker
     // glow, label ink) via CSS descendant rules — one style pass on toggle,
-    // zero shape re-renders (a React commit across ~750 shapes read as a
-    // screen-wide flicker at high zoom).
+    // zero shape re-renders. bpStyled (not the raw editMode) times the flip
+    // so it always lands white-on-white; see its declaration.
     <div
       style={{ position: "absolute", inset: 0 }}
-      className={editMode && !geoMode ? "bp-mode" : undefined}
+      className={bpStyled ? "bp-mode" : undefined}
     >
       <div className="mode-controls">
         <div className="mode-toggle" role="group" aria-label="Map layout mode">
