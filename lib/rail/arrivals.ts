@@ -149,6 +149,36 @@ function predictionsForLine(
 /** Which upstream produced the rail predictions (surfaced for debugging). */
 export type RailSource = "fixture" | "darwin" | "disabled";
 
+/** How many board requests may be in flight at once. Firing a full line's
+ * boards concurrently trips the RDM gateway's spike arrest (it smooths the
+ * per-second cap into tiny admission buckets), 429-ing a board or two per
+ * sweep; a small pool spreads the starts while keeping the sweep fast. */
+const BOARD_CONCURRENCY = 4;
+
+/** Promise.allSettled with at most `limit` tasks in flight. */
+async function settledPool<T, R>(
+  items: T[],
+  limit: number,
+  task: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      try {
+        results[i] = { status: "fulfilled", value: await task(items[i]) };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
 /**
  * Live arrivals for every configured National Rail line, in TfL Prediction
  * shape. Sources, in order: RAIL_FIXTURE=1 (synthetic moving services, for
@@ -174,8 +204,9 @@ export async function getRailArrivals(): Promise<{
 
   const out: Prediction[] = [];
   for (const line of RAIL_LINES) {
-    const settled: PromiseSettledResult<LdbsvBoard>[] =
-      await Promise.allSettled(line.boardCrs.map((crs) => fetchDepBoard(crs)));
+    const settled = await settledPool(line.boardCrs, BOARD_CONCURRENCY, (crs) =>
+      fetchDepBoard(crs),
+    );
     const boards: LdbsvBoard[] = [];
     for (const [i, r] of settled.entries()) {
       if (r.status === "fulfilled") boards.push(r.value);

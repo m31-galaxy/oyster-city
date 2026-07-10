@@ -107,6 +107,12 @@ export function londonIsoToMs(iso: string): number | null {
   return guess;
 }
 
+/** Pause before the single retry of a spike-arrested (HTTP 429) request.
+ * The RDM gateway smooths its per-second cap into ~10ms admission buckets,
+ * so two boards fetched near-simultaneously can 429 while the actual rate
+ * is far under the cap — a short wait lands the retry in a free bucket. */
+const RETRY_429_MS = 400;
+
 /** Fetch a station's departures board with full calling/passing details. */
 export async function fetchDepBoard(
   crs: string,
@@ -119,11 +125,18 @@ export async function fetchDepBoard(
     `${base}/LDBSVWS/api/20220120/GetDepBoardWithDetails/` +
     `${crs}/${londonBoardTime(Date.now())}` +
     `?numRows=${opts?.numRows ?? 20}&timeWindow=${opts?.timeWindow ?? 120}`;
-  const res = await fetch(url, {
-    headers: { "x-apikey": key, Accept: "application/json" },
-    cache: "no-store",
-    signal: opts?.signal,
-  });
+  const get = () =>
+    fetch(url, {
+      headers: { "x-apikey": key, Accept: "application/json" },
+      cache: "no-store",
+      signal: opts?.signal,
+    });
+  let res = await get();
+  if (res.status === 429) {
+    await res.text().catch(() => {});
+    await new Promise((r) => setTimeout(r, RETRY_429_MS));
+    res = await get();
+  }
   if (!res.ok) {
     const body = await res.text();
     throw new Error(
