@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "next dev -p 61016",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 61016",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
