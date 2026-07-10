@@ -34,6 +34,7 @@ import {
   type TrainShape,
 } from "@/components/shapes/TrainShapeUtil";
 import DebugPanel, { type DebugStats } from "@/components/DebugPanel";
+import { wheelZooms } from "@/lib/tube/camera";
 import { getTubeNetwork } from "@/lib/tube/network";
 import { hiddenLabels } from "@/lib/tube/labels";
 import {
@@ -1714,12 +1715,22 @@ export default function TubeMap() {
       if (ed.__oysterBuilt) return;
       ed.__oysterBuilt = true;
 
-      // Scroll wheel zooms rather than pans (tldraw's default is pan). This
-      // merges with the constraints set later in updateCameraConstraints, so
-      // it holds across every mode. wheelBehavior only applies while the user
-      // preference inputMode is null (the default) — we hide tldraw's UI, so
-      // it can never be toggled to "trackpad"/"mouse" and override this.
-      editor.setCameraOptions({ wheelBehavior: "zoom" });
+      // A non-null inputMode user preference makes tldraw ignore wheelBehavior
+      // entirely — and it persists in localStorage (TLDRAW_USER_DATA_v3),
+      // where a since-reverted device-detection experiment may have left one.
+      // We hide tldraw's UI, so nothing can set it intentionally; null it at
+      // mount so wheelBehavior below stays authoritative.
+      editor.user.updateUserPreferences({ inputMode: null });
+
+      // Scroll wheel zooms rather than pans (tldraw's default); the debug
+      // panel's wheel toggle flips it live. setCameraOptions merges, so this
+      // coexists with the constraints set later in updateCameraConstraints
+      // and holds across every mode.
+      react("wheel behavior from debug toggle", () => {
+        editor.setCameraOptions({
+          wheelBehavior: wheelZooms.get() ? "zoom" : "pan",
+        });
+      });
 
       const net = getTubeNetwork();
       naptanToHubRef.current = net.naptanToHub;

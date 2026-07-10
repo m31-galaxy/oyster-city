@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { useValue } from "tldraw";
 import { cycleLineOverride } from "@/lib/tube/status";
+import { wheelZooms } from "@/lib/tube/camera";
 
 // Lightweight diagnostics overlay: a floating readout of the map's live
 // internals (poll freshness, data sources, train/station/render counts,
@@ -86,6 +88,19 @@ const h = (label: string) => (
   </div>
 );
 
+/** Two-state mode chip: blue = active, grey = available. */
+const modeChipStyle = (active: boolean): CSSProperties => ({
+  padding: "1px 8px",
+  fontFamily: "inherit",
+  fontSize: 10,
+  lineHeight: 1.5,
+  color: active ? "#93c5fd" : "#71717a",
+  background: active ? "rgba(30, 64, 175, 0.35)" : "transparent",
+  border: `1px solid ${active ? "#3b82f6" : "#3f3f46"}`,
+  borderRadius: 4,
+  cursor: "pointer",
+});
+
 /** Line-status chip: green = open, red = closed; amber ring = forced. */
 const chipStyle = (closed: boolean, forced: boolean): CSSProperties => ({
   padding: "1px 6px",
@@ -106,6 +121,7 @@ export default function DebugPanel({
 }) {
   const [open, setOpen] = useState(false);
   const [stats, setStats] = useState<DebugStats | null>(null);
+  const zooms = useValue(wheelZooms);
 
   // Opening seeds the readout in the toggle event itself (an effect must not
   // set state synchronously); the 1Hz interval below keeps it fresh.
@@ -145,6 +161,20 @@ export default function DebugPanel({
       </button>
       {open && (
         <div style={panelStyle}>
+          <div style={{ color: "#a1a1aa" }}>scroll wheel</div>
+          <div style={{ display: "flex", gap: 3, marginTop: 2 }}>
+            {(["zoom", "pan"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                style={modeChipStyle(zooms === (m === "zoom"))}
+                onClick={() => wheelZooms.set(m === "zoom")}
+                title="What the scroll wheel does, in every mode"
+              >
+                {m}
+              </button>
+            ))}
+          </div>
           {!stats ? (
             "collecting…"
           ) : (
