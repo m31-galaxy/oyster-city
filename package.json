@@ -4,7 +4,7 @@
   "private": true,
   "description": "Live London transport in your browser — a TfL Go equivalent.",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 61016",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",

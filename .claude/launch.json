@@ -5,12 +5,12 @@
       "name": "next-dev",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
-      "port": 3000
+      "port": 61016
     },
     {
       "name": "next-dev-rail-fixture",
       "runtimeExecutable": "sh",
-      "runtimeArgs": ["-c", "RAIL_FIXTURE=1 PORT=3001 npm run dev"],
+      "runtimeArgs": ["-c", "RAIL_FIXTURE=1 npx next dev -p 3001"],
       "port": 3001
     },
     {
