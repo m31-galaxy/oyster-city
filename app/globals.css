@@ -193,8 +193,28 @@ textarea {
 }
 
 .blueprint--on .blueprint-grid {
+  /* No container fade on entry — the lines stage their own draw-in. */
   opacity: 1;
-  transition: opacity 600ms ease 250ms;
+  transition: none;
+}
+
+/* The staggered draw-in: each grid line sweeps along its own length
+   (dash-offset from full length to zero), with per-line delays set inline
+   (verticals cascade left-to-right, horizontals top-to-bottom). `backwards`
+   keeps a line invisible until its turn. --len is the unitless line length,
+   set inline alongside the delay. */
+.bp-draw-line {
+  stroke-dashoffset: 0;
+  animation: bp-grid-draw 450ms cubic-bezier(0.33, 0, 0.2, 1) backwards;
+}
+
+@keyframes bp-grid-draw {
+  from {
+    stroke-dashoffset: calc(var(--len) * 1px);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
 }
 
 .blueprint-vignette {
@@ -221,6 +241,11 @@ textarea {
   .blueprint-vignette {
     transition-duration: 1ms !important;
     transition-delay: 0ms !important;
+  }
+
+  .bp-draw-line {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
   }
 }
 

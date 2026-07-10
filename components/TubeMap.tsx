@@ -6,6 +6,8 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type CSSProperties,
+  type ReactNode,
 } from "react";
 import {
   Tldraw,
@@ -77,22 +79,57 @@ const tldrawOptions = {
 
 /** Minor drafting-grid cell in map units; majors every 5th line. */
 const BLUEPRINT_GRID = 40;
+/** Grid stroke colours (majors solid, minors additionally faded by zoom). */
+const GRID_MINOR_INK = "rgba(219, 234, 254, 0.16)";
+const GRID_MAJOR_INK = "rgba(219, 234, 254, 0.3)";
+/** The staggered draw-in: each line sweeps along its length in DRAW_MS,
+ * lines start left-to-right / top-to-bottom a few ms apart (budgeted so the
+ * whole cascade fits STAGGER_BUDGET_MS regardless of line count), and after
+ * everything has landed the per-line elements swap for two pattern-filled
+ * rects that pan and zoom for free. */
+const GRID_DRAW_BASE_MS = 250; // let the wipe open before inking starts
+const GRID_DRAW_MS = 450;
+const GRID_STAGGER_BUDGET_MS = 550;
+const GRID_DRAW_TOTAL_MS =
+  GRID_DRAW_BASE_MS + GRID_STAGGER_BUDGET_MS + GRID_DRAW_MS + 150;
+/** Above this many lines (deep zoom-out), skip the theatre — pattern only. */
+const GRID_DRAW_MAX_LINES = 400;
 
 const mod = (v: number, m: number) => ((v % m) + m) % m;
 
 function BlueprintBackground() {
   const editor = useEditor();
   const active = useValue("blueprint-active", () => blueprintOn.get(), []);
-  // The camera is only READ while the blueprint is up, so panning and
-  // zooming re-render this component only in edit mode; off, the atom
-  // read short-circuits before the camera subscription is taken.
+  // The grid outlives the checkbox: it draws itself in line-by-line on
+  // enable, and on disable stays mounted through the collapse so it rides
+  // the wipe out instead of vanishing a frame early.
+  const [gridMounted, setGridMounted] = useState(false);
+  const [drawing, setDrawing] = useState(false);
+  useEffect(() => {
+    if (active) {
+      setGridMounted(true);
+      setDrawing(true);
+      const t = setTimeout(() => setDrawing(false), GRID_DRAW_TOTAL_MS);
+      return () => clearTimeout(t);
+    }
+    setDrawing(false);
+    const t = setTimeout(() => setGridMounted(false), 600);
+    return () => clearTimeout(t);
+  }, [active]);
+  // The camera is only READ while the grid is up, so panning and zooming
+  // re-render this component only in (and just after) edit mode.
   const cam = useValue(
     "blueprint-camera",
-    () => (blueprintOn.get() ? editor.getCamera() : null),
-    [editor],
+    () => (gridMounted ? editor.getCamera() : null),
+    [editor, gridMounted],
+  );
+  const vsb = useValue(
+    "blueprint-viewport",
+    () => (gridMounted ? editor.getViewportScreenBounds() : null),
+    [editor, gridMounted],
   );
   // Same offset arithmetic as tldraw's DefaultGrid: the page origin lands
-  // at (cam.x * z, cam.y * z) screen px; patterns tile from there.
+  // at (cam.x * z, cam.y * z) screen px; the grid tiles from there.
   const cell = (cam?.z ?? 1) * BLUEPRINT_GRID;
   const major = cell * 5;
   const ox = cam ? mod(0.5 + cam.x * cam.z, cell) : 0;
@@ -101,52 +138,136 @@ function BlueprintBackground() {
   const moy = cam ? mod(0.5 + cam.y * cam.z, major) : 0;
   // Fade the minor grid away as its cells shrink below legibility.
   const minorOpacity = Math.max(0, Math.min(1, (cell - 9) / 14));
+
+  let grid: ReactNode = null;
+  if (cam && vsb) {
+    const w = vsb.w;
+    const h = vsb.h;
+    const minors = minorOpacity >= 0.05;
+    const step = minors ? cell : major;
+    const stepX = minors ? ox : mox;
+    const stepY = minors ? oy : moy;
+    const vTotal = Math.ceil((w - stepX) / step) + 1;
+    const hTotal = Math.ceil((h - stepY) / step) + 1;
+    if (drawing && vTotal + hTotal <= GRID_DRAW_MAX_LINES) {
+      // Draw-in phase: real per-line elements. Verticals ink top-to-bottom
+      // and start left-to-right; horizontals ink left-to-right and start
+      // top-to-bottom (delays scale to the line count so the cascade always
+      // fits the budget). Keys are positional indices, so panning mid-draw
+      // moves lines without restarting their animations. Geometry, stroke,
+      // and opacity match the pattern fill exactly — the swap is invisible.
+      const isMajor = (v: number, mo: number) => {
+        const m = mod(v - mo, major);
+        return m < 0.5 || major - m < 0.5;
+      };
+      const stagger = (n: number) =>
+        Math.min(28, GRID_STAGGER_BUDGET_MS / Math.max(1, n));
+      const vStag = stagger(vTotal);
+      const hStag = stagger(hTotal);
+      const lines: ReactNode[] = [];
+      for (let i = 0, x = stepX; x <= w; x += step, i++) {
+        const mj = !minors || isMajor(x, mox);
+        lines.push(
+          <line
+            key={`v${i}`}
+            className="bp-draw-line"
+            x1={x}
+            y1={0}
+            x2={x}
+            y2={h}
+            stroke={mj ? GRID_MAJOR_INK : GRID_MINOR_INK}
+            strokeOpacity={mj ? 1 : minorOpacity}
+            strokeWidth={1}
+            strokeDasharray={h}
+            style={
+              {
+                "--len": h,
+                animationDelay: `${GRID_DRAW_BASE_MS + Math.round(i * vStag)}ms`,
+              } as CSSProperties
+            }
+          />,
+        );
+      }
+      for (let i = 0, y = stepY; y <= h; y += step, i++) {
+        const mj = !minors || isMajor(y, moy);
+        lines.push(
+          <line
+            key={`h${i}`}
+            className="bp-draw-line"
+            x1={0}
+            y1={y}
+            x2={w}
+            y2={y}
+            stroke={mj ? GRID_MAJOR_INK : GRID_MINOR_INK}
+            strokeOpacity={mj ? 1 : minorOpacity}
+            strokeWidth={1}
+            strokeDasharray={w}
+            style={
+              {
+                "--len": w,
+                animationDelay: `${GRID_DRAW_BASE_MS + Math.round(i * hStag)}ms`,
+              } as CSSProperties
+            }
+          />,
+        );
+      }
+      grid = lines;
+    } else {
+      // Steady state (and the ride-out): two pattern fills, camera-synced.
+      grid = (
+        <>
+          <defs>
+            <pattern
+              id="bp-minor"
+              width={cell}
+              height={cell}
+              x={ox}
+              y={oy}
+              patternUnits="userSpaceOnUse"
+            >
+              <path
+                d={`M ${cell} 0 H 0 V ${cell}`}
+                fill="none"
+                stroke={GRID_MINOR_INK}
+                strokeWidth="1"
+              />
+            </pattern>
+            <pattern
+              id="bp-major"
+              width={major}
+              height={major}
+              x={mox}
+              y={moy}
+              patternUnits="userSpaceOnUse"
+            >
+              <path
+                d={`M ${major} 0 H 0 V ${major}`}
+                fill="none"
+                stroke={GRID_MAJOR_INK}
+                strokeWidth="1"
+              />
+            </pattern>
+          </defs>
+          {minorOpacity > 0 && (
+            <rect
+              width="100%"
+              height="100%"
+              fill="url(#bp-minor)"
+              opacity={minorOpacity}
+            />
+          )}
+          <rect width="100%" height="100%" fill="url(#bp-major)" />
+        </>
+      );
+    }
+  }
+
   return (
     <div className="map-underlay">
       <div className={active ? "blueprint blueprint--on" : "blueprint"}>
-        {cam !== null && (
+        {grid !== null && (
           <svg className="blueprint-grid" aria-hidden="true">
-            <defs>
-              <pattern
-                id="bp-minor"
-                width={cell}
-                height={cell}
-                x={ox}
-                y={oy}
-                patternUnits="userSpaceOnUse"
-              >
-                <path
-                  d={`M ${cell} 0 H 0 V ${cell}`}
-                  fill="none"
-                  stroke="rgba(219, 234, 254, 0.16)"
-                  strokeWidth="1"
-                />
-              </pattern>
-              <pattern
-                id="bp-major"
-                width={major}
-                height={major}
-                x={mox}
-                y={moy}
-                patternUnits="userSpaceOnUse"
-              >
-                <path
-                  d={`M ${major} 0 H 0 V ${major}`}
-                  fill="none"
-                  stroke="rgba(219, 234, 254, 0.3)"
-                  strokeWidth="1"
-                />
-              </pattern>
-            </defs>
-            {minorOpacity > 0 && (
-              <rect
-                width="100%"
-                height="100%"
-                fill="url(#bp-minor)"
-                opacity={minorOpacity}
-              />
-            )}
-            <rect width="100%" height="100%" fill="url(#bp-major)" />
+            {grid}
           </svg>
         )}
         <div className="blueprint-vignette" />
