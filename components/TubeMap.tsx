@@ -1732,6 +1732,25 @@ export default function TubeMap() {
         });
       });
 
+      // Chrome/Firefox deliver a trackpad pinch as a ctrl+wheel event, and
+      // tldraw's wheel handler INVERTS the configured behavior while ctrl is
+      // down — right for pan mode (pinch must zoom) but backwards in zoom
+      // mode, where the flip made a pinch pan. No hook exists, so wrap
+      // dispatch: in zoom mode strip the ctrl flag from wheel infos so pinch
+      // (and ctrl/cmd+wheel — tldraw folds metaKey into info.ctrlKey, and a
+      // held modifier is indistinguishable from a pinch anyway) zooms like
+      // everything else. Safari is unaffected either way: its pinches arrive
+      // as GestureEvents and dispatch "pinch", which always zooms.
+      {
+        const origDispatch = editor.dispatch.bind(editor);
+        editor.dispatch = (info) => {
+          if (info.type === "wheel" && info.ctrlKey && wheelZooms.get()) {
+            return origDispatch({ ...info, ctrlKey: false });
+          }
+          return origDispatch(info);
+        };
+      }
+
       const net = getTubeNetwork();
       naptanToHubRef.current = net.naptanToHub;
       stationPosRef.current = new Map(
