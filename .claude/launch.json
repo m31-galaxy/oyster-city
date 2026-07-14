@@ -18,6 +18,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "start"],
       "port": 61016
+    },
+    {
+      "name": "next-prod-3100",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "npx next start -p 3100"],
+      "port": 3100
     }
   ]
 }

@@ -1572,9 +1572,10 @@ export default function TubeMap() {
 
   const handleMount = useCallback(
     (editor: Editor) => {
-      if (process.env.NODE_ENV !== "production") {
-        (window as unknown as { editor?: Editor }).editor = editor;
-      }
+      // Exposed in ALL builds: inert (a single reference assignment) and it
+      // lets the same headless measurement harnesses drive dev and
+      // production builds alike when comparing them.
+      (window as unknown as { editor?: Editor }).editor = editor;
 
       // Build once per editor (guards React strict-mode double-invoke).
       const ed = editor as Editor & { __oysterBuilt?: boolean };
