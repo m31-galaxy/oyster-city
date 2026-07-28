@@ -40,7 +40,12 @@ export async function GET() {
   }
   return NextResponse.json(memo!.body, {
     headers: {
-      "cache-control": "public, max-age=25",
+      // NEVER cached at the browser or CDN: the in-process memo above is
+      // the ONLY cache layer. `public, max-age=25` here used to stack
+      // browser + CDN staleness on top of the memo in production, serving
+      // clients boards up to a minute old (same failure as the TfL proxy —
+      // see app/api/tfl/[...path]/route.ts).
+      "cache-control": "private, no-store",
       "x-rail-source": memo!.source,
     },
   });
